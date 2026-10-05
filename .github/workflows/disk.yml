@@ -1,0 +1,33 @@
+# Builds the fleet's L1 disk: one dispatch converts Ubuntu's signed noble cloud image to a VHDX, publishes it as
+# release disk-noble-<serial> in this repo and prints the two lock entries for the owner to pin and sign. The input
+# reaches the script only through env:; the script refuses anything but Ubuntu's signature by the pinned key.
+name: disk
+on:
+  workflow_dispatch:
+    inputs:
+      serial:
+        description: the noble cloud image serial, 20260930 or 20260930.1
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: disk
+jobs:
+  build:
+    # `if` only stops an accidental dispatch from a branch: a dispatched run uses the workflow file of ITS ref, so a
+    # writer could drop it. The boundary is the environment: `release` is restricted to main (see the README).
+    if: github.ref == 'refs/heads/main'
+    environment: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-utils
+      - env:
+          SERIAL: ${{ inputs.serial }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 bin/fleet-disk.py "$SERIAL"
