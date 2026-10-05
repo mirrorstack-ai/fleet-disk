@@ -120,7 +120,8 @@ class Build(unittest.TestCase):
         self.assertEqual(io_.tools(), ['gh api', 'gh release', 'gpgv', 'qemu-img', 'gh release', 'gh api'])
         gpgv, qemu, gh = io_.ran[2][0], io_.ran[3][0], io_.ran[4][0]
         self.assertEqual(gpgv[:5], [fd.GPGV, '--keyring', fd.KEYRING, '--status-fd', '1'])
-        self.assertEqual(qemu[:6], [fd.QEMU_IMG, 'convert', '-f', 'qcow2', '-O', 'vhdx'])
+        self.assertEqual(qemu[:8], [fd.QEMU_IMG, 'convert', '-f', 'qcow2', '-O', 'vhdx', '-o',
+                                    'subformat=dynamic,block_size=1M'])
         self.assertEqual(gh[:4], [fd.GH, 'release', 'create', f'disk-noble-{SERIAL}'])
         self.assertEqual(gh[gh.index('--target') + 1], SHA)
         self.assertEqual(io_.fetched, [BASE + 'SHA256SUMS', BASE + 'SHA256SUMS.gpg', BASE + fd.IMAGE])

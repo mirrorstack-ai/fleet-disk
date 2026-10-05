@@ -32,6 +32,7 @@ FPR = re.compile(r'[0-9A-F]{40}', re.ASCII)
 REPO = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}', re.ASCII)
 SHA = re.compile(r'[0-9a-f]{64}', re.ASCII)
 MAX_SUMS, MAX_IMAGE = 1 << 20, 2 << 30  # a longer SHA256SUMS or image is refused, not read to the end
+VHDX_OPTS = 'subformat=dynamic,block_size=1M'  # see build(): the smallest block Hyper-V's VHDX allows
 MAX_ASSET = 2 << 30  # GitHub release assets must be under 2 GiB: refuse here rather than fail at upload
 CHUNK = 1 << 20
 TOOL_TIMEOUT, CONVERT_TIMEOUT = 600, 1800  # seconds: gpgv and gh, qemu-img; a hung tool must not hold the job
@@ -191,10 +192,14 @@ def build(io: Io, serial: str, work: Path, repo: str, sha: str, token: str, fpr:
     with image.open('rb') as f:
         if f.read(len(QCOW2_MAGIC)) != QCOW2_MAGIC:
             raise Refused('not-qcow2')
-    if io.run([QEMU_IMG, 'convert', '-f', 'qcow2', '-O', 'vhdx', str(image), str(vhdx)], {'PATH': '/usr/bin'},
-              CONVERT_TIMEOUT)[0] != 0:
+    # a dynamic VHDX allocates whole blocks: the default 32 MiB block over a sparse 3.5 GiB disk passed 2 GiB (the
+    # first build, 2026-10-05); 1 MiB blocks keep the file near the data actually written
+    if io.run([QEMU_IMG, 'convert', '-f', 'qcow2', '-O', 'vhdx', '-o', VHDX_OPTS, str(image), str(vhdx)],
+              {'PATH': '/usr/bin'}, CONVERT_TIMEOUT)[0] != 0:
         raise Refused('convert-failed')
-    if vhdx.stat().st_size >= MAX_ASSET:
+    size = vhdx.stat().st_size
+    print(f'fleet-disk: vhdx {size} bytes', file=sys.stderr, flush=True)  # a size, never a secret: how close the limit is
+    if size >= MAX_ASSET:
         raise Refused('too-big')
     disk = file_sha(vhdx)
     if io.run([GH, 'release', 'create', tag, str(vhdx), '--target', sha, '--title', tag,
