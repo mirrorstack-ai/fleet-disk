@@ -1,0 +1,37 @@
+# Publishes the owner-signed install set committed under release/install-<serial>/ as the release install-<serial>.
+# Inputs reach the script only through env:; the script refuses unless install.json.sig verifies against
+# keys/owner-pin.pub, every file is the signed one and nothing else is in the folder. It never edits a tag.
+name: install
+on:
+  workflow_dispatch:
+    inputs:
+      serial:
+        description: the install serial, the folder release/install-<serial>
+        required: true
+      min_serial:
+        description: the lowest serial this publish may carry (the previous release's serial)
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: install
+jobs:
+  publish:
+    # `if` only stops an accidental dispatch from a branch: a dispatched run uses the workflow file of ITS ref, so a
+    # writer could drop it. The boundary is the environment: `release` is restricted to main (see the README).
+    if: github.ref == 'refs/heads/main'
+    environment: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
+        with:
+          persist-credentials: false
+      - env:
+          SERIAL: ${{ inputs.serial }}
+          MIN_SERIAL: ${{ inputs.min_serial }}
+          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_CONFIRMED: ${{ vars.IMMUTABLE_RELEASES_CONFIRMED }}
+        run: python3 bin/fleet-install-publish.py publish "release/install-$SERIAL" --owner-pub keys/owner-pin.pub --min-serial "$MIN_SERIAL"
