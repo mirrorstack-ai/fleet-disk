@@ -117,8 +117,8 @@ class Fixture:
     def signed_install(self, doc: dict, key: Path | None = None, namespace: str = fp.NS) -> None:
         sign(key or self.key, self.put('install.json', json.dumps(doc).encode()), namespace)
 
-    def check(self, min_serial: int = 0, repo: str = REPO, now: datetime = NOW) -> 'fp.Plan':
-        plan = fp.check_dir(Path('release') / self.dir.name, self.pub.read_bytes(), min_serial, now, repo)
+    def check(self, min_serial: int = 0, repo: str = REPO, now: datetime = NOW, run=fp.run_argv) -> 'fp.Plan':
+        plan = fp.check_dir(Path('release') / self.dir.name, self.pub.read_bytes(), min_serial, now, repo, run)
         self.plans.append(plan)
         return plan
 
@@ -135,6 +135,7 @@ class FakeGh:
         self.immutable, self.create_code, self.created = immutable, create_code, []
         self.tweak = lambda assets: assets  # a test edits what GitHub "serves" back
         self.query_code = 0
+        self.raw: dict[str, tuple[int, str]] = {}  # query name -> (exit code, stdout) to answer instead
 
     def run(self, argv, env, timeout=fp.TOOL_TIMEOUT):
         self.calls.append(list(argv))
@@ -142,9 +143,9 @@ class FakeGh:
         self.timeouts.append(timeout)
         words = argv[1:]
         if words[:1] == ['api'] and 'matching-refs' in words[1]:
-            return self.query_code, json.dumps(self.refs)
+            return self.raw.get('refs') or (self.query_code, json.dumps(self.refs))
         if words[:2] == ['release', 'list']:
-            return 0, json.dumps(self.releases)
+            return self.raw.get('releases') or (0, json.dumps(self.releases))
         if words[:1] == ['api'] and words[1].endswith('/immutable-releases'):
             return self.immutable
         if words[:2] == ['release', 'create']:
@@ -153,7 +154,7 @@ class FakeGh:
         if words[:1] == ['api'] and '/releases/tags/' in words[1]:
             assets = [{'name': p.name.replace('.gitattributes', 'default.gitattributes'),
                        'digest': 'sha256:' + sha(p.read_bytes()), 'size': p.stat().st_size} for p in self.created]
-            return 0, json.dumps({'assets': self.tweak(assets), **self.release_flags})
+            return self.raw.get('tag') or (0, json.dumps({'assets': self.tweak(assets), **self.release_flags}))
         raise AssertionError(argv)
 
     def creates(self) -> list[list[str]]:
@@ -165,6 +166,13 @@ class Publish(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
+        # the stages and scratch dirs of this test land in a private base, so a suite running beside this one (or a
+        # leftover of another run) can never change what the stage-removal test counts
+        self.stage_base = Path(self._tmp.name) / 'stage-base'
+        self.stage_base.mkdir()
+        patch = mock.patch.object(tempfile, 'tempdir', str(self.stage_base))
+        patch.start()
+        self.addCleanup(patch.stop)  # runs before the temp dir is removed (LIFO)
         self.fx = Fixture(Path(self._tmp.name))
         self.addCleanup(self.fx.cleanup)  # runs before the temp dir is removed (LIFO)
 
@@ -344,6 +352,7 @@ class Publish(unittest.TestCase):
             code = fp.main(['x', 'publish', f'release/{TAG}', '--owner-pub', str(self.fx.pub), '--min-serial', '0'],
                            {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN}, gh, now=NOW)
         self.assertEqual((code, out.getvalue().strip()), (1, 'REFUSED unlisted'))
+        self.assertIn('fleet-install-publish: refused unlisted\n', err.getvalue())  # the log line names the rule
         self.assertEqual(gh.calls, [])
 
     # the tag
@@ -367,7 +376,11 @@ class Publish(unittest.TestCase):
 
     def test_a_missing_release_environment_refuses_before_gh(self):
         self.fx.build()
-        for repo, sha_, token in (('', SHA, TOKEN), (REPO, 'zz', TOKEN), (REPO, SHA, '')):
+        for repo, sha_, token in (('', SHA, TOKEN), (REPO, 'zz', TOKEN), (REPO, SHA, ''), ('x', SHA, TOKEN),
+                                  ('org/repo/extra', SHA, TOKEN), ('org/repo!', SHA, TOKEN), (' org/repo', SHA, TOKEN),
+                                  ('org/repo\n', SHA, TOKEN), ('-org/repo', SHA, TOKEN), (REPO, SHA + 'z', TOKEN),
+                                  (REPO, SHA[:-1], TOKEN), (REPO, SHA.upper(), TOKEN), (REPO, SHA + '\n', TOKEN),
+                                  (REPO, SHA + 'ab', TOKEN), (REPO, ' ' + SHA, TOKEN)):
             gh = FakeGh()
             with self.assertRaises(fp.Refused) as why:
                 fp.publish(gh, self.fx.check(), repo, sha_, token)
@@ -383,10 +396,13 @@ class Publish(unittest.TestCase):
 
     def test_an_unreadable_immutable_setting_stops_unless_the_owner_confirmed(self):
         self.fx.build()
-        for answer in ((1, ''), (0, 'not json'), (0, '[]'), (0, '{"enabled": "true"}'), (0, '{}')):
+        for answer in ((1, ''), (0, 'not json'), (0, '[]'), (0, '{"enabled": "true"}'), (0, '{}'),
+                       (1, '{"enabled": true}'), (1, '{"enabled": false}'), (2, '{"enabled": true}')):
             with self.subTest(answer):
                 self.assertEqual(self.refuses('immutable-unreadable', FakeGh(immutable=answer)).creates(), [])
-        self.refuses('immutable-unreadable', FakeGh(immutable=(1, '')), 'maybe')
+        for word in ('maybe', 'y', 'yes ', ' yes', 'yesterday', 'Yes', 'YES', 'true', '1', 'no'):
+            with self.subTest(word):
+                self.assertEqual(self.refuses('immutable-unreadable', FakeGh(immutable=(1, '')), word).creates(), [])
         gh = FakeGh(immutable=(1, ''))
         with contextlib.redirect_stderr(io.StringIO()):
             fp.publish(gh, self.fx.check(), REPO, SHA, TOKEN, 'yes')
@@ -492,7 +508,7 @@ class Publish(unittest.TestCase):
 
     def test_the_stage_is_removed_after_main_and_on_a_refusal(self):
         self.fx.build()
-        before = set(Path(tempfile.gettempdir()).glob('fleet-install-*'))
+        before = set(self.stage_base.glob('fleet-install-*'))
         self.fx.put('extra.txt', b'x')
         self.refuses_locally('unlisted')
         out = io.StringIO()
@@ -503,7 +519,9 @@ class Publish(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             fp.main(['x', 'publish', f'release/{TAG}', '--owner-pub', str(self.fx.pub), '--min-serial', '0'],
                     {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN}, FakeGh(), now=NOW)
-        self.assertEqual(set(Path(tempfile.gettempdir()).glob('fleet-install-*')), before)
+        self.assertEqual(set(self.stage_base.glob('fleet-install-*')), before)
+        self.fx.check()  # a stage that is NOT cleaned up is visible here, so the count above can fail
+        self.assertEqual(len(set(self.stage_base.glob('fleet-install-*')) - before), 1)
 
     def test_a_symlink_named_like_a_listed_file_is_refused(self):
         self.fx.build()
@@ -606,13 +624,16 @@ class Publish(unittest.TestCase):
         want_env = {'PATH': '/usr/bin', 'GH_TOKEN': TOKEN, 'GH_REPO': REPO, 'GH_PROMPT_DISABLED': '1'}
         self.assertEqual(gh.envs, [want_env] * 5)
         self.assertEqual(gh.envs[0]['GH_REPO'], REPO)
-        self.assertEqual(gh.timeouts, [fp.TOOL_TIMEOUT] * 3 + [fp.UPLOAD_TIMEOUT, fp.TOOL_TIMEOUT])
+        self.assertEqual(gh.timeouts, [600] * 3 + [1800, 600])  # the literals: ten minutes a query, half an hour an upload
+        self.assertEqual((fp.TOOL_TIMEOUT, fp.UPLOAD_TIMEOUT), (600, 1800))
 
     # main(): the one real path, where the job token cannot read the immutable setting
 
-    def run_main(self, verb='publish', gh=None, env=None, key=None, run=fp.run_argv):
+    def run_main(self, verb='publish', gh=None, env=None, key=None, run=fp.run_argv, drop=()):
         gh = gh or FakeGh()
         environ = {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN, **(env or {})}
+        for name in drop:
+            del environ[name]
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = fp.main(['x', verb, f'release/{TAG}', '--owner-pub', str(key or self.fx.pub), '--min-serial', '0'],
@@ -630,7 +651,8 @@ class Publish(unittest.TestCase):
 
     def test_main_refuses_immutable_unreadable_without_the_confirmation(self):
         self.fx.build()
-        for env in ({}, {'IMMUTABLE_CONFIRMED': ''}, {'IMMUTABLE_CONFIRMED': 'no'}, {'IMMUTABLE_CONFIRMED': 'YES'}):
+        for env in ({}, {'IMMUTABLE_CONFIRMED': ''}, {'IMMUTABLE_CONFIRMED': 'no'}, {'IMMUTABLE_CONFIRMED': 'YES'},
+                    {'IMMUTABLE_CONFIRMED': 'y'}, {'IMMUTABLE_CONFIRMED': 'yes '}, {'IMMUTABLE_CONFIRMED': 'yesterday'}):
             with self.subTest(env):
                 gh = FakeGh(immutable=(1, ''))
                 code, out, _, _ = self.run_main(gh=gh, env=env)
@@ -667,7 +689,9 @@ class Publish(unittest.TestCase):
         for name in ('bootstrap.sh', 'install.json', 'carrier-check.py', 'default.gitattributes'):
             with self.subTest(name):
                 self.fx.build()
-                self.fx.put(name, BUNDLE_BYTES) if name == 'default.gitattributes' else None
+                if name == 'default.gitattributes':
+                    (self.fx.dir / BUNDLE).unlink()  # then it is the ONLY extra file: the name rule alone must refuse
+                    self.fx.put(name, BUNDLE_BYTES)
                 self.resign(url=BUNDLE_URL[:-len(BUNDLE)] + name)
                 self.refuses_locally('unlisted')
         self.fx.build()
@@ -872,6 +896,173 @@ class Publish(unittest.TestCase):
                               env={'PATH': '/usr/bin:/bin'})
         self.assertEqual((done.returncode, done.stdout.strip()), (1, 'REFUSED dir'))
 
+    # mutation survivors: each test below fails when the guard it names is removed
+
+    def put_kit(self, kit) -> None:
+        """Replace kit.json with `kit` (a value or raw bytes), signed, and keep install.json's hash of it right."""
+        data = kit if isinstance(kit, bytes) else json.dumps(kit).encode()
+        sign(self.fx.key, self.fx.put('kit.json', data), fp.PIN_NS)
+        self.resign()
+
+    def test_kit_json_must_have_the_exact_shape_of_five_unique_path_sha256_entries(self):
+        self.fx.build()
+        good = json.loads((self.fx.dir / 'kit.json').read_bytes())
+        files = good['files']
+        ref = ['path', 'sha256']
+        bad = {'an extra key in an entry': dict(good, files=[dict(files[0], x=1)] + files[1:]),
+               'an entry without a sha256': dict(good, files=[{'path': files[0]['path']}] + files[1:]),
+               'a duplicate entry': dict(good, files=files + [files[-1]]),
+               'a duplicate in place of one': dict(good, files=files[:4] + [files[0]]),
+               'files is null': dict(good, files=None), 'files is a number': dict(good, files=5),
+               'files is a string': dict(good, files='carrier-check.py'), 'files is an object': dict(good, files={}),
+               'files is missing': {k: v for k, v in good.items() if k != 'files'},
+               'entries are lists': dict(good, files=[ref] * 5), 'entries are strings': dict(good, files=['x'] * 5),
+               'kit.json is a list': [], 'kit.json is a number': 5, 'kit.json is null': None, 'kit.json is a string': 'x'}
+        for what, kit in bad.items():
+            with self.subTest(what):
+                self.fx.build()
+                self.put_kit(kit)
+                self.refuses_locally('kit')
+        self.fx.build()
+        self.put_kit(dict(good, files=list(reversed(files))))  # the order of the entries is not the signed thing
+        self.assertEqual(self.fx.check().tag, TAG)
+
+    def test_a_missing_folder_or_a_file_where_the_folder_should_be_is_refused_dir(self):
+        self.fx.build()
+        shutil.rmtree(self.fx.dir)
+        self.refuses_locally('dir')
+        self.fx.dir.write_bytes(b'not a folder')
+        self.refuses_locally('dir')
+
+    def test_every_missing_file_but_the_pin_is_refused_missing(self):
+        for name in fp.FIXED + fp.KIT_FILES:
+            if name == 'deploy-pin.json':
+                continue  # its own code, no-deploy-pin
+            with self.subTest(name):
+                self.fx.build()
+                (self.fx.dir / name).unlink()
+                self.refuses_locally('missing')
+
+    def test_a_folder_name_of_eleven_digits_is_refused_dir(self):
+        self.fx.build()
+        moved = self.fx.dir.parent / 'install-12345678901'
+        self.fx.dir.rename(moved)
+        self.fx.dir = moved
+        self.refuses_locally('dir')
+
+    def test_the_scan_refuses_a_link_or_a_folder_before_any_file_is_read(self):
+        for make in (lambda d: (d / 'sub').mkdir(), lambda d: (d / 'link').symlink_to(d / 'bootstrap.sh'),
+                     lambda d: (d / 'bootstrap.sh').unlink() or (d / 'bootstrap.sh').symlink_to(d / 'bootstrap.ps1')):
+            shutil.rmtree(self.fx.dir)  # a fresh folder each time: the one before left its extra file behind
+            self.fx.dir.mkdir()
+            self.fx.build()
+            make(self.fx.dir)
+            with mock.patch.object(fp, 'snapshot', side_effect=AssertionError('a file was read before the scan')):
+                self.refuses_locally('unlisted')
+
+    def test_check_dir_gives_the_run_it_was_given_to_all_three_signature_checks(self):
+        self.fx.build()
+        namespaces = []
+
+        def spy(argv, stdin):
+            namespaces.append(argv[argv.index('-n') + 1])
+            return fp.run_argv(argv, stdin)
+        self.fx.check(run=spy)
+        self.assertEqual(namespaces, [fp.NS, fp.PIN_NS, fp.PIN_NS])
+
+    # the rollback floor read from GitHub
+
+    def test_a_draft_install_release_counts_for_the_floor(self):
+        self.fx.build()
+        gh = self.refuses('not-newer', FakeGh(releases=[{'tagName': 'install-9', 'isDraft': True}]))
+        self.assertEqual(gh.creates(), [])
+
+    def test_serial_zero_is_a_first_release(self):
+        self.fx.build(bundle=False, serial=0)
+        moved = self.fx.dir.parent / 'install-0'
+        self.fx.dir.rename(moved)
+        self.fx.dir = moved
+        gh = FakeGh()
+        plan = self.fx.check()
+        fp.publish(gh, plan, REPO, SHA, TOKEN)
+        self.assertEqual((plan.tag, len(gh.creates())), ('install-0', 1))
+
+    def test_release_rows_that_are_not_install_tags_never_lift_or_crash_the_floor(self):
+        self.fx.build()
+        rows = ['install-9', 7, None, [], {}, {'tagName': 7}, {'tagName': None}, {'tagName': ['install-9']},
+                {'tagName': 'install-9abc'}, {'tagName': 'install-9-rc'}, {'tagName': 'install-9\n'},
+                {'tagName': ' install-9'}, {'tagName': 'install-007'}, {'tagName': 'install-12345678901'},
+                {'tagName': 'v9'}, {'tagName': 'install-4', 'isDraft': False}]
+        gh = FakeGh(releases=rows)
+        fp.publish(gh, self.fx.check(), REPO, SHA, TOKEN)
+        self.assertEqual(len(gh.creates()), 1)
+
+    # what a query answers must be JSON of the expected type, with a zero exit
+
+    def test_a_query_that_answers_the_wrong_type_or_non_json_or_a_nonzero_exit_refuses(self):
+        self.fx.build()
+        wrong = ((0, '{}'), (0, '{"a": 1}'), (0, 'null'), (0, '"x"'), (0, '5'), (0, 'not json'), (0, ''), (0, '[1,'),
+                 (1, '[]'), (2, '[]'))
+        for key in ('refs', 'releases'):
+            for answer in wrong:
+                with self.subTest(key=key, answer=answer):
+                    gh = FakeGh()
+                    gh.raw[key] = answer
+                    self.assertEqual(self.refuses('tag-check-failed', gh).creates(), [])
+        for answer in ((0, '[]'), (0, 'null'), (0, '5'), (0, '"x"'), (0, 'not json'), (0, '')):
+            with self.subTest(key='tag', answer=answer):
+                gh = FakeGh()
+                gh.raw['tag'] = answer
+                self.refuses('publish-mismatch', gh)
+
+    # the read-back is lenient about a missing size and strict about everything else
+
+    def test_the_read_back_accepts_a_missing_size_and_refuses_rows_that_are_not_assets(self):
+        self.fx.build()
+        gh = FakeGh()
+        gh.tweak = lambda assets: [{k: v for k, v in a.items() if k != 'size'} for a in assets]
+        fp.publish(gh, self.fx.check(), REPO, SHA, TOKEN)
+        for extra in ('x', 5, None, [], {}, {'name': 5, 'digest': 'sha256:' + '0' * 64}, {'name': None}):
+            with self.subTest(str(extra)):
+                gh = FakeGh()
+                gh.tweak = lambda assets, extra=extra: assets + [extra]
+                self.refuses('publish-mismatch', gh)
+        for served in ('x', 5, None, {'name': 'install.json'}):
+            gh = FakeGh()
+            gh.tweak = lambda assets, served=served: served
+            self.refuses('publish-mismatch', gh)
+
+    def test_gh_is_asked_about_the_repo_exactly_as_given_not_lower_cased(self):
+        self.fx.build(bundle=False)
+        gh = FakeGh()
+        plan = self.fx.check(repo='Org/Repo')
+        fp.publish(gh, plan, 'Org/Repo', SHA, TOKEN)
+        self.assertEqual({env['GH_REPO'] for env in gh.envs}, {'Org/Repo'})
+        self.assertTrue(all('repos/Org/Repo/' in c[2] for c in gh.calls if c[1] == 'api'))
+
+    def test_main_refuses_release_env_when_the_job_gives_no_sha_or_no_token(self):
+        self.fx.build()
+        for name in ('GITHUB_SHA', 'GH_TOKEN'):
+            with self.subTest(name):
+                gh = FakeGh()
+                code, out, _, _ = self.run_main(gh=gh, drop=(name,))
+                self.assertEqual((code, out.strip(), gh.calls), (1, 'REFUSED release-env', []))
+
+    def test_a_bundle_url_below_the_release_folder_is_not_this_release(self):
+        for sub in ('a/b.tar', 'x/', '/y'):
+            with self.subTest(sub):
+                self.fx.build()
+                self.resign(url=BUNDLE_URL[:-len(BUNDLE)] + sub)
+                self.refuses_locally('unlisted')  # not the release's bundle, so the bundle file in the folder is unlisted
+
+    def test_a_bundle_name_with_a_tilde_anywhere_or_trailing_junk_is_refused_bundle_name(self):
+        prefix = BUNDLE_URL[:-len(BUNDLE)]
+        for name in ('a~b.tar', 'ab~', 'a~', 'x.tar~'):
+            with self.subTest(name):
+                self.fx.build()
+                self.resign(url=prefix + name)
+                self.refuses_locally('bundle-name')
+
 
 class VendoredVerifier(unittest.TestCase):
     """Section 1 (a copy of the fleet's install manifest rules, schema version 1) against a frozen golden: a change to
@@ -953,6 +1144,358 @@ class VendoredVerifier(unittest.TestCase):
 
     def test_the_publisher_only_adds_codes_the_golden_does_not_have(self):
         self.assertFalse(set(fp.PUBLISH_CODES) & set(fp.CODES))
+
+
+BLOB68 = 'A' * 68
+KEY_LINE = ('ssh-ed25519 ' + BLOB68).encode()
+
+
+def good_out(ns: str, principal: str = 'owner') -> bytes:
+    return f'Good "{ns}" signature for {principal} with ED25519 key SHA256:abc\n'.encode()
+
+
+def fake_run(code: int, out: bytes):
+    return lambda argv, stdin: (code, out)
+
+
+def no_run(argv, stdin):
+    raise AssertionError('ssh-keygen was asked')
+
+
+class Seams(unittest.TestCase):
+    """The helpers under check_dir and main, each driven alone with a fake run (no ssh-keygen, no gh, no network)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+
+    def key_file(self, data: bytes) -> str:
+        path = self.dir / 'k.pub'
+        path.write_bytes(data)
+        return str(path)
+
+    def code_of(self, fn, *args, **kw) -> str:
+        with self.assertRaises(fp.Refused) as why:
+            fn(*args, **kw)
+        return why.exception.code
+
+    # run_argv
+
+    def test_run_argv_returns_the_exit_code_and_stdout_and_feeds_stdin(self):
+        code = 'import sys; sys.stdout.write(sys.stdin.read().upper()); sys.exit(3)'
+        self.assertEqual(fp.run_argv([sys.executable, '-c', code], b'abc'), (3, b'ABC'))
+        self.assertEqual(fp.run_argv((sys.executable, '-c', 'pass'), b''), (0, b''))
+
+    def test_run_argv_is_127_when_the_program_cannot_run_or_times_out(self):
+        self.assertEqual(fp.run_argv([str(self.dir / 'no-such-program')], b''), (127, b''))
+        self.assertEqual(fp.run_argv([str(self.dir)], b''), (127, b''))  # a folder is not runnable
+        for err in (OSError('x'), subprocess.TimeoutExpired('x', 1), subprocess.SubprocessError('x')):
+            with mock.patch.object(fp.subprocess, 'run', side_effect=err):
+                self.assertEqual(fp.run_argv(['x'], b''), (127, b''))
+
+    def test_run_argv_asks_subprocess_for_exactly_a_minute_without_a_shell_or_check(self):
+        done = subprocess.CompletedProcess(['x'], 0, stdout=b'o')
+        with mock.patch.object(fp.subprocess, 'run', return_value=done) as run:
+            fp.run_argv(('a', 'b'), b'in')
+        run.assert_called_once_with(['a', 'b'], input=b'in', capture_output=True, timeout=60, check=False)
+
+    # Real (the one real call to gh)
+
+    def test_real_hands_subprocess_exactly_these_arguments(self):
+        env = {'A': '1'}
+        done = subprocess.CompletedProcess(['x'], 3, stdout='out')
+        with mock.patch.object(fp.subprocess, 'run', return_value=done) as run:
+            self.assertEqual(fp.Real().run(['/x', 'y'], env, 77), (3, 'out'))
+            run.assert_called_once_with(['/x', 'y'], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, text=True, shell=False, start_new_session=True,
+                                        check=False, timeout=77)
+            fp.Real().run(['/x'], env)
+        self.assertEqual(run.call_args.kwargs['timeout'], 600)  # the default is ten minutes
+
+    def test_real_maps_a_timeout_and_a_missing_tool_to_their_codes(self):
+        for err, code in ((subprocess.TimeoutExpired('x', 1), 'tool-timeout'), (FileNotFoundError('x'), 'tool-missing'),
+                          (PermissionError('x'), 'tool-missing')):
+            with self.subTest(code=code, err=type(err).__name__), mock.patch.object(fp.subprocess, 'run',
+                                                                                    side_effect=err):
+                self.assertEqual(self.code_of(fp.Real().run, ['/x'], {}), code)
+        self.assertEqual(self.code_of(fp.Real().run, [str(self.dir / 'no-such-tool')], {}), 'tool-missing')
+
+    def test_a_real_child_gets_only_the_given_env_no_stdin_its_own_session_and_nothing_from_stderr(self):
+        code = ("import os, sys; print(sorted(k for k in os.environ if k.startswith('FLEETTEST')));"
+                " print(repr(sys.stdin.read())); print(os.getsid(0) == os.getpid());"
+                " sys.stderr.write('noise'); sys.exit(3)")
+        with mock.patch.dict(os.environ, {'FLEETTEST_PARENT': '1'}):
+            got = fp.Real().run([sys.executable, '-c', code], {'FLEETTEST_CHILD': '1', 'PATH': os.environ['PATH']})
+        self.assertEqual(got, (3, "['FLEETTEST_CHILD']\n''\nTrue\n"))
+
+    def test_a_real_child_that_outlives_its_timeout_is_refused_tool_timeout(self):
+        self.assertEqual(self.code_of(fp.Real().run, [sys.executable, '-c', 'import time; time.sleep(60)'], {}, 1),
+                         'tool-timeout')
+
+    # snapshot
+
+    def test_snapshot_takes_a_file_of_exactly_the_limit_and_stops_reading_at_the_first_chunk_over_it(self):
+        src, stage = self.dir / 'f', self.dir / 'stage'
+        stage.mkdir()
+        src.write_bytes(b'x' * 10)
+        got = fp.snapshot(src, stage, 10)
+        self.assertEqual((got.size, got.sha256, got.path.read_bytes()), (10, sha(b'x' * 10), b'x' * 10))
+        src.write_bytes(b'y' * 100)
+        (stage / 'f').unlink()
+        with mock.patch.object(fp, 'CHUNK', 4):
+            self.assertEqual(self.code_of(fp.snapshot, src, stage, 10), 'size')
+        self.assertLessEqual((stage / 'f').stat().st_size, 10)  # refused while reading, not after the whole copy
+        src.write_bytes(b'x' * 11)
+        (stage / 'f').unlink()
+        self.assertEqual(self.code_of(fp.snapshot, src, stage, 10), 'size')
+
+    def test_snapshot_never_overwrites_a_file_in_the_stage(self):
+        src, stage = self.dir / 'f', self.dir / 'stage'
+        stage.mkdir()
+        src.write_bytes(b'new')
+        (stage / 'f').write_bytes(b'old')
+        with self.assertRaises(FileExistsError):
+            fp.snapshot(src, stage, 10)
+        self.assertEqual((stage / 'f').read_bytes(), b'old')
+
+    def test_snapshot_closes_the_file_it_refuses(self):
+        (self.dir / 'folder').mkdir()
+        (self.dir / 'stage').mkdir()
+        opened, closed, real_open, real_close = [], [], os.open, os.close
+
+        def spy_open(*a, **kw):
+            fd = real_open(*a, **kw)
+            opened.append(fd)
+            return fd
+
+        def spy_close(fd):
+            closed.append(fd)
+            return real_close(fd)
+        with mock.patch.object(os, 'open', spy_open), mock.patch.object(os, 'close', spy_close):
+            self.assertEqual(self.code_of(fp.snapshot, self.dir / 'folder', self.dir / 'stage', 10), 'unlisted')
+        self.assertTrue(opened)
+        self.assertEqual(sorted(opened), sorted(closed))
+
+    # the pin
+
+    def test_the_pin_serial_may_be_zero_and_head_and_tree_must_be_strings(self):
+        head, tree = 'a' * 40, 'b' * 40
+        fp.check_pin(json.dumps({'serial': 0, 'head': head, 'tree': tree}).encode(), None)
+        for what in ('1' * 40, '[]', 'null', 'true', '{}'):
+            for key in ('head', 'tree'):
+                doc = {'serial': 1, 'head': head, 'tree': tree}
+                raw = json.dumps(doc).replace(f'"{doc[key]}"', what).encode()
+                with self.subTest(key=key, what=what):
+                    self.assertEqual(self.code_of(fp.check_pin, raw, None), 'form')
+
+    # the command line
+
+    def test_the_command_line_has_exactly_seven_words_with_these_flags_and_a_plain_decimal(self):
+        ok = ['x', 'publish', 'd', '--owner-pub', 'k', '--min-serial', '12']
+        self.assertEqual(fp.parse_args(ok), ('publish', Path('d'), 'k', 12))
+        self.assertEqual(fp.parse_args(ok[:1] + ['verify'] + ok[2:])[0], 'verify')
+        for bad in (ok[:-1], ok + ['extra'], ok[:3] + ['--owner', 'k', '--min-serial', '1'],
+                    ok[:5] + ['--min', '1'], ok[:3] + ['--min-serial', '1', '--owner-pub', 'k'],
+                    ok[:1] + ['other'] + ok[2:], ok[:1] + ['x'] + ok[2:], ok[:1] + ['Publish'] + ok[2:], ok[:6] + ['²'], ok[:6] + ['١'], ok[:6] + ['1.5'],
+                    ok[:6] + ['-1'], ok[:6] + ['+1'], ok[:6] + [''], ok[:6] + [' 1'], ok[:6] + ['1 ']):
+            with self.subTest(bad[-3:]):
+                self.assertIsNone(fp.parse_args(bad))
+
+    # blob ids
+
+    def test_blob_ids_are_the_bytes_as_they_are_and_with_only_crlf_read_as_lf(self):
+        self.assertEqual(fp.blob_ids(b'a\r\nb\rc\n'), {blob(b'a\r\nb\rc\n'), blob(b'a\nb\rc\n')})
+        self.assertEqual(fp.blob_ids(b'a\n'), {blob(b'a\n')})
+        self.assertEqual(fp.blob_ids(b'a\rb'), {blob(b'a\rb')})  # a lone CR is never turned into LF
+        self.assertNotIn(blob(b'a\nb\nc\n'), fp.blob_ids(b'a\r\nb\rc\n'))
+
+    # the bundle name
+
+    def test_bundle_name_of_a_url_below_the_release_or_with_a_tilde_or_junk(self):
+        prefix = f'https://github.com/{REPO}/releases/download/{TAG}/'
+        doc = lambda name: {'bundle': {'url': prefix + name}}  # noqa: E731
+        self.assertEqual(fp.bundle_name(doc('a.tar'), REPO, TAG), 'a.tar')
+        for name in ('a/b.tar', 'x/', 'dir/../b.tar', '/b'):
+            self.assertIsNone(fp.bundle_name(doc(name), REPO, TAG), name)
+        for name in ('a~b', 'ab~', 'a b', 'a\n', 'a?b', '', '.x', '-x', 'aé'):
+            self.assertEqual(self.code_of(fp.bundle_name, doc(name), REPO, TAG), 'bundle-name', name)
+        self.assertIsNone(fp.bundle_name({'bundle': {'url': 'https://example.org/x'}}, REPO, TAG))
+        self.assertIsNone(fp.bundle_name(doc('a.tar'), '', TAG))
+        self.assertIsNone(fp.bundle_name(doc('a.tar'), REPO, 'install-6'))
+
+    # the owner's key line and fingerprint
+
+    def test_owner_key_is_exactly_one_ed25519_line_of_a_68_character_blob(self):
+        self.assertEqual(fp.owner_key(self.key_file(KEY_LINE + b'\n')), KEY_LINE + b'\n')
+        self.assertEqual(fp.owner_key(self.key_file(KEY_LINE + b' a comment, 1')), KEY_LINE + b' a comment, 1')
+        for what, data in {'67 chars': b'ssh-ed25519 ' + b'A' * 67, '69 chars': b'ssh-ed25519 ' + b'A' * 69,
+                           'dash': b'ssh-ed25519 ' + b'A' * 67 + b'-', 'underscore': b'ssh-ed25519 ' + b'A' * 67 + b'_',
+                           'padding': b'ssh-ed25519 ' + b'A' * 67 + b'=', 'tab comment': KEY_LINE + b'\tc',
+                           'tab before blob': b'ssh-ed25519\t' + b'A' * 68, 'two spaces': b'ssh-ed25519  ' + b'A' * 68,
+                           'no blob': b'ssh-ed25519', 'rsa': b'ssh-rsa ' + b'A' * 68, 'dss': b'ssh-dss ' + b'A' * 68,
+                           'ed448': b'ssh-ed448 ' + b'A' * 68, 'any ssh-': b'ssh-x ' + b'A' * 68,
+                           'ecdsa': b'ecdsa-sha2-nistp256 ' + b'A' * 68}.items():
+            with self.subTest(what):
+                self.assertEqual(self.code_of(fp.owner_key, self.key_file(data)), 'key')
+
+    def test_owner_key_pins_the_fingerprint_exactly_and_only_in_the_sha256_form(self):
+        path, want = self.key_file(KEY_LINE), 'SHA256:' + 'A' * 43
+        listed = lambda fpr, code=0: fake_run(code, f'256 {fpr} test (ED25519)\n'.encode())  # noqa: E731
+        self.assertEqual(fp.owner_key(path, want, listed(want)), KEY_LINE)
+        near = 'SHA256:' + 'A' * 42 + 'B'
+        for what, run in {'a near miss': listed(near), 'a nonzero exit': listed(want, 1),
+                          'one word': fake_run(0, b'256'), 'nothing': fake_run(0, b''),
+                          'the fingerprint first': fake_run(0, f'{want} 256 x'.encode())}.items():
+            with self.subTest(what):
+                self.assertEqual(self.code_of(fp.owner_key, path, want, run), 'key')
+        for odd in ('abc', 'SHA256:' + 'A' * 42, 'SHA256:' + 'A' * 44, 'SHA256:' + 'A' * 42 + '-', 'sha256:' + 'A' * 43,
+                    'MD5:' + 'A' * 43, 'SHA256:' + 'A' * 43 + ' '):
+            with self.subTest(odd):  # even a run that echoes the odd value back is refused: the form is checked first
+                self.assertEqual(self.code_of(fp.owner_key, path, odd, listed(odd.strip())), 'key')
+        asked = []
+        fp.owner_key(path, want, lambda argv, stdin: asked.append((argv, stdin)) or (0, f'256 {want} t'.encode()))
+        self.assertEqual(asked, [((fp.SSH_KEYGEN, '-l', '-f', path), b'')])
+
+    # the two signature checks
+
+    def test_a_signature_counts_only_with_a_zero_exit_and_the_right_good_line(self):
+        for verify, ns in ((fp.verify_signature, fp.NS), (fp.verify_pin_signature, fp.PIN_NS)):
+            ok = good_out(ns)
+            self.assertIsNone(verify(b't', b's', KEY_LINE, fake_run(0, ok)))
+            for what, code, out in (('a nonzero exit', 1, ok), ('another nonzero exit', 255, ok), ('no output', 0, b''),
+                                    ('bad output', 0, b'Bad signature'), ('another namespace', 0, good_out('other')),
+                                    ('the other kind', 0, good_out(fp.NS if ns == fp.PIN_NS else fp.PIN_NS)),
+                                    ('another principal', 0, good_out(ns, 'someone')),
+                                    ('a junk first line', 0, b'x' + ok), ('the line not first', 0, b'\n' + ok)):
+                with self.subTest(verify=verify.__name__, what=what):
+                    self.assertEqual(self.code_of(verify, b't', b's', KEY_LINE, fake_run(code, out)), 'sig')
+
+    def test_the_signature_check_writes_one_allowed_signers_line_for_its_own_namespace(self):
+        for verify, ns in ((fp.verify_signature, fp.NS), (fp.verify_pin_signature, fp.PIN_NS)):
+            seen = []
+
+            def spy(argv, stdin):
+                files = {flag: Path(argv[argv.index(flag) + 1]).read_bytes() for flag in ('-f', '-s')}
+                seen.append((argv, stdin, files))
+                return 0, good_out(ns)
+            verify(b'the text', b'the sig', KEY_LINE + b' comment', spy)
+            ((argv, stdin, files),) = seen
+            self.assertEqual(files['-f'], f'owner namespaces="{ns}" ssh-ed25519 {BLOB68}\n'.encode())
+            self.assertEqual((files['-s'], stdin), (b'the sig', b'the text'))
+            self.assertEqual((argv[0], argv[1:3], argv[argv.index('-I') + 1], argv[argv.index('-n') + 1]),
+                             (fp.SSH_KEYGEN, ('-Y', 'verify'), 'owner', ns))
+
+    def test_verify_signature_refuses_a_key_that_is_not_one_ed25519_blob_before_it_asks_ssh_keygen(self):
+        for what, key in {'empty': b'', 'type only': b'ssh-ed25519', 'rsa': b'ssh-rsa ' + BLOB68.encode(),
+                          '67': b'ssh-ed25519 ' + b'A' * 67, '69': b'ssh-ed25519 ' + b'A' * 69,
+                          'dash': b'ssh-ed25519 ' + b'A' * 67 + b'-', 'padding': b'ssh-ed25519 ' + b'A' * 67 + b'=',
+                          'trailing junk glued on': b'ssh-ed25519 ' + b'A' * 68 + b'!'}.items():
+            with self.subTest(what):
+                self.assertEqual(self.code_of(fp.verify_signature, b't', b's', key, no_run), 'key')
+
+
+class VendoredRules(unittest.TestCase):
+    """Section 1's rules one at a time, over a fake ssh-keygen that says Good: each field, each bound, each equality."""
+
+    SIGNED = staticmethod(fake_run(0, good_out(fp.NS)))
+
+    def signed(self, doc, *, now=NOW, min_serial=0, in_tree=lambda *_: True, raw=None):
+        text = raw if raw is not None else json.dumps(doc).encode()
+        return fp.signed_install(text, b'sig', KEY_LINE, min_serial=min_serial, now=now, in_tree=in_tree,
+                                 run=self.SIGNED)
+
+    def code_of(self, *args, **kw) -> str:
+        with self.assertRaises(fp.Refused) as why:
+            self.signed(*args, **kw)
+        return why.exception.code
+
+    def test_a_manifest_is_valid_until_the_second_before_valid_until(self):
+        until = NOW + timedelta(days=90)
+        doc = manifest(until)
+        self.assertEqual(self.signed(doc, now=until - timedelta(seconds=1)), doc)
+        self.assertEqual(self.code_of(doc, now=until), 'expired')
+        self.assertEqual(self.code_of(doc, now=until + timedelta(seconds=1)), 'expired')
+
+    def test_a_serial_equal_to_the_floor_is_fine_and_one_below_is_rollback(self):
+        doc = manifest()
+        self.assertEqual(self.signed(doc, min_serial=SERIAL), doc)
+        self.assertEqual(self.code_of(doc, min_serial=SERIAL + 1), 'rollback')
+
+    def test_a_manifest_of_exactly_the_size_limit_is_read_and_one_byte_more_is_size(self):
+        body = json.dumps(manifest()).encode()
+        self.assertEqual(self.signed(None, raw=body + b' ' * (fp.MAX_BYTES - len(body)))['serial'], SERIAL)
+        self.assertEqual(self.code_of(None, raw=body + b' ' * (fp.MAX_BYTES + 1 - len(body))), 'size')
+
+    def test_the_tree_question_is_asked_for_both_bootstraps_and_either_no_refuses(self):
+        doc, asked = manifest(), []
+        self.signed(doc, in_tree=lambda head, blob_id: asked.append((head, blob_id)) or True)
+        self.assertEqual(asked, [(H40, doc['bootstrap']['ps1']['blob']), (H40, doc['bootstrap']['sh']['blob'])])
+        for name in fp.OSES:
+            with self.subTest(name):
+                self.assertEqual(self.code_of(doc, in_tree=lambda head, b, name=name: b != doc['bootstrap'][name]['blob']),
+                                 'tree')
+
+    def test_every_field_of_the_schema_is_checked_with_the_form_code(self):
+        paths = [('serial',), ('valid_until',), ('source_head',), ('lock_sha256',), ('bootstrap',), ('kit',), ('bundle',),
+                 ('bootstrap', 'ps1'), ('bootstrap', 'sh'), ('bootstrap', 'ps1', 'sha256'), ('bootstrap', 'ps1', 'blob'),
+                 ('bootstrap', 'sh', 'sha256'), ('bootstrap', 'sh', 'blob'), ('kit', 'serial'),
+                 ('kit', 'kit_json_sha256'), ('bundle', 'head'), ('bundle', 'tree'), ('bundle', 'url'),
+                 ('bundle', 'sha256'), ('bundle', 'size')]
+        keys = {('bootstrap',): fp.OSES, ('kit',): fp.KIT_KEYS, ('bundle',): fp.BUNDLE_KEYS,
+                ('bootstrap', 'ps1'): fp.BOOT_KEYS, ('bootstrap', 'sh'): fp.BOOT_KEYS}
+        for path in paths:
+            for bad in ('zz', 1.5, -1, None, [], True, {'x': 1}) + ((list(keys[path]),) if path in keys else ()):
+                doc = manifest()
+                node = doc
+                for step in path[:-1]:
+                    node = node[step]
+                if node[path[-1]] == bad and type(node[path[-1]]) is type(bad):
+                    continue
+                node[path[-1]] = bad
+                with self.subTest(path=path, bad=str(bad)[:20]):
+                    self.assertEqual(self.code_of(doc), 'form')
+
+    def test_a_duplicate_key_is_refused_even_in_an_otherwise_valid_manifest(self):
+        body = json.dumps(manifest()).encode()
+        self.assertEqual(self.code_of(None, raw=body[:-1] + b', "serial": 5}'), 'form')
+        nested = body.replace(b'"size"', b'"size": 1, "size"')
+        self.assertEqual(self.code_of(None, raw=nested), 'form')
+        self.assertEqual(self.signed(None, raw=body)['serial'], SERIAL)
+
+    def test_a_json_that_recurses_too_deep_is_form_and_never_a_crash(self):
+        with mock.patch.object(fp.json, 'loads', side_effect=RecursionError):
+            self.assertEqual(self.code_of(None, raw=b'{}'), 'form')
+
+    def test_a_valid_until_must_be_the_zero_padded_form(self):
+        for bad in ('2026-1-1T0:0:0Z', '2026-12-01T00:00:00', '2026-12-01 00:00:00Z', ' 2026-12-01T00:00:00Z'):
+            with self.subTest(bad), self.assertRaises(ValueError):
+                fp._parse_utc(bad)
+        self.assertEqual(fp._parse_utc('2026-12-01T00:00:00Z'), datetime(2026, 12, 1, tzinfo=timezone.utc))
+
+
+class Constants(unittest.TestCase):
+    def test_gitattributes_is_these_exact_bytes(self):
+        self.assertEqual(fp.GITATTRIBUTES, b'* text=auto eol=lf\n*.ps1 eol=crlf\n')
+
+    def test_the_regexes_and_bounds_of_the_publisher(self):
+        self.assertEqual(fp.DIR_NAME.pattern, r'install-(0|[1-9][0-9]{0,9})')
+        self.assertEqual(fp.INSTALL_TAG.pattern, r'install-(0|[1-9][0-9]{0,9})')
+        self.assertEqual((fp.USAGE, fp.REFUSED), (2, 1))
+        self.assertEqual(fp.MIN_DAYS, 30)
+
+
+class Readme(unittest.TestCase):
+    TEXT = (ROOT / 'README.md').read_text(encoding='utf-8')
+
+    def test_the_owners_key_section_says_where_the_key_comes_from_and_what_the_log_shows(self):
+        self.assertIn("\n## The owner's key\n", self.TEXT)
+        section = re.split(r'(?m)^## ', self.TEXT.split("## The owner's key\n", 1)[1])[0]
+        for need in ('not in this repo', '`OWNER_PIN_PUB`', 'Environment `release`', '`OWNER_PIN_SHA256`',
+                     'The run log prints the fingerprint of the key it used', 'owner key\nSHA256:',
+                     'The bootstraps carry their own baked copy of the key', '`--owner-pub PATH`'):
+            self.assertIn(need, section.replace('(`owner key\nSHA256', '(`owner key\nSHA256'))
+        self.assertIn('"The owner\'s key"', self.TEXT)  # the one-time settings point at the section
 
 
 class Workflow(unittest.TestCase):
