@@ -2,9 +2,11 @@
 --min-serial N`, run by .github/workflows/install.yml on a GitHub-hosted runner (`verify <dir> ...` does the local
 half only, with no network and no gh). <dir> is release/install-<serial>, committed here by PR. Everything the
 release will carry is checked first, offline: install.json.sig verifies against the owner's public key under namespace
-mirrorstack-fleet-install, every file's sha256 equals the signed one, no file is unlisted, deploy-pin.json is there and
-install.json is valid for at least 30 more days. Only then does it refuse an existing tag install-<serial>, require
-GitHub's Immutable releases setting, create the release with exactly those assets and read GitHub's digests back.
+mirrorstack-fleet-install, every file's sha256 equals the signed one, no file is unlisted, deploy-pin.json is there with
+its shape and install.json is valid for at least 30 more days. Each file is copied once into a private stage; the checks
+and the upload use that copy. Only then does it refuse an existing tag install-<serial>, require
+GitHub's Immutable releases setting, create the release with exactly those assets, read GitHub's digests back and
+require the release to say immutable and not draft.
 Standalone stdlib. An error names the rule and never echoes a value; a refusal is exit 1, a bad command line 2.
 
 Section 1 is a vendored copy of the install.json verifier of the fleet's private repo (fleet/install/manifest.py, at
@@ -20,6 +22,7 @@ import json
 import math
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -204,17 +207,22 @@ FIXED = ('install.json', 'install.json.sig', 'kit.json', 'kit.json.sig', 'deploy
          '.gitattributes', 'bootstrap.ps1', 'bootstrap.sh')
 MAX_SMALL = 1 << 20  # kit.json, the pin, signatures, .gitattributes: far below this; a bigger one is refused
 MAX_ATTR = 4096
+MAX_KIT = 16 << 20  # one kit file (a script): far above the real ones, refused beyond it
+# .gitattributes carries no signature and decides the line endings of the checked-out bootstraps, so it is compared with
+# this committed constant: changing it is a reviewed change to this file, never a release folder's data.
+GITATTRIBUTES = b'* text=auto eol=lf\n*.ps1 eol=crlf\n'
 CHUNK = 1 << 20
 TOOL_TIMEOUT, UPLOAD_TIMEOUT = 600, 1800  # seconds: gh queries; the release upload with the bundle in it
 USAGE, REFUSED = 2, 1
 USAGE_TEXT = ('usage: fleet-install-publish.py publish|verify <dir> --owner-pub <path> --min-serial N\n'
               '  <dir> is release/install-<serial>; both verbs need GITHUB_REPOSITORY (the bundle URL is checked against it);\n'
               '  publish also needs GITHUB_SHA and GH_TOKEN\n')
-DIR_NAME = re.compile(r'install-([0-9]{1,10})', re.ASCII)
+DIR_NAME = re.compile(r'install-(0|[1-9][0-9]{0,9})', re.ASCII)  # canonical decimal: install-007 is not install-7
+INSTALL_TAG = re.compile(r'install-(0|[1-9][0-9]{0,9})', re.ASCII)
 REPO = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}', re.ASCII)
 PUBLISH_CODES = ('serial', 'dir', 'missing', 'no-deploy-pin', 'hash', 'unlisted', 'kit', 'short-validity', 'release-env',
-                 'tag-check-failed', 'tag-exists', 'immutable-off', 'immutable-unreadable', 'tool-missing',
-                 'tool-timeout', 'publish-failed', 'publish-mismatch')
+                 'tag-check-failed', 'tag-exists', 'not-newer', 'immutable-off', 'immutable-unreadable',
+                 'immutable-not-set', 'attributes', 'tool-missing', 'tool-timeout', 'publish-failed', 'publish-mismatch')
 
 
 class Io(Protocol):
@@ -246,18 +254,47 @@ class Asset:
 
 
 class Plan:
-    """What `check_dir` proved: the tag, the manifest and the assets in publish order."""
+    """What `check_dir` proved: the tag, the manifest and the assets in publish order. The assets are the private
+    copy under `stage` that was verified, never the folder it was copied from."""
 
-    def __init__(self, tag: str, doc: dict, assets: list[Asset], key_fpr: str) -> None:
-        self.tag, self.doc, self.assets, self.key_fpr = tag, doc, assets, key_fpr
+    def __init__(self, tag: str, doc: dict, assets: list[Asset], key_fpr: str, stage: Path) -> None:
+        self.tag, self.doc, self.assets, self.key_fpr, self.stage = tag, doc, assets, key_fpr, stage
+
+    def cleanup(self) -> None:
+        """Remove the private copy of the files (the assets live there); safe to call twice."""
+        shutil.rmtree(self.stage, ignore_errors=True)
 
 
-def file_sha(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open('rb') as f:
+def snapshot(src: Path, stage: Path, limit: int) -> Asset:
+    """Copy src into the private stage in ONE read, hashing the very bytes written: the sha256 and size of the Asset
+    describe the copy, and the copy is what is verified and uploaded (nothing re-reads the source). A link, a
+    non-regular file or one over `limit` bytes is refused."""
+    try:
+        fd = os.open(src, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0))
+    except OSError:
+        raise Refused('unlisted') from None
+    dst, digest, size = stage / src.name, hashlib.sha256(), 0
+    with os.fdopen(fd, 'rb') as f, open(dst, 'xb') as out:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise Refused('unlisted')
         while chunk := f.read(CHUNK):
+            size += len(chunk)
+            if size > limit:
+                raise Refused('size')
             digest.update(chunk)
-    return digest.hexdigest()
+            out.write(chunk)
+    return Asset(dst, digest.hexdigest(), size)
+
+
+def check_pin(data: bytes) -> None:
+    """deploy-pin.json has verify-archive's signed_pin shape: exactly serial (an integer), head and tree (40 hex).
+    How it relates to install.json is deliberately free (README, Trust model): it is not bound to the bundle's head
+    and tree, and its serial is not compared with the install serial."""
+    pin = _loads_strict(data)
+    if (not isinstance(pin, dict) or set(pin) != {'serial', 'head', 'tree'} or type(pin['serial']) is not int
+            or not 0 <= pin['serial'] <= MAX_COUNT
+            or not all(type(pin[k]) is str and HEX40.fullmatch(pin[k]) for k in ('head', 'tree'))):
+        raise Refused('form')
 
 
 def blob_ids(data: bytes) -> set[str]:
@@ -286,12 +323,6 @@ def verify_pin_signature(text: bytes, sig: bytes, owner_pub: bytes, run: Run) ->
         raise Refused('sig')
 
 
-def read_small(path: Path, limit: int = MAX_SMALL) -> bytes:
-    if path.stat().st_size > limit:
-        raise Refused('size')
-    return path.read_bytes()
-
-
 def bundle_name(doc: dict, repo: str, tag: str) -> str | None:
     """The bundle's file name when its signed URL is a download of this very release, else None (not public here)."""
     prefix = f'https://github.com/{repo}/releases/download/{tag}/'
@@ -300,13 +331,23 @@ def bundle_name(doc: dict, repo: str, tag: str) -> str | None:
 
 
 def check_dir(d: Path, owner_pub: bytes, min_serial: int, now: datetime, repo: str, run: Run = run_argv) -> Plan:
-    """Offline: everything the release would carry is proven, or Refused with the code. Order: the folder's shape,
-    install.json.sig, the manifest's own rules, validity of 30 days, the bootstraps, the kit, the pin, the bundle, and
-    last that no file is unlisted."""
+    """Offline: everything the release would carry is proven, or Refused with the code. `d` must be exactly
+    release/install-<serial> (relative, canonical serial). Each file is read once into a private stage; every check and
+    the later upload use that copy. Order: the folder's shape, install.json.sig, the manifest's own rules, validity of
+    30 days, the bootstraps, the kit, the pin, .gitattributes, the bundle, and last that no file is unlisted."""
     m = DIR_NAME.fullmatch(d.name)
-    if not m or '..' in d.parts:
+    if not m or d != Path('release') / d.name:
         raise Refused('dir')
-    tag = d.name
+    stage = Path(tempfile.mkdtemp(prefix='fleet-install-'))
+    try:
+        return _check_staged(d, m.group(0), int(m[1]), stage, owner_pub, min_serial, now, repo, run)
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def _check_staged(d: Path, tag: str, folder_serial: int, stage: Path, owner_pub: bytes, min_serial: int, now: datetime,
+                  repo: str, run: Run) -> Plan:
     try:
         entries = {e.name: os.lstat(e.path) for e in os.scandir(d)}
     except OSError:
@@ -317,51 +358,53 @@ def check_dir(d: Path, owner_pub: bytes, min_serial: int, now: datetime, repo: s
         raise Refused('no-deploy-pin')
     if not all(name in entries for name in FIXED + KIT_FILES):
         raise Refused('missing')
-    text, sig = read_small(d / 'install.json', MAX_BYTES), read_small(d / 'install.json.sig')
-    boots = {name: read_small(d / f'bootstrap.{name}') for name in OSES}
+    limits = {name: MAX_KIT if name in KIT_FILES else MAX_SMALL for name in FIXED + KIT_FILES}
+    limits.update({'install.json': MAX_BYTES, '.gitattributes': MAX_ATTR})
+    snap = {name: snapshot(d / name, stage, limits[name]) for name in FIXED + KIT_FILES}
+    data = lambda name: snap[name].path.read_bytes()  # noqa: E731  (the private copy, whose hash is snap[name].sha256)
+    text, sig = data('install.json'), data('install.json.sig')
     # signed_install's tree rule asks whether a blob is in source_head's tree, which only the private repo can answer;
     # here the question is answered below, per file: the bootstrap carries the signed blob id (and the signed sha256)
     doc = signed_install(text, sig, owner_pub, min_serial=min_serial, now=now, in_tree=lambda head, blob: True, run=run)
-    if doc['serial'] != int(m[1]):
+    if doc['serial'] != folder_serial:
         raise Refused('serial')
     if _parse_utc(doc['valid_until']) < now + timedelta(days=MIN_DAYS):
         raise Refused('short-validity')
     for name in OSES:  # each bootstrap is the signed one: its sha256 and its own blob id, not the other's
-        want = doc['bootstrap'][name]
-        if hashlib.sha256(boots[name]).hexdigest() != want['sha256']:
+        want, boot = doc['bootstrap'][name], snap[f'bootstrap.{name}']
+        if boot.sha256 != want['sha256']:
             raise Refused('hash')
-        if want['blob'] not in blob_ids(boots[name]):
+        if want['blob'] not in blob_ids(boot.path.read_bytes()):
             raise Refused('tree')
-    kit_bytes = read_small(d / 'kit.json')
-    if hashlib.sha256(kit_bytes).hexdigest() != doc['kit']['kit_json_sha256']:
+    if snap['kit.json'].sha256 != doc['kit']['kit_json_sha256']:
         raise Refused('hash')
-    verify_pin_signature(kit_bytes, read_small(d / 'kit.json.sig'), owner_pub, run)
-    kit = _loads_strict(kit_bytes)
+    verify_pin_signature(data('kit.json'), data('kit.json.sig'), owner_pub, run)
+    kit = _loads_strict(data('kit.json'))
     files = kit.get('files') if isinstance(kit, dict) else None
     if (not isinstance(files, list) or kit.get('serial') != doc['kit']['serial']
             or not all(isinstance(f, dict) and set(f) == {'path', 'sha256'} and type(f['path']) is str for f in files)
             or sorted(f['path'] for f in files) != sorted(KIT_FILES)):
         raise Refused('kit')
     for f in files:
-        if file_sha(d / f['path']) != f['sha256']:
+        if snap[f['path']].sha256 != f['sha256']:
             raise Refused('hash')
-    pin_bytes = read_small(d / 'deploy-pin.json')
-    verify_pin_signature(pin_bytes, read_small(d / 'deploy-pin.json.sig'), owner_pub, run)
-    if not isinstance(_loads_strict(pin_bytes), dict):
-        raise Refused('form')
-    if (d / '.gitattributes').stat().st_size > MAX_ATTR or not (d / '.gitattributes').read_bytes().isascii():
-        raise Refused('size')
+    verify_pin_signature(data('deploy-pin.json'), data('deploy-pin.json.sig'), owner_pub, run)
+    check_pin(data('deploy-pin.json'))
+    if data('.gitattributes') != GITATTRIBUTES:
+        raise Refused('attributes')
     names = list(FIXED + KIT_FILES)
     if (bundle := bundle_name(doc, repo, tag)) is not None:
         if bundle not in entries or bundle in names:
             raise Refused('missing' if bundle not in entries else 'unlisted')
-        if entries[bundle].st_size != doc['bundle']['size'] or file_sha(d / bundle) != doc['bundle']['sha256']:
+        snap[bundle] = snapshot(d / bundle, stage, MAX_BUNDLE)
+        if snap[bundle].size != doc['bundle']['size'] or snap[bundle].sha256 != doc['bundle']['sha256']:
             raise Refused('hash')
         names.append(bundle)
     if set(entries) != set(names):  # a file the signed manifest does not account for
         raise Refused('unlisted')
-    return Plan(tag, doc, [Asset(d / n, file_sha(d / n), entries[n].st_size) for n in names],
-                key_fingerprint(owner_pub))
+    # every asset's sha256 is that of the verified copy: where the owner signed a hash (bootstraps, kit files, kit.json,
+    # the bundle) it was compared above and is that very value; the rest is covered by a signature over the same bytes
+    return Plan(tag, doc, [snap[n] for n in names], key_fingerprint(owner_pub), stage)
 
 
 def json_out(io: Io, argv: list[str], env: dict[str, str], kind: type, slug: str = 'tag-check-failed'):
@@ -397,6 +440,12 @@ def publish(io: Io, plan: Plan, repo: str, sha: str, token: str, confirmed: str 
     if (any(isinstance(r, dict) and r.get('ref') == f'refs/tags/{tag}' for r in refs)
             or any(isinstance(r, dict) and r.get('tagName') == tag for r in releases)):
         raise Refused('tag-exists')
+    # rollback floor, derived here and not only dispatched: never a serial at or below an install-N release that exists
+    # (min_serial stays an additional floor)
+    newest = max((int(m[1]) for r in releases if isinstance(r, dict) and isinstance(r.get('tagName'), str)
+                  and (m := INSTALL_TAG.fullmatch(r['tagName']))), default=-1)
+    if plan.doc['serial'] <= newest:
+        raise Refused('not-newer')
     # Immutable releases covers only releases created after it is on, so it is read BEFORE the release exists. The
     # job token cannot always read it: then only the owner's recorded confirmation (confirmed == 'yes') goes on.
     code, out = io.run([GH, 'api', f'repos/{repo}/immutable-releases'], env)
@@ -416,6 +465,9 @@ def publish(io: Io, plan: Plan, repo: str, sha: str, token: str, confirmed: str 
                '--notes', notes], env, UPLOAD_TIMEOUT)[0] != 0:
         raise Refused('publish-failed')
     published = json_out(io, [GH, 'api', f'repos/{repo}/releases/tags/{tag}'], env, dict, 'publish-mismatch')
+    # the setting read and the owner's variable are only an early stop: what the created release says is the proof
+    if published.get('immutable') is not True or published.get('draft') is not False:
+        raise Refused('immutable-not-set')
     got = published.get('assets')
     want = {a.name: a for a in plan.assets}
     served: dict[str, dict] = {}
@@ -452,12 +504,14 @@ def main(argv: list[str], environ: dict[str, str], io: Io, run: Run = run_argv, 
         return USAGE
     verb, d, key_path, min_serial = args
     repo = environ.get('GITHUB_REPOSITORY', '')
+    plans: list[Plan] = []
     try:
         try:
             owner_pub = Path(key_path).read_bytes()
         except OSError:
             raise Refused('key') from None
         plan = check_dir(d, owner_pub, min_serial, now or datetime.now(timezone.utc), repo, run)
+        plans.append(plan)
         print(f'fleet-install-publish: {plan.tag} verified against {plan.key_fpr}, {len(plan.assets)} assets,'
               f' valid until {plan.doc["valid_until"]}', file=sys.stderr, flush=True)
         if verb == 'verify':
@@ -469,6 +523,9 @@ def main(argv: list[str], environ: dict[str, str], io: Io, run: Run = run_argv, 
         sys.stderr.write(f'fleet-install-publish: refused {why.code}\n')
         print(f'REFUSED {why.code}')
         return REFUSED
+    finally:
+        for staged in plans:
+            staged.cleanup()
     print(f'OK {plan.tag}')
     print('\n'.join(lines))
     return 0

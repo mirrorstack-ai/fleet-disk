@@ -39,6 +39,7 @@ H40, H64 = 'c' * 40, 'd' * 64
 KIT = {name: f'kit file {name}\n'.encode() for name in fp.KIT_FILES}
 PS1, SH = b'Write-Output "hi"\r\n', b'#!/bin/sh\necho hi\n'
 BUNDLE_BYTES = b'tar bytes ' * 100
+PIN_BYTES = json.dumps({'serial': 4, 'head': 'a' * 40, 'tree': 'b' * 40}).encode()
 
 
 def keygen(tmp: Path, name: str) -> Path:
@@ -74,6 +75,14 @@ class Fixture:
         shutil.copy(str(self.key) + '.pub', self.pub)
         self.dir = tmp / 'release' / TAG
         self.dir.mkdir(parents=True)
+        self.plans: list = []
+        self._cwd = os.getcwd()
+        os.chdir(tmp)  # check_dir wants the relative release/install-<serial>, as the workflow runs it
+
+    def cleanup(self) -> None:
+        for plan in self.plans:
+            plan.cleanup()
+        os.chdir(self._cwd)
 
     def put(self, name: str, data: bytes) -> Path:
         path = self.dir / name
@@ -88,8 +97,8 @@ class Fixture:
                           'python_zip': {'version': '3.14.7', 'sha256': H64}}).encode()
         sign(self.key, self.put('kit.json', kit), fp.PIN_NS)
         if pin:
-            sign(self.key, self.put('deploy-pin.json', b'{"serial": 0, "head": null}'), fp.PIN_NS)
-        self.put('.gitattributes', b'* text=auto eol=lf\n*.ps1 eol=crlf\n')
+            sign(self.key, self.put('deploy-pin.json', PIN_BYTES), fp.PIN_NS)
+        self.put('.gitattributes', fp.GITATTRIBUTES)
         self.put('bootstrap.ps1', PS1)
         self.put('bootstrap.sh', SH)
         doc = manifest(valid_until, **over)
@@ -105,7 +114,9 @@ class Fixture:
         sign(key or self.key, self.put('install.json', json.dumps(doc).encode()), namespace)
 
     def check(self, min_serial: int = 0, repo: str = REPO, now: datetime = NOW) -> 'fp.Plan':
-        return fp.check_dir(self.dir, self.pub.read_bytes(), min_serial, now, repo)
+        plan = fp.check_dir(Path('release') / self.dir.name, self.pub.read_bytes(), min_serial, now, repo)
+        self.plans.append(plan)
+        return plan
 
 
 class FakeGh:
@@ -113,6 +124,8 @@ class FakeGh:
 
     def __init__(self, refs=None, releases=None, immutable=(0, '{"enabled": true}'), create_code=0) -> None:
         self.calls: list[list[str]] = []
+        self.envs: list[dict] = []
+        self.release_flags = {'immutable': True, 'draft': False}  # what GitHub says about the created release
         self.refs, self.releases = refs if refs is not None else [], releases if releases is not None else []
         self.immutable, self.create_code, self.created = immutable, create_code, []
         self.tweak = lambda assets: assets  # a test edits what GitHub "serves" back
@@ -120,6 +133,7 @@ class FakeGh:
 
     def run(self, argv, env, timeout=fp.TOOL_TIMEOUT):
         self.calls.append(list(argv))
+        self.envs.append(dict(env))
         words = argv[1:]
         if words[:1] == ['api'] and 'matching-refs' in words[1]:
             return self.query_code, json.dumps(self.refs)
@@ -133,7 +147,7 @@ class FakeGh:
         if words[:1] == ['api'] and '/releases/tags/' in words[1]:
             assets = [{'name': p.name.replace('.gitattributes', 'default.gitattributes'),
                        'digest': 'sha256:' + sha(p.read_bytes()), 'size': p.stat().st_size} for p in self.created]
-            return 0, json.dumps({'assets': self.tweak(assets)})
+            return 0, json.dumps({'assets': self.tweak(assets), **self.release_flags})
         raise AssertionError(argv)
 
     def creates(self) -> list[list[str]]:
@@ -146,6 +160,7 @@ class Publish(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.fx = Fixture(Path(self._tmp.name))
+        self.addCleanup(self.fx.cleanup)  # runs before the temp dir is removed (LIFO)
 
     def refuses(self, code: str, gh: FakeGh | None = None, confirmed: str = '', **kw) -> FakeGh:
         gh = gh or FakeGh()
@@ -169,7 +184,8 @@ class Publish(unittest.TestCase):
         self.assertEqual([Path(p).name for p in create[4:create.index('--target')]],
                          list(fp.FIXED + fp.KIT_FILES) + [BUNDLE])
         self.assertEqual(create[create.index('--target') + 1], SHA)
-        self.assertEqual(create[4], str(self.fx.dir / 'install.json'))
+        self.assertEqual(Path(create[4]).name, 'install.json')
+        self.assertNotEqual(Path(create[4]).parent, self.fx.dir)  # uploaded from the private copy, not the folder
         self.assertEqual(len(lines), 15)
         self.assertIn(f'bootstrap.sh sha256:{sha(SH)} https://github.com/{REPO}/releases/download/{TAG}/bootstrap.sh',
                       lines)
@@ -319,7 +335,7 @@ class Publish(unittest.TestCase):
         gh = FakeGh()
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = fp.main(['x', 'publish', str(self.fx.dir), '--owner-pub', str(self.fx.pub), '--min-serial', '0'],
+            code = fp.main(['x', 'publish', f'release/{TAG}', '--owner-pub', str(self.fx.pub), '--min-serial', '0'],
                            {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN}, gh, now=NOW)
         self.assertEqual((code, out.getvalue().strip()), (1, 'REFUSED unlisted'))
         self.assertEqual(gh.calls, [])
@@ -333,7 +349,7 @@ class Publish(unittest.TestCase):
 
     def test_another_serial_that_only_starts_with_the_tag_is_not_the_tag(self):
         self.fx.build()
-        gh = FakeGh(refs=[{'ref': f'refs/tags/{TAG}0'}], releases=[{'tagName': f'{TAG}0', 'isDraft': False}])
+        gh = FakeGh(refs=[{'ref': f'refs/tags/{TAG}0'}], releases=[{'tagName': 'v1', 'isDraft': False}])
         fp.publish(gh, self.fx.check(), REPO, SHA, TOKEN)
         self.assertEqual(len(gh.creates()), 1)
 
@@ -391,11 +407,157 @@ class Publish(unittest.TestCase):
         self.fx.build()
         self.refuses('publish-failed', FakeGh(create_code=1))
 
+    # review of I02: the pin, the immutable flag, one read per file, the folder, the floor, .gitattributes, test gaps
+
+    def put_pin(self, data: bytes) -> None:
+        sign(self.fx.key, self.fx.put('deploy-pin.json', data), fp.PIN_NS)
+
+    def test_the_pin_has_exactly_serial_head_tree_in_verify_archives_shape(self):
+        good = {'serial': 4, 'head': 'a' * 40, 'tree': 'b' * 40}
+        for bad in (b'[1]', b'"x"', b'null', b'{"serial": 0, "head": null}', json.dumps({**good, 'x': 1}).encode(),
+                    json.dumps({k: v for k, v in good.items() if k != 'tree'}).encode(),
+                    json.dumps({**good, 'serial': True}).encode(), json.dumps({**good, 'serial': 1.0}).encode(),
+                    json.dumps({**good, 'serial': -1}).encode(), json.dumps({**good, 'head': 'A' * 40}).encode(),
+                    json.dumps({**good, 'tree': 'b' * 39}).encode(), b'{"serial": 1, "serial": 1}', b'not json'):
+            with self.subTest(bad[:30]):
+                self.fx.build()
+                self.put_pin(bad)
+                self.refuses_locally('form')
+
+    def test_a_pin_of_another_head_tree_or_serial_than_the_bundle_is_deliberately_accepted(self):
+        self.fx.build()
+        self.put_pin(json.dumps({'serial': 99, 'head': '1' * 40, 'tree': '2' * 40}).encode())  # README: relation free
+        self.assertEqual(self.fx.check().tag, TAG)
+
+    def test_the_created_release_must_read_back_immutable_and_not_a_draft(self):
+        self.fx.build()
+        for flags in ({'immutable': False, 'draft': False}, {'immutable': True, 'draft': True}, {'draft': False},
+                      {'immutable': 'true', 'draft': False}, {'immutable': True}):
+            with self.subTest(flags):
+                gh = FakeGh()
+                gh.release_flags = flags
+                self.refuses('immutable-not-set', gh)
+
+    def test_a_confirmed_but_wrong_immutable_variable_does_not_publish_a_mutable_release_unnoticed(self):
+        self.fx.build()
+        gh = FakeGh(immutable=(1, ''))
+        gh.release_flags = {'immutable': False, 'draft': False}
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.refuses('immutable-not-set', gh, 'yes')
+
+    def test_the_uploaded_bytes_are_the_verified_ones_even_if_the_folder_changes_after_the_check(self):
+        self.fx.build()
+        plan = self.fx.check()
+        self.fx.put('bootstrap.sh', SH + b'echo swapped\n')
+        self.fx.put(BUNDLE, b'swapped')
+        gh = FakeGh()
+        fp.publish(gh, plan, REPO, SHA, TOKEN)  # the read-back digests are those of the signed bytes
+        self.assertEqual(gh.created[0].parent, plan.stage)
+        by_name = {p.name: p for p in gh.created}
+        self.assertEqual(by_name['bootstrap.sh'].read_bytes(), SH)
+        self.assertEqual(by_name[BUNDLE].read_bytes(), BUNDLE_BYTES)
+        self.assertEqual(sha(SH), next(a.sha256 for a in plan.assets if a.name == 'bootstrap.sh'))
+
+    def test_the_stage_is_removed_after_main_and_on_a_refusal(self):
+        self.fx.build()
+        before = set(Path(tempfile.gettempdir()).glob('fleet-install-*'))
+        self.fx.put('extra.txt', b'x')
+        self.refuses_locally('unlisted')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            fp.main(['x', 'publish', f'release/{TAG}', '--owner-pub', str(self.fx.pub), '--min-serial', '0'],
+                    {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN}, FakeGh(), now=NOW)
+        (self.fx.dir / 'extra.txt').unlink()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            fp.main(['x', 'publish', f'release/{TAG}', '--owner-pub', str(self.fx.pub), '--min-serial', '0'],
+                    {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN}, FakeGh(), now=NOW)
+        self.assertEqual(set(Path(tempfile.gettempdir()).glob('fleet-install-*')), before)
+
+    def test_a_symlink_named_like_a_listed_file_is_refused(self):
+        self.fx.build()
+        (self.fx.dir / 'bootstrap.sh').unlink()
+        (self.fx.dir / 'bootstrap.sh').symlink_to(self.fx.dir / 'bootstrap.ps1')
+        self.refuses_locally('unlisted')
+
+    def test_snapshot_refuses_a_link_even_if_it_was_swapped_in_after_the_scan(self):
+        self.fx.build()
+        link = self.fx.dir / 'bootstrap.sh'
+        link.unlink()
+        link.symlink_to(self.fx.dir / 'bootstrap.ps1')
+        with tempfile.TemporaryDirectory() as stage, self.assertRaises(fp.Refused) as why:
+            fp.snapshot(link, Path(stage), 1 << 20)
+        self.assertEqual(why.exception.code, 'unlisted')
+
+    def test_a_bundle_of_the_right_size_and_other_bytes_is_refused_hash(self):
+        self.fx.build()
+        self.fx.put(BUNDLE, b'X' * len(BUNDLE_BYTES))
+        self.refuses_locally('hash')
+
+    def test_a_bundle_whose_signed_size_is_not_its_size_is_refused_hash_though_the_sha_matches(self):
+        self.fx.build(bundle=True)
+        doc = manifest()
+        doc['bundle']['size'] = len(BUNDLE_BYTES) + 1
+        doc['kit']['kit_json_sha256'] = sha((self.fx.dir / 'kit.json').read_bytes())
+        self.fx.signed_install(doc)
+        self.refuses_locally('hash')
+
+    def test_the_folder_must_be_exactly_release_install_serial_in_canonical_form(self):
+        self.fx.build()
+        pub = self.fx.pub.read_bytes()
+        for d in ('../install-5', 'install-5', 'a#b/install-5', 'release/a/install-5', 'x/release/install-5',
+                  str(self.fx.dir), 'release/install-05', 'release/install-005', 'release/install-+5',
+                  'release/install-x/y'):
+            with self.subTest(d), self.assertRaises(fp.Refused) as why:
+                fp.check_dir(Path(d), pub, 0, NOW, REPO)
+            self.assertEqual(why.exception.code, 'dir')
+        self.assertEqual(self.fx.check().tag, TAG)
+
+    def test_leading_zeros_in_the_folder_name_are_refused_so_one_serial_has_one_tag(self):
+        self.fx.build(serial=7)
+        moved = self.fx.dir.parent / 'install-007'
+        self.fx.dir.rename(moved)
+        self.fx.dir = moved
+        self.refuses_locally('dir')
+
+    def test_a_serial_not_above_the_newest_existing_install_release_is_refused_not_newer(self):
+        self.fx.build()
+        for tags in (['install-9'], ['install-4', 'install-50'], ['v1', 'install-6']):
+            with self.subTest(tags):
+                gh = self.refuses('not-newer', FakeGh(releases=[{'tagName': t, 'isDraft': False} for t in tags]))
+                self.assertEqual(gh.creates(), [])
+        gh = FakeGh(releases=[{'tagName': 'install-4', 'isDraft': False}, {'tagName': 'install-abc'}, {'tagName': 'v9'}])
+        fp.publish(gh, self.fx.check(), REPO, SHA, TOKEN)
+        self.assertEqual(len(gh.creates()), 1)
+
+    def test_a_kit_json_serial_other_than_the_signed_one_is_refused_kit(self):
+        self.fx.build()
+        doc = manifest()
+        doc['kit']['serial'] = 4
+        doc['kit']['kit_json_sha256'] = sha((self.fx.dir / 'kit.json').read_bytes())
+        self.fx.signed_install(doc)
+        self.refuses_locally('kit')
+
+    def test_gitattributes_must_be_the_committed_constant(self):
+        for data in (fp.GITATTRIBUTES + b'*.sh eol=lf\n', b'* text=auto eol=lf\n*.ps1 eol=crlf\n' + b'#' * 5000,
+                     'caf\u00e9\n'.encode(), b'', b'* -text\n'):
+            with self.subTest(data[:20]):
+                self.fx.build()
+                self.fx.put('.gitattributes', data)
+                self.refuses_locally('size' if len(data) > fp.MAX_ATTR else 'attributes')
+
+    def test_gh_runs_under_exactly_four_variables(self):
+        self.fx.build()
+        gh = FakeGh()
+        fp.publish(gh, self.fx.check(), REPO, SHA, TOKEN)
+        self.assertTrue(gh.envs)
+        for env in gh.envs:
+            self.assertEqual(set(env), {'PATH', 'GH_TOKEN', 'GH_REPO', 'GH_PROMPT_DISABLED'})
+
     # the command line
 
     def test_main_publishes_and_verify_never_calls_gh(self):
         self.fx.build()
-        argv = lambda verb: ['x', verb, str(self.fx.dir), '--owner-pub', str(self.fx.pub), '--min-serial', '5']  # noqa
+        argv = lambda verb: ['x', verb, f'release/{TAG}', '--owner-pub', str(self.fx.pub), '--min-serial', '5']  # noqa
         env = {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN}
         gh = FakeGh()
         out, err = io.StringIO(), io.StringIO()
