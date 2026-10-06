@@ -39,7 +39,8 @@ H40, H64 = 'c' * 40, 'd' * 64
 KIT = {name: f'kit file {name}\n'.encode() for name in fp.KIT_FILES}
 PS1, SH = b'Write-Output "hi"\r\n', b'#!/bin/sh\necho hi\n'
 BUNDLE_BYTES = b'tar bytes ' * 100
-PIN_BYTES = json.dumps({'serial': 4, 'head': 'a' * 40, 'tree': 'b' * 40}).encode()
+BUNDLE_TREE = 'e' * 40
+PIN_BYTES = json.dumps({'serial': 4, 'head': H40, 'tree': BUNDLE_TREE}).encode()  # the bundle's head and tree
 
 
 def keygen(tmp: Path, name: str) -> Path:
@@ -59,7 +60,7 @@ def manifest(valid_until: datetime = NOW + timedelta(days=90), **over) -> dict:
            'bootstrap': {'ps1': {'sha256': sha(PS1), 'blob': blob(PS1.replace(b'\r\n', b'\n'))},
                          'sh': {'sha256': sha(SH), 'blob': blob(SH)}},
            'kit': {'serial': 3, 'kit_json_sha256': 'f' * 64}, 'lock_sha256': H64,
-           'bundle': {'head': H40, 'tree': 'e' * 40, 'url': BUNDLE_URL, 'sha256': sha(BUNDLE_BYTES),
+           'bundle': {'head': H40, 'tree': BUNDLE_TREE, 'url': BUNDLE_URL, 'sha256': sha(BUNDLE_BYTES),
                       'size': len(BUNDLE_BYTES)}}
     doc.update(over)
     return doc
@@ -424,10 +425,36 @@ class Publish(unittest.TestCase):
                 self.put_pin(bad)
                 self.refuses_locally('form')
 
-    def test_a_pin_of_another_head_tree_or_serial_than_the_bundle_is_deliberately_accepted(self):
+    def pin_with(self, **over) -> bytes:
+        return json.dumps({**json.loads(PIN_BYTES), **over}).encode()
+
+    def test_a_pin_of_the_bundles_head_and_tree_passes_whatever_its_serial(self):
         self.fx.build()
-        self.put_pin(json.dumps({'serial': 99, 'head': '1' * 40, 'tree': '2' * 40}).encode())  # README: relation free
+        self.put_pin(self.pin_with(serial=99))  # the serial is the PC's verify-archive floor, not compared here
         self.assertEqual(self.fx.check().tag, TAG)
+
+    def test_a_pin_of_another_head_than_the_bundle_is_refused_pin_mismatch(self):
+        self.fx.build()
+        self.put_pin(self.pin_with(head='1' * 40))
+        self.refuses_locally('pin-mismatch')
+
+    def test_a_pin_of_another_tree_than_the_bundle_is_refused_pin_mismatch(self):
+        self.fx.build()
+        self.put_pin(self.pin_with(tree='2' * 40))
+        self.refuses_locally('pin-mismatch')
+
+    def test_without_the_bundle_in_the_release_the_pin_is_not_compared(self):
+        self.fx.build(bundle=False)
+        self.put_pin(self.pin_with(head='1' * 40, tree='2' * 40))
+        self.assertEqual(self.fx.check().tag, TAG)
+
+    def test_without_the_bundle_a_pin_of_a_bad_shape_or_signature_is_still_refused(self):
+        self.fx.build(bundle=False)
+        self.put_pin(b'[1]')
+        self.refuses_locally('form')
+        self.fx.build(bundle=False)
+        sign(self.fx.other, self.fx.dir / 'deploy-pin.json', fp.PIN_NS)
+        self.refuses_locally('sig')
 
     def test_the_created_release_must_read_back_immutable_and_not_a_draft(self):
         self.fx.build()

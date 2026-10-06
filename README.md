@@ -34,7 +34,8 @@ carry, normally the previous release's). The job runs `bin/fleet-install-publish
 - both bootstraps equal the signed sha256 and carry the signed git blob id, `kit.json` equals the signed
   `kit_json_sha256`, and `kit.json` and `deploy-pin.json` carry the owner's signature (namespace
   `mirrorstack-fleet-pin`); the five kit files equal `kit.json`, the bundle equals the signed sha256 and size;
-- `deploy-pin.json` is present with exactly `serial` (an integer), `head` and `tree` (40 hex), and no file in the folder
+- `deploy-pin.json` is present with exactly `serial` (an integer), `head` and `tree` (40 hex) and, when the bundle is in
+  the release, its `head` and `tree` equal the signed `bundle.head` and `bundle.tree` (`pin-mismatch`), and no file in the folder
   is unlisted (a link or a folder is unlisted); `.gitattributes` equals the constant committed in the script (it carries
   no signature); the folder is exactly `release/install-<serial>` with a canonical serial (no leading zeros);
 - every file is read once into a private temporary copy, and the checks and the upload use that copy only.
@@ -46,8 +47,10 @@ those assets and reads GitHub's digests back: every asset must be there with the
 `python3 bin/fleet-install-publish.py verify <dir> --owner-pub keys/owner-pin.pub --min-serial N` runs the offline half
 alone (with `GITHUB_REPOSITORY` set). After the create it also requires the read-back release to say `immutable: true` and
 `draft: false` (`immutable-not-set` otherwise), so the owner's variable is only an early stop.
-The pin's relation to `install.json` (its `head`/`tree` against the bundle's, its `serial`) is deliberately not enforced
-until the owner says which relation must hold; only its shape and signature are. The owner's own check of a release is `VERIFY.txt`'s `ssh-keygen` line.
+The deploy pin names exactly the commit and tree the bundle was built from: when the release carries the bundle, the pin's
+`head` and `tree` must equal `install.json`'s `bundle.head` and `bundle.tree` (`pin-mismatch` otherwise). Without the bundle
+in the release the pin is only checked for shape and signature, not compared. The pin's `serial` is not compared here
+(the PC's `verify-archive` enforces its own floor). The owner's own check of a release is `VERIFY.txt`'s `ssh-keygen` line.
 
 Immutable releases: the job's token usually cannot read the setting (it needs admin). Then the run stops with
 `immutable-unreadable` until the owner records their confirmation as the Environment variable

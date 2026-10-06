@@ -3,7 +3,8 @@
 half only, with no network and no gh). <dir> is release/install-<serial>, committed here by PR. Everything the
 release will carry is checked first, offline: install.json.sig verifies against the owner's public key under namespace
 mirrorstack-fleet-install, every file's sha256 equals the signed one, no file is unlisted, deploy-pin.json is there with
-its shape and install.json is valid for at least 30 more days. Each file is copied once into a private stage; the checks
+its shape, signature and (when the bundle is in the release) the bundle's head and tree, and install.json is valid for at
+least 30 more days. Each file is copied once into a private stage; the checks
 and the upload use that copy. Only then does it refuse an existing tag install-<serial>, require
 GitHub's Immutable releases setting, create the release with exactly those assets, read GitHub's digests back and
 require the release to say immutable and not draft.
@@ -220,8 +221,8 @@ USAGE_TEXT = ('usage: fleet-install-publish.py publish|verify <dir> --owner-pub 
 DIR_NAME = re.compile(r'install-(0|[1-9][0-9]{0,9})', re.ASCII)  # canonical decimal: install-007 is not install-7
 INSTALL_TAG = re.compile(r'install-(0|[1-9][0-9]{0,9})', re.ASCII)
 REPO = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}', re.ASCII)
-PUBLISH_CODES = ('serial', 'dir', 'missing', 'no-deploy-pin', 'hash', 'unlisted', 'kit', 'short-validity', 'release-env',
-                 'tag-check-failed', 'tag-exists', 'not-newer', 'immutable-off', 'immutable-unreadable',
+PUBLISH_CODES = ('serial', 'dir', 'missing', 'no-deploy-pin', 'pin-mismatch', 'hash', 'unlisted', 'kit', 'short-validity',
+                 'release-env', 'tag-check-failed', 'tag-exists', 'not-newer', 'immutable-off', 'immutable-unreadable',
                  'immutable-not-set', 'attributes', 'tool-missing', 'tool-timeout', 'publish-failed', 'publish-mismatch')
 
 
@@ -286,15 +287,20 @@ def snapshot(src: Path, stage: Path, limit: int) -> Asset:
     return Asset(dst, digest.hexdigest(), size)
 
 
-def check_pin(data: bytes) -> None:
+def check_pin(data: bytes, bundle: dict | None) -> None:
     """deploy-pin.json has verify-archive's signed_pin shape: exactly serial (an integer), head and tree (40 hex).
-    How it relates to install.json is deliberately free (README, Trust model): it is not bound to the bundle's head
-    and tree, and its serial is not compared with the install serial."""
+    `bundle` is install.json's signed bundle object when this release carries the bundle, else None. The pin names
+    exactly the commit and tree the bundle was built from, so with a bundle its head and tree must equal the bundle's,
+    else Refused('pin-mismatch'). Without a bundle the pin is only shape-checked here (and signature-checked by the
+    caller), not compared. The pin's serial is never compared with install.json: the PC's verify-archive enforces its
+    own floor."""
     pin = _loads_strict(data)
     if (not isinstance(pin, dict) or set(pin) != {'serial', 'head', 'tree'} or type(pin['serial']) is not int
             or not 0 <= pin['serial'] <= MAX_COUNT
             or not all(type(pin[k]) is str and HEX40.fullmatch(pin[k]) for k in ('head', 'tree'))):
         raise Refused('form')
+    if bundle is not None and (pin['head'] != bundle['head'] or pin['tree'] != bundle['tree']):
+        raise Refused('pin-mismatch')
 
 
 def blob_ids(data: bytes) -> set[str]:
@@ -389,11 +395,12 @@ def _check_staged(d: Path, tag: str, folder_serial: int, stage: Path, owner_pub:
         if snap[f['path']].sha256 != f['sha256']:
             raise Refused('hash')
     verify_pin_signature(data('deploy-pin.json'), data('deploy-pin.json.sig'), owner_pub, run)
-    check_pin(data('deploy-pin.json'))
+    bundle = bundle_name(doc, repo, tag)  # the bundle's file name when this release carries it, else None
+    check_pin(data('deploy-pin.json'), doc['bundle'] if bundle is not None else None)
     if data('.gitattributes') != GITATTRIBUTES:
         raise Refused('attributes')
     names = list(FIXED + KIT_FILES)
-    if (bundle := bundle_name(doc, repo, tag)) is not None:
+    if bundle is not None:
         if bundle not in entries or bundle in names:
             raise Refused('missing' if bundle not in entries else 'unlisted')
         snap[bundle] = snapshot(d / bundle, stage, MAX_BUNDLE)
