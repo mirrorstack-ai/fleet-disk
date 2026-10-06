@@ -1,6 +1,8 @@
 # Publishes the owner-signed install set committed under release/install-<serial>/ as the release install-<serial>.
-# Inputs reach the script only through env:; the script refuses unless install.json.sig verifies against
-# keys/owner-pin.pub, every file is the signed one and nothing else is in the folder. It never edits a tag.
+# Inputs reach the script only through env:; the script refuses unless install.json.sig verifies against the owner's
+# public key, every file is the signed one and nothing else is in the folder. It never edits a tag. The key is not in
+# this repo (a copy here would let a merged PR swap it): the owner sets it as the variable OWNER_PIN_PUB (the whole
+# key line) of the Environment `release`, and optionally its fingerprint as OWNER_PIN_SHA256.
 name: install
 on:
   workflow_dispatch:
@@ -30,8 +32,12 @@ jobs:
         with:
           persist-credentials: false
       - env:
+          OWNER_PIN_PUB: ${{ vars.OWNER_PIN_PUB }}
+        run: umask 077 && printf '%s\n' "$OWNER_PIN_PUB" > "$RUNNER_TEMP/owner-pin.pub"
+      - env:
           SERIAL: ${{ inputs.serial }}
           MIN_SERIAL: ${{ inputs.min_serial }}
           GH_TOKEN: ${{ github.token }}
           IMMUTABLE_CONFIRMED: ${{ vars.IMMUTABLE_RELEASES_CONFIRMED }}
-        run: python3 bin/fleet-install-publish.py publish "release/install-$SERIAL" --owner-pub keys/owner-pin.pub --min-serial "$MIN_SERIAL"
+          OWNER_PIN_SHA256: ${{ vars.OWNER_PIN_SHA256 }}
+        run: python3 bin/fleet-install-publish.py publish "release/install-$SERIAL" --owner-pub "$RUNNER_TEMP/owner-pin.pub" --min-serial "$MIN_SERIAL"

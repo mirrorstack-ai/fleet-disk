@@ -1,7 +1,7 @@
 """bin/fleet-install-publish.py over a fake gh and a throwaway ssh-keygen key, with no network: the signature (unsigned,
 wrong key, wrong namespace), every hash, an unlisted file, the missing deploy-pin.json, the 30 days of validity, an
-existing tag, the immutable setting, GitHub's digests read back, the vendored verifier frozen against I01's schema, and
-the workflow's shape. The signature tests are skipped when ssh-keygen is missing. Plain unittest, stdlib only."""
+existing tag, the immutable setting, GitHub's digests read back, the exact gh calls, the owner key from the environment,
+the copied manifest rules frozen against a golden, and the workflow's shape. The signature tests are skipped when ssh-keygen is missing. Plain unittest, stdlib only."""
 from __future__ import annotations
 
 import contextlib
@@ -12,10 +12,13 @@ import json
 import os
 import re
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -126,6 +129,7 @@ class FakeGh:
     def __init__(self, refs=None, releases=None, immutable=(0, '{"enabled": true}'), create_code=0) -> None:
         self.calls: list[list[str]] = []
         self.envs: list[dict] = []
+        self.timeouts: list[int] = []
         self.release_flags = {'immutable': True, 'draft': False}  # what GitHub says about the created release
         self.refs, self.releases = refs if refs is not None else [], releases if releases is not None else []
         self.immutable, self.create_code, self.created = immutable, create_code, []
@@ -135,6 +139,7 @@ class FakeGh:
     def run(self, argv, env, timeout=fp.TOOL_TIMEOUT):
         self.calls.append(list(argv))
         self.envs.append(dict(env))
+        self.timeouts.append(timeout)
         words = argv[1:]
         if words[:1] == ['api'] and 'matching-refs' in words[1]:
             return self.query_code, json.dumps(self.refs)
@@ -408,7 +413,7 @@ class Publish(unittest.TestCase):
         self.fx.build()
         self.refuses('publish-failed', FakeGh(create_code=1))
 
-    # review of I02: the pin, the immutable flag, one read per file, the folder, the floor, .gitattributes, test gaps
+    # second review: the pin, the immutable flag, one read per file, the folder, the floor, .gitattributes, test gaps
 
     def put_pin(self, data: bytes) -> None:
         sign(self.fx.key, self.fx.put('deploy-pin.json', data), fp.PIN_NS)
@@ -580,6 +585,263 @@ class Publish(unittest.TestCase):
         for env in gh.envs:
             self.assertEqual(set(env), {'PATH', 'GH_TOKEN', 'GH_REPO', 'GH_PROMPT_DISABLED'})
 
+
+    # the exact gh calls (the fake alone proves nothing about what is asked of gh)
+
+    def test_publish_makes_exactly_these_gh_calls_in_this_order_under_the_repo(self):
+        self.fx.build()
+        gh = FakeGh()
+        plan = self.fx.check()
+        fp.publish(gh, plan, REPO, SHA, TOKEN)
+        notes = (f'Owner-signed install set {TAG}. Verify install.json with ssh-keygen -Y verify'
+                 f' -n mirrorstack-fleet-install -I owner.')
+        self.assertEqual(gh.calls, [
+            ['/usr/bin/gh', 'api', f'repos/{REPO}/git/matching-refs/tags/{TAG}'],
+            ['/usr/bin/gh', 'release', 'list', '--limit', '1000', '--json', 'tagName,isDraft'],
+            ['/usr/bin/gh', 'api', f'repos/{REPO}/immutable-releases'],
+            ['/usr/bin/gh', 'release', 'create', TAG, *(str(plan.stage / a.name) for a in plan.assets),
+             '--target', SHA, '--title', TAG, '--notes', notes],
+            ['/usr/bin/gh', 'api', f'repos/{REPO}/releases/tags/{TAG}'],
+        ])
+        want_env = {'PATH': '/usr/bin', 'GH_TOKEN': TOKEN, 'GH_REPO': REPO, 'GH_PROMPT_DISABLED': '1'}
+        self.assertEqual(gh.envs, [want_env] * 5)
+        self.assertEqual(gh.envs[0]['GH_REPO'], REPO)
+        self.assertEqual(gh.timeouts, [fp.TOOL_TIMEOUT] * 3 + [fp.UPLOAD_TIMEOUT, fp.TOOL_TIMEOUT])
+
+    # main(): the one real path, where the job token cannot read the immutable setting
+
+    def run_main(self, verb='publish', gh=None, env=None, key=None, run=fp.run_argv):
+        gh = gh or FakeGh()
+        environ = {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN, **(env or {})}
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = fp.main(['x', verb, f'release/{TAG}', '--owner-pub', str(key or self.fx.pub), '--min-serial', '0'],
+                           environ, gh, run=run, now=NOW)
+        return code, out.getvalue(), err.getvalue(), gh
+
+    def test_main_publishes_an_unreadable_immutable_setting_on_the_owners_confirmation(self):
+        self.fx.build()
+        gh = FakeGh(immutable=(1, ''))  # the /immutable-releases call fails: the job token cannot read it
+        code, out, err, _ = self.run_main(gh=gh, env={'IMMUTABLE_CONFIRMED': 'yes'})
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith(f'OK {TAG}\n'))
+        self.assertEqual(len(gh.creates()), 1)
+        self.assertIn('unreadable by this token', err)
+
+    def test_main_refuses_immutable_unreadable_without_the_confirmation(self):
+        self.fx.build()
+        for env in ({}, {'IMMUTABLE_CONFIRMED': ''}, {'IMMUTABLE_CONFIRMED': 'no'}, {'IMMUTABLE_CONFIRMED': 'YES'}):
+            with self.subTest(env):
+                gh = FakeGh(immutable=(1, ''))
+                code, out, _, _ = self.run_main(gh=gh, env=env)
+                self.assertEqual((code, out.strip()), (1, 'REFUSED immutable-unreadable'))
+                self.assertEqual(gh.creates(), [])
+
+    # the bundle's name
+
+    def resign(self, url: str | None = None, **bundle) -> None:
+        """Re-sign install.json with another bundle url (or fields), keeping kit.json's hash right."""
+        doc = manifest()
+        doc['bundle'].update(bundle)
+        if url is not None:
+            doc['bundle']['url'] = url
+        doc['kit']['kit_json_sha256'] = sha((self.fx.dir / 'kit.json').read_bytes())
+        self.fx.signed_install(doc)
+
+    def test_a_bundle_whose_signed_name_is_not_a_plain_file_name_is_refused_bundle_name(self):
+        prefix = BUNDLE_URL[:-len(BUNDLE)]
+        for name in ('', '.hidden', '..', '-x.tar', '~x.tar', '_x.tar', '.gitattributes'):
+            with self.subTest(name):
+                self.fx.build()
+                self.resign(url=prefix + name)
+                self.refuses_locally('bundle-name')
+
+    def test_a_plain_bundle_name_with_dots_dashes_and_underscores_is_fine(self):
+        self.fx.build()
+        (self.fx.dir / BUNDLE).unlink()
+        self.fx.put('A_b-1.2.tar.gz', BUNDLE_BYTES)
+        self.resign(url=BUNDLE_URL[:-len(BUNDLE)] + 'A_b-1.2.tar.gz')
+        self.assertEqual(self.fx.check().assets[-1].name, 'A_b-1.2.tar.gz')
+
+    def test_a_bundle_named_like_a_fixed_file_or_its_published_name_is_refused_unlisted_not_a_traceback(self):
+        for name in ('bootstrap.sh', 'install.json', 'carrier-check.py', 'default.gitattributes'):
+            with self.subTest(name):
+                self.fx.build()
+                self.fx.put(name, BUNDLE_BYTES) if name == 'default.gitattributes' else None
+                self.resign(url=BUNDLE_URL[:-len(BUNDLE)] + name)
+                self.refuses_locally('unlisted')
+        self.fx.build()
+        self.resign(url=BUNDLE_URL[:-len(BUNDLE)] + 'bootstrap.sh')
+        code, out, err, gh = self.run_main()
+        self.assertEqual((code, out.strip(), gh.calls), (1, 'REFUSED unlisted', []))
+        self.assertNotIn('Traceback', err)
+
+    def test_the_read_back_name_of_the_bundle_must_equal_the_signed_name_exactly(self):
+        self.fx.build()
+        for served in (f'default.{BUNDLE}', f'default{BUNDLE}', BUNDLE.upper()):
+            with self.subTest(served):
+                gh = FakeGh()
+                gh.tweak = lambda assets, served=served: [dict(a, name=served) if a['name'] == BUNDLE else a
+                                                          for a in assets]
+                self.refuses('publish-mismatch', gh)
+
+    def test_only_gitattributes_may_be_read_back_under_the_default_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / '.other'
+            path.write_bytes(b'x')
+            plan = fp.Plan(TAG, {'serial': SERIAL}, [fp.Asset(path, sha(b'x'), 1)], 'SHA256:x', Path(tmp))
+            gh = FakeGh()
+            fp.publish(gh, plan, REPO, SHA, TOKEN)  # served as .other, exactly: fine
+            gh = FakeGh()
+            gh.tweak = lambda assets: [dict(a, name='default.other') for a in assets]
+            with self.assertRaises(fp.Refused) as why:
+                fp.publish(gh, plan, REPO, SHA, TOKEN)
+            self.assertEqual(why.exception.code, 'publish-mismatch')
+
+    def test_a_bundle_url_of_this_release_with_an_empty_repo_is_not_this_release(self):
+        self.fx.build()
+        self.resign(url=f'https://github.com//releases/download/{TAG}/{BUNDLE}')
+        self.refuses_locally('unlisted', repo='')  # the bundle file is then a file nothing signed accounts for
+
+    # every size guard, and the path guards, each with the test that fails without it
+
+    def test_a_small_file_over_max_small_is_refused_size(self):
+        for name in ('kit.json.sig', 'deploy-pin.json', 'install.json.sig', 'bootstrap.sh'):
+            with self.subTest(name):
+                self.fx.build()
+                self.fx.put(name, b'x' * (fp.MAX_SMALL + 1))
+                self.refuses_locally('size')
+
+    def test_a_kit_file_over_max_kit_is_refused_size(self):
+        self.fx.build()
+        self.fx.put('verify-archive.py', b'x' * (fp.MAX_KIT + 1))
+        self.refuses_locally('size')
+
+    def test_a_bundle_over_the_bundle_limit_is_refused_size_before_its_hash_is_judged(self):
+        self.fx.build()
+        self.fx.put(BUNDLE, b'x' * 2000)
+        with mock.patch.object(fp, 'MAX_BUNDLE', 1500):  # the signed size (1000) still fits the manifest's own bound
+            self.refuses_locally('size')
+
+    def test_install_json_over_its_limit_is_refused_size_and_each_file_is_snapshotted_under_its_own_limit(self):
+        self.fx.build()
+        self.fx.put('install.json', b'x' * (fp.MAX_BYTES + 1))
+        self.refuses_locally('size')
+        self.fx.build()
+        with mock.patch.object(fp, 'snapshot', wraps=fp.snapshot) as spy:
+            self.fx.check()
+        limits = {call.args[0].name: call.args[2] for call in spy.call_args_list}
+        want = {name: fp.MAX_KIT if name in fp.KIT_FILES else fp.MAX_SMALL for name in fp.FIXED + fp.KIT_FILES}
+        want.update({'install.json': fp.MAX_BYTES, '.gitattributes': fp.MAX_ATTR, BUNDLE: fp.MAX_BUNDLE})
+        self.assertEqual(limits, want)
+
+    def test_snapshot_refuses_a_fifo_or_a_folder_where_a_file_is_expected(self):
+        self.fx.build()
+        fifo = self.fx.dir / 'fifo'
+        os.mkfifo(fifo)
+        (self.fx.dir / 'folder').mkdir()
+        if hasattr(signal, 'SIGALRM'):  # a snapshot that blocked on the FIFO would hang here, not fail
+            signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(AssertionError('snapshot blocked')))
+            signal.alarm(20)
+            self.addCleanup(signal.alarm, 0)
+        for path in (fifo, self.fx.dir / 'folder'):
+            with self.subTest(path.name), tempfile.TemporaryDirectory() as stage, self.assertRaises(fp.Refused) as why:
+                fp.snapshot(path, Path(stage), 1 << 20)
+            self.assertEqual(why.exception.code, 'unlisted')
+        self.assertTrue(stat.S_ISFIFO(os.lstat(fifo).st_mode))
+
+    def test_the_pin_serial_has_an_upper_bound(self):
+        self.fx.build()
+        self.put_pin(self.pin_with(serial=fp.MAX_COUNT))
+        self.assertEqual(self.fx.check().tag, TAG)
+        self.put_pin(self.pin_with(serial=fp.MAX_COUNT + 1))
+        self.refuses_locally('form')
+
+    def test_a_kit_json_path_that_is_not_a_string_is_refused_kit_and_never_a_traceback(self):
+        for bad in (['carrier-check.py'], 5, None, {'x': 1}):
+            with self.subTest(str(bad)):
+                self.fx.build()
+                kit = json.loads((self.fx.dir / 'kit.json').read_bytes())
+                kit['files'][0]['path'] = bad
+                data = json.dumps(kit).encode()
+                sign(self.fx.key, self.fx.put('kit.json', data), fp.PIN_NS)
+                self.resign()
+                self.refuses_locally('kit')
+
+    # the owner's key comes from the release environment, never from this repo
+
+    def test_there_is_no_key_file_in_the_repo(self):
+        self.assertEqual([p.name for p in ROOT.rglob('*.pub') if '.git' not in p.parts], [])
+        self.assertFalse((ROOT / 'keys').exists())
+
+    def test_a_missing_or_malformed_key_file_is_refused_key_before_anything_else(self):
+        self.fx.build()
+        line = self.fx.pub.read_bytes()
+        blob = line.split()[1]
+        bad = {'empty': b'', 'newline only': b'\n', 'two lines': line + line, 'blank then key': b'\n' + line,
+               'wrong type': b'ssh-rsa ' + blob + b'\n', 'short blob': b'ssh-ed25519 ' + blob[:-1] + b'\n',
+               'long blob': b'ssh-ed25519 ' + blob + b'A\n', 'crlf': line.rstrip(b'\n') + b'\r\n',
+               'leading space': b' ' + line, 'two blank at end': line + b'\n', 'comment with a control char':
+               b'ssh-ed25519 ' + blob + b' a\x00b\n', 'non-ascii comment': b'ssh-ed25519 ' + blob + ' é\n'.encode(),
+               'options': b'no-pty ' + line, 'a private-key header': b'-----BEGIN OPENSSH PRIVATE KEY-----\n',
+               'too big': b'ssh-ed25519 ' + blob + b' ' + b'c' * 5000 + b'\n'}
+        for what, data in bad.items():
+            with self.subTest(what):
+                key = self.fx.tmp / 'bad.pub'
+                key.write_bytes(data)
+                gh = FakeGh()
+                code, out, _, _ = self.run_main(gh=gh, key=key)
+                self.assertEqual((code, out.strip(), gh.calls), (1, 'REFUSED key', []))
+        code, out, _, _ = self.run_main(key=self.fx.tmp / 'no-such-file.pub')
+        self.assertEqual((code, out.strip()), (1, 'REFUSED key'))
+
+    def test_a_key_line_with_or_without_a_comment_and_a_final_newline_is_accepted(self):
+        self.fx.build()
+        blob = self.fx.pub.read_bytes().split()[1]
+        for data in (b'ssh-ed25519 ' + blob, b'ssh-ed25519 ' + blob + b'\n', b'ssh-ed25519 ' + blob + b' my key, 2026\n'):
+            with self.subTest(data[-12:]):
+                key = self.fx.tmp / 'ok.pub'
+                key.write_bytes(data)
+                self.assertEqual(self.run_main('verify', key=key)[0], 0)
+
+    def test_the_pinned_fingerprint_must_match_the_keys(self):
+        self.fx.build()
+        mine = fp.key_fingerprint(self.fx.pub.read_bytes())
+        other = fp.key_fingerprint(Path(str(self.fx.other) + '.pub').read_bytes())
+        code, out, err, _ = self.run_main('verify', env={'OWNER_PIN_SHA256': mine})  # the real ssh-keygen -lf agrees
+        self.assertEqual(code, 0)
+        self.assertIn(f'owner key {mine}', err)
+        for want in (other, 'abc', 'SHA256:' + 'A' * 43, mine.lower(), mine + ' x'):
+            with self.subTest(want):
+                gh = FakeGh()
+                code, out, _, _ = self.run_main(gh=gh, env={'OWNER_PIN_SHA256': want})
+                self.assertEqual((code, out.strip(), gh.calls), (1, 'REFUSED key', []))
+        # a variable that is not set at all (empty) pins nothing; ssh-keygen failing with one set refuses
+        self.assertEqual(self.run_main('verify', env={'OWNER_PIN_SHA256': ''})[0], 0)
+        code, out, _, _ = self.run_main('verify', env={'OWNER_PIN_SHA256': mine}, run=lambda argv, stdin: (1, b''))
+        self.assertEqual((code, out.strip()), (1, 'REFUSED key'))
+
+    def test_the_fingerprint_is_asked_of_ssh_keygen_for_this_very_file(self):
+        self.fx.build()
+        mine = fp.key_fingerprint(self.fx.pub.read_bytes())
+        calls = []
+
+        def spy(argv, stdin):
+            calls.append(tuple(argv))
+            return fp.run_argv(argv, stdin)
+        self.assertEqual(self.run_main('verify', env={'OWNER_PIN_SHA256': mine}, run=spy)[0], 0)
+        self.assertEqual(calls[0], (fp.SSH_KEYGEN, '-l', '-f', str(self.fx.pub)))
+
+    # the public repo carries no internal names
+
+    def test_the_public_files_name_no_private_repo_commit_or_internal_id(self):
+        banned = re.compile(r'\bI0\d\b|\bP\+|[0-9a-f]{7,40}\b.*\bmerge\b|manifest\.py|private repo|phone|fleet\.core', re.I)
+        for rel in ('bin/fleet-install-publish.py', 'README.md', '.github/workflows/install.yml'):
+            for n, line in enumerate((ROOT / rel).read_text(encoding='utf-8').splitlines(), 1):
+                self.assertIsNone(banned.search(line), f'{rel}:{n}')
+        for n, line in enumerate((ROOT / 'bin/fleet-install-publish.py').read_text(encoding='utf-8').splitlines(), 1):
+            self.assertIsNone(re.search(r'\bcommit [0-9a-f]{7,40}\b', line), f'script:{n}')
+
     # the command line
 
     def test_main_publishes_and_verify_never_calls_gh(self):
@@ -611,18 +873,8 @@ class Publish(unittest.TestCase):
         self.assertEqual((done.returncode, done.stdout.strip()), (1, 'REFUSED dir'))
 
 
-class OwnerKey(unittest.TestCase):
-    PIN = ('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDVIWCyjvYMcqnICKNrysNOrkMmE3NXHbRFTlQG9fPTZ fleet-pin\n')
-
-    def test_the_committed_key_is_the_owners_one_line_and_its_fingerprint_is_stable(self):
-        text = (ROOT / 'keys/owner-pin.pub').read_text(encoding='ascii')
-        self.assertEqual(text, self.PIN)
-        self.assertEqual(fp.key_fingerprint(text.encode()), 'SHA256:WUdTSPIrp0kNwRkqLVXN7ifG9Gg5pZF95NnPsPDKTfU')
-        self.assertNotRegex(text, r'PRIVATE')
-
-
 class VendoredVerifier(unittest.TestCase):
-    """Section 1 against a frozen golden of I01's fleet/install/manifest.py (private repo commit 433018e): a change to
+    """Section 1 (a copy of the fleet's install manifest rules, schema version 1) against a frozen golden: a change to
     either side must come with a new copy and a new golden."""
 
     def test_the_constants_equal_the_golden(self):
@@ -642,9 +894,9 @@ class VendoredVerifier(unittest.TestCase):
         self.assertEqual(fp.SSH_KEYGEN, '/usr/bin/ssh-keygen' if os.name != 'nt'
                          else 'C:\\Windows\\System32\\OpenSSH\\ssh-keygen.exe')
 
-    def test_the_top_of_the_file_names_the_copied_commit(self):
-        self.assertRegex((ROOT / 'bin/fleet-install-publish.py').read_text(encoding='utf-8')[:2500],
-                         r'commit 433018e55d94a31afb42ec07670393ae3e8b9fae')
+    def test_the_top_of_the_file_names_the_copied_rules_by_their_schema_version(self):
+        self.assertIn("a copy of the fleet's install manifest rules, schema version 1",
+                      (ROOT / 'bin/fleet-install-publish.py').read_text(encoding='utf-8')[:2500])
 
     def test_a_good_manifest_parses_and_each_misfit_has_its_golden_code(self):
         good = manifest()
@@ -696,6 +948,9 @@ class VendoredVerifier(unittest.TestCase):
         self.assertEqual(calls[0][calls[0].index('-n') + 1], 'mirrorstack-fleet-install')
         self.assertEqual(calls[0][calls[0].index('-I') + 1], 'owner')
 
+    def test_the_publishers_size_limits_are_these_numbers(self):
+        self.assertEqual((fp.MAX_SMALL, fp.MAX_KIT, fp.MAX_ATTR), (1 << 20, 16 << 20, 4096))
+
     def test_the_publisher_only_adds_codes_the_golden_does_not_have(self):
         self.assertFalse(set(fp.PUBLISH_CODES) & set(fp.CODES))
 
@@ -729,10 +984,25 @@ class Workflow(unittest.TestCase):
             self.assertRegex(uses, r'^actions/checkout@[0-9a-f]{40}$')
         self.assertEqual(self.TEXT.count('persist-credentials: false'), self.TEXT.count('actions/checkout@'))
 
+    def test_the_owners_confirmation_reaches_the_script_from_the_release_environments_variable(self):
+        step = self.TEXT[self.TEXT.index('          SERIAL:'):]
+        self.assertIn('          IMMUTABLE_CONFIRMED: ${{ vars.IMMUTABLE_RELEASES_CONFIRMED }}\n', step)
+        self.assertEqual(re.findall(r'IMMUTABLE_\w+: (.*)', self.TEXT), ['${{ vars.IMMUTABLE_RELEASES_CONFIRMED }}'])
+
+    def test_the_owners_key_and_fingerprint_come_from_the_release_environment_not_the_repo(self):
+        self.assertIn('          OWNER_PIN_PUB: ${{ vars.OWNER_PIN_PUB }}\n', self.TEXT)
+        self.assertIn('          OWNER_PIN_SHA256: ${{ vars.OWNER_PIN_SHA256 }}\n', self.TEXT)
+        self.assertEqual(re.findall(r'\$\{\{ (?:vars|secrets)\.\w+ \}\}', self.TEXT).count('${{ vars.OWNER_PIN_PUB }}'), 1)
+        self.assertIn('umask 077', self.TEXT)  # the temp file is the job's alone (0600)
+        self.assertNotIn('keys/', self.TEXT)
+        self.assertNotIn('owner-pin.pub"\n', self.TEXT.split('run: umask')[0])
+
     def test_the_inputs_reach_the_script_only_through_env(self):
         runs = re.findall(r'(?m)^\s+(?:- )?run: (.*)$', self.TEXT)
-        self.assertEqual(runs, ['python3 bin/fleet-install-publish.py publish "release/install-$SERIAL"'
-                                ' --owner-pub keys/owner-pin.pub --min-serial "$MIN_SERIAL"'])
+        self.assertEqual(runs, ['umask 077 && printf \'%s\\n\' "$OWNER_PIN_PUB" > "$RUNNER_TEMP/owner-pin.pub"',
+                                'python3 bin/fleet-install-publish.py publish "release/install-$SERIAL"'
+                                ' --owner-pub "$RUNNER_TEMP/owner-pin.pub" --min-serial "$MIN_SERIAL"'])
+        self.assertFalse([r for r in runs if '${{' in r])  # nothing in a run: line is an expression
         for want in ('SERIAL: ${{ inputs.serial }}', 'MIN_SERIAL: ${{ inputs.min_serial }}',
                      'GH_TOKEN: ${{ github.token }}'):
             self.assertIn(want, self.TEXT)

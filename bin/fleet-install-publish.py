@@ -1,6 +1,9 @@
 """Publish the MirrorStack fleet's owner-signed install set: `fleet-install-publish.py publish <dir> --owner-pub <path>
 --min-serial N`, run by .github/workflows/install.yml on a GitHub-hosted runner (`verify <dir> ...` does the local
-half only, with no network and no gh). <dir> is release/install-<serial>, committed here by PR. Everything the
+half only, with no network and no gh). <dir> is release/install-<serial>, committed here by PR. The owner's public key
+is never read from this repo: the workflow writes it from the release environment's variable OWNER_PIN_PUB to a
+private temp file, and the script refuses `key` unless that file is exactly one `ssh-ed25519 <base64>[ comment]` line
+and, when OWNER_PIN_SHA256 is set, its `ssh-keygen -lf` fingerprint equals it. Everything the
 release will carry is checked first, offline: install.json.sig verifies against the owner's public key under namespace
 mirrorstack-fleet-install, every file's sha256 equals the signed one, no file is unlisted, deploy-pin.json is there with
 its shape, signature and (when the bundle is in the release) the bundle's head and tree, and install.json is valid for at
@@ -10,11 +13,10 @@ GitHub's Immutable releases setting, create the release with exactly those asset
 require the release to say immutable and not draft.
 Standalone stdlib. An error names the rule and never echoes a value; a refusal is exit 1, a bad command line 2.
 
-Section 1 is a vendored copy of the install.json verifier of the fleet's private repo (fleet/install/manifest.py, at
-commit 433018e55d94a31afb42ec07670393ae3e8b9fae, the I01 merge): same schema, bounds, namespace, principal and refusal
-codes. Two things differ and nothing else: its two helpers from that repo (strict JSON and the UTC time parser) are
-inlined as _loads_strict and _parse_utc. tests/test_install_publish.py freezes the constants and the codes, so a
-drift in either copy is a red test, not a silent fork. When I01's file changes, copy it again and move the commit id."""
+Section 1 is a copy of the fleet's install manifest rules, schema version 1: same schema, bounds, namespace, principal
+and refusal codes. Its two helpers (strict JSON and the UTC time parser) are inlined as _loads_strict and _parse_utc,
+and nothing else differs. tests/test_install_publish.py freezes the constants and the codes, so a drift in either
+copy is a red test, not a silent fork. When the manifest rules change, copy them again and update the golden test."""
 from __future__ import annotations
 
 import base64
@@ -75,7 +77,7 @@ def run_argv(argv: Sequence[str], stdin: bytes) -> tuple[int, bytes]:
 
 
 def _loads_strict(text: bytes) -> object:
-    """Strict JSON (inlined from the private repo's fleet.core.canon.loads_strict): UTF-8 with no BOM, no NaN or
+    """Strict JSON: UTF-8 with no BOM, no NaN or
     Infinity (nor a number like 1e400 that reads as one), no duplicate key. Any refusal is `form`."""
     if text.startswith(b'\xef\xbb\xbf'):
         raise Refused('form')
@@ -104,7 +106,7 @@ def _loads_strict(text: bytes) -> object:
 
 
 def _parse_utc(s: str) -> datetime:
-    """A time like 2026-12-01T00:00:00Z (inlined from fleet.core.clock.parse_utc): ValueError if it is not one."""
+    """A time like 2026-12-01T00:00:00Z: ValueError if it is not one."""
     if not UTC_TIME.fullmatch(s):
         raise ValueError('not a UTC time')
     return datetime.strptime(s, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
@@ -147,7 +149,7 @@ def _count(v: object, lo: int, hi: int) -> int:
 
 
 def parse_install(text: bytes) -> dict[str, object]:
-    """The exact shape of SCHEMA (P+ I01) from strict JSON: hashes lower-case hex, an https URL with a host name, a
+    """The exact shape of SCHEMA from strict JSON: hashes lower-case hex, an https URL with a host name, a
     valid_until like 2026-12-01T00:00:00Z; kind other than `install` is `kind`, any other misfit `form`."""
     doc = _loads_strict(text)
     if not isinstance(doc, dict) or doc.get('kind') != KIND:
@@ -217,12 +219,16 @@ TOOL_TIMEOUT, UPLOAD_TIMEOUT = 600, 1800  # seconds: gh queries; the release upl
 USAGE, REFUSED = 2, 1
 USAGE_TEXT = ('usage: fleet-install-publish.py publish|verify <dir> --owner-pub <path> --min-serial N\n'
               '  <dir> is release/install-<serial>; both verbs need GITHUB_REPOSITORY (the bundle URL is checked against it);\n'
+              '  OWNER_PIN_SHA256 (optional) is the fingerprint the key file must have;\n'
               '  publish also needs GITHUB_SHA and GH_TOKEN\n')
 DIR_NAME = re.compile(r'install-(0|[1-9][0-9]{0,9})', re.ASCII)  # canonical decimal: install-007 is not install-7
 INSTALL_TAG = re.compile(r'install-(0|[1-9][0-9]{0,9})', re.ASCII)
+OWNER_LINE = re.compile(r'ssh-ed25519 [A-Za-z0-9+/]{68}(?: [ -~]*)?', re.ASCII)  # one key line, an optional comment
+FPR = re.compile(r'SHA256:[A-Za-z0-9+/]{43}', re.ASCII)  # what ssh-keygen -l prints for an ed25519 key
+BUNDLE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*', re.ASCII)  # a plain file name: no leading dot (GitHub rewrites it)
 REPO = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}', re.ASCII)
 PUBLISH_CODES = ('serial', 'dir', 'missing', 'no-deploy-pin', 'pin-mismatch', 'hash', 'unlisted', 'kit', 'short-validity',
-                 'release-env', 'tag-check-failed', 'tag-exists', 'not-newer', 'immutable-off', 'immutable-unreadable',
+                 'release-env', 'bundle-name', 'tag-check-failed', 'tag-exists', 'not-newer', 'immutable-off', 'immutable-unreadable',
                  'immutable-not-set', 'attributes', 'tool-missing', 'tool-timeout', 'publish-failed', 'publish-mismatch')
 
 
@@ -271,13 +277,18 @@ def snapshot(src: Path, stage: Path, limit: int) -> Asset:
     describe the copy, and the copy is what is verified and uploaded (nothing re-reads the source). A link, a
     non-regular file or one over `limit` bytes is refused."""
     try:
-        fd = os.open(src, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0))
+        fd = os.open(src, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
+                     | getattr(os, 'O_NONBLOCK', 0))  # a FIFO swapped in must not block the open
     except OSError:
         raise Refused('unlisted') from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):  # a folder or a FIFO swapped in after the scan
+            raise Refused('unlisted')
+    except BaseException:
+        os.close(fd)
+        raise
     dst, digest, size = stage / src.name, hashlib.sha256(), 0
     with os.fdopen(fd, 'rb') as f, open(dst, 'xb') as out:
-        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-            raise Refused('unlisted')
         while chunk := f.read(CHUNK):
             size += len(chunk)
             if size > limit:
@@ -309,6 +320,26 @@ def blob_ids(data: bytes) -> set[str]:
     return {hashlib.sha1(b'blob %d\0' % len(body) + body).hexdigest() for body in (data, data.replace(b'\r\n', b'\n'))}
 
 
+def owner_key(path: str, want_fpr: str = '', run: Run = run_argv) -> bytes:
+    """The owner's public key from the file the workflow wrote out of the release environment, or Refused('key'): the
+    file must be there and be exactly one `ssh-ed25519 <base64>[ comment]` line (one final newline allowed), and when
+    want_fpr is given (OWNER_PIN_SHA256) the `ssh-keygen -lf` fingerprint must equal it. Nothing in this repo is a key."""
+    try:
+        with open(path, 'rb') as f:
+            data = f.read(4097)
+    except OSError:
+        raise Refused('key') from None
+    text = data.decode('ascii', 'replace')
+    if len(data) > 4096 or not OWNER_LINE.fullmatch(text[:-1] if text.endswith('\n') else text):
+        raise Refused('key')
+    if want_fpr:
+        code, out = run((SSH_KEYGEN, '-l', '-f', path), b'')
+        words = out.decode('ascii', 'replace').split()
+        if not FPR.fullmatch(want_fpr) or code != 0 or len(words) < 2 or words[1] != want_fpr:
+            raise Refused('key')
+    return data
+
+
 def key_fingerprint(owner_pub: bytes) -> str:
     """SHA256:<base64> of the key blob, the form ssh-keygen -l prints, so the log shows which key was trusted."""
     blob = base64.b64decode(owner_pub.split()[1] + b'=')
@@ -330,10 +361,16 @@ def verify_pin_signature(text: bytes, sig: bytes, owner_pub: bytes, run: Run) ->
 
 
 def bundle_name(doc: dict, repo: str, tag: str) -> str | None:
-    """The bundle's file name when its signed URL is a download of this very release, else None (not public here)."""
+    """The bundle's file name when its signed URL is a download of this very release, else None (not public here). A
+    name that is not a plain file name (BUNDLE_NAME) is Refused('bundle-name')."""
     prefix = f'https://github.com/{repo}/releases/download/{tag}/'
     url = doc['bundle']['url']
-    return url[len(prefix):] if repo and url.startswith(prefix) and '/' not in url[len(prefix):] else None
+    if not (repo and url.startswith(prefix) and '/' not in url[len(prefix):]):
+        return None
+    name = url[len(prefix):]
+    if not BUNDLE_NAME.fullmatch(name):
+        raise Refused('bundle-name')
+    return name
 
 
 def check_dir(d: Path, owner_pub: bytes, min_serial: int, now: datetime, repo: str, run: Run = run_argv) -> Plan:
@@ -369,7 +406,7 @@ def _check_staged(d: Path, tag: str, folder_serial: int, stage: Path, owner_pub:
     snap = {name: snapshot(d / name, stage, limits[name]) for name in FIXED + KIT_FILES}
     data = lambda name: snap[name].path.read_bytes()  # noqa: E731  (the private copy, whose hash is snap[name].sha256)
     text, sig = data('install.json'), data('install.json.sig')
-    # signed_install's tree rule asks whether a blob is in source_head's tree, which only the private repo can answer;
+    # signed_install's tree rule asks whether a blob is in source_head's tree, which only the source repo can answer;
     # here the question is answered below, per file: the bootstrap carries the signed blob id (and the signed sha256)
     doc = signed_install(text, sig, owner_pub, min_serial=min_serial, now=now, in_tree=lambda head, blob: True, run=run)
     if doc['serial'] != folder_serial:
@@ -401,8 +438,10 @@ def _check_staged(d: Path, tag: str, folder_serial: int, stage: Path, owner_pub:
         raise Refused('attributes')
     names = list(FIXED + KIT_FILES)
     if bundle is not None:
-        if bundle not in entries or bundle in names:
-            raise Refused('missing' if bundle not in entries else 'unlisted')
+        if bundle in names or bundle in map(published_name, names):  # a fixed name, or the name GitHub gives one
+            raise Refused('unlisted')
+        if bundle not in entries:
+            raise Refused('missing')
         snap[bundle] = snapshot(d / bundle, stage, MAX_BUNDLE)
         if snap[bundle].size != doc['bundle']['size'] or snap[bundle].sha256 != doc['bundle']['sha256']:
             raise Refused('hash')
@@ -427,8 +466,8 @@ def json_out(io: Io, argv: list[str], env: dict[str, str], kind: type, slug: str
 
 
 def published_name(name: str) -> str:
-    """The name GitHub serves an asset under: it rewrites a leading dot to `default.` (unverified until the first
-    publish, so the read-back accepts either spelling and prints the one it found)."""
+    """The name GitHub serves an asset under: it rewrites a leading dot to `default.` (so the read-back accepts either
+    spelling for .gitattributes and prints the one it found)."""
     return 'default' + name if name.startswith('.') else name
 
 
@@ -484,7 +523,9 @@ def publish(io: Io, plan: Plan, repo: str, sha: str, token: str, confirmed: str 
         served[asset['name']] = asset
     lines = []
     for name, a in want.items():
-        found = served.pop(name, None) or served.pop(published_name(name), None)
+        found = served.pop(name, None)
+        if found is None and name == '.gitattributes':  # the only name GitHub rewrites here; the bundle is exact
+            found = served.pop(published_name(name), None)
         if not found or found.get('digest') != f'sha256:{a.sha256}' or found.get('size', a.size) != a.size:
             raise Refused('publish-mismatch')  # what GitHub now serves is not what was checked
         lines.append(f'{found["name"]} sha256:{a.sha256} https://github.com/{repo}/releases/download/{tag}/{found["name"]}')
@@ -504,7 +545,7 @@ def parse_args(argv: list[str]) -> tuple[str, Path, str, int] | None:
 
 def main(argv: list[str], environ: dict[str, str], io: Io, run: Run = run_argv, now: datetime | None = None) -> int:
     """0 done, 1 refused, 2 usage. publish also needs GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN (the job's), and
-    optionally IMMUTABLE_CONFIRMED=yes."""
+    optionally IMMUTABLE_CONFIRMED=yes; OWNER_PIN_SHA256 (optional, both verbs) pins the key file's fingerprint."""
     args = parse_args(argv)
     if args is None:
         sys.stderr.write(USAGE_TEXT)
@@ -513,10 +554,8 @@ def main(argv: list[str], environ: dict[str, str], io: Io, run: Run = run_argv, 
     repo = environ.get('GITHUB_REPOSITORY', '')
     plans: list[Plan] = []
     try:
-        try:
-            owner_pub = Path(key_path).read_bytes()
-        except OSError:
-            raise Refused('key') from None
+        owner_pub = owner_key(key_path, environ.get('OWNER_PIN_SHA256', ''), run)
+        print(f'fleet-install-publish: owner key {key_fingerprint(owner_pub)}', file=sys.stderr, flush=True)
         plan = check_dir(d, owner_pub, min_serial, now or datetime.now(timezone.utc), repo, run)
         plans.append(plan)
         print(f'fleet-install-publish: {plan.tag} verified against {plan.key_fpr}, {len(plan.assets)} assets,'
