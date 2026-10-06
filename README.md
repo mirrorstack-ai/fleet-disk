@@ -32,6 +32,17 @@ carry, normally the previous release's). The job runs `bin/fleet-install-publish
   (`bin/fleet-install-publish.py` carries a copy of the fleet's install manifest rules, schema version 1, and a test
   freezes its constants);
 - its `serial` is the folder's and at least `min_serial`, and `valid_until` is at least 30 days away;
+- both bootstraps are byte-exact release assets: ASCII, LF only, no CR, no BOM (`boot-bytes`), so the asset is the git
+  blob and its blob id is the sha1 of the raw bytes only (no CRLF variant). The LF rule is enforced on the bootstrap
+  assets themselves; `.gitattributes` stays an exact published copy of the fleet repo's own file (which sets
+  `*.ps1 eol=crlf` for checkouts) and does not change that rule. Each bootstrap must also carry its baked values on one
+  assignment line each (`$OwnerKey = '...'` and `$Expires = '...'` in the `.ps1`; `OWNER_KEY='...'` and `EXPIRES=...` in the `.sh`),
+  exactly one line each with nothing after the value: the key must equal (type and base64) the owner key that verified
+  `install.json`, and the expiry must have `valid_until`'s shape and be at least `valid_until` and at least 30 days from now
+  (`baked`; the placeholders `ssh-ed25519 UNBAKED` and 1970 are refused);
+- every asset is held to a size cap no larger than the bootstraps' own downloads: `install.json` 8192 bytes, each
+  signature 4096, `kit.json` 65536, each kit file 4 MiB, `carrier-check.sh` 262144 (`size`); `kit.json`'s `python_zip`
+  must be a `version` of the form `N.N.N` (one or two digits each) and a lowercase 64-hex `sha256` (`form`);
 - both bootstraps equal the signed sha256 and carry the signed git blob id, `kit.json` equals the signed
   `kit_json_sha256`, and `kit.json` and `deploy-pin.json` carry the owner's signature (namespace
   `mirrorstack-fleet-pin`); the five kit files equal `kit.json`, the bundle equals the signed sha256 and size;

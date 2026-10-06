@@ -40,7 +40,39 @@ utc = lambda dt: dt.strftime('%Y-%m-%dT%H:%M:%SZ')  # noqa: E731
 H40, H64 = 'c' * 40, 'd' * 64
 
 KIT = {name: f'kit file {name}\n'.encode() for name in fp.KIT_FILES}
-PS1, SH = b'Write-Output "hi"\r\n', b'#!/bin/sh\necho hi\n'
+PS1_TEMPLATE = (b"# a bootstrap\nWrite-Output 'hi'\n$OwnerKey = 'ssh-ed25519 UNBAKED'\n"
+                b"$Expires = '1970-01-01T00:00:00Z'\n$Release = 'https://example.org'\n")
+SH_TEMPLATE = (b"#!/bin/sh\n# a bootstrap\nOWNER_KEY='ssh-ed25519 UNBAKED'\nEXPIRES=1970-01-01T00:00:00Z\n"
+               b"RELEASES=https://example.org\n")
+BAKED_UNTIL = NOW + timedelta(days=120)  # past valid_until (90 days) and past the 30-day floor
+
+
+def bake(template: bytes, key_line: str, expires: str) -> bytes:
+    """The template with its two placeholder values replaced, nothing else touched."""
+    return (template.replace(b'ssh-ed25519 UNBAKED', key_line.encode())
+            .replace(b'1970-01-01T00:00:00Z', expires.encode()))
+
+
+# set by setUpModule: one throwaway owner key for the whole module, and the two bootstraps baked with it
+SHARED = Path(tempfile.mkdtemp(prefix='fleet-install-test-key-'))
+PS1 = SH = b''
+OWNER_LINE = ''
+
+
+def setUpModule():
+    global PS1, SH, OWNER_LINE
+    if HAVE_KEYGEN:
+        keygen(SHARED, 'owner-key')
+        keygen(SHARED, 'stranger')
+        OWNER_LINE = ' '.join((SHARED / 'owner-key.pub').read_text().split()[:2])
+    else:
+        OWNER_LINE = 'ssh-ed25519 ' + 'A' * 68
+    PS1 = bake(PS1_TEMPLATE, OWNER_LINE, utc(BAKED_UNTIL))
+    SH = bake(SH_TEMPLATE, OWNER_LINE, utc(BAKED_UNTIL))
+
+
+def tearDownModule():
+    shutil.rmtree(SHARED, ignore_errors=True)
 BUNDLE_BYTES = b'tar bytes ' * 100
 BUNDLE_TREE = 'e' * 40
 PIN_BYTES = json.dumps({'serial': 4, 'head': H40, 'tree': BUNDLE_TREE}).encode()  # the bundle's head and tree
@@ -60,7 +92,7 @@ def sign(key: Path, path: Path, namespace: str) -> None:
 
 def manifest(valid_until: datetime = NOW + timedelta(days=90), **over) -> dict:
     doc = {'kind': 'install', 'serial': SERIAL, 'valid_until': utc(valid_until), 'source_head': H40,
-           'bootstrap': {'ps1': {'sha256': sha(PS1), 'blob': blob(PS1.replace(b'\r\n', b'\n'))},
+           'bootstrap': {'ps1': {'sha256': sha(PS1), 'blob': blob(PS1)},
                          'sh': {'sha256': sha(SH), 'blob': blob(SH)}},
            'kit': {'serial': 3, 'kit_json_sha256': 'f' * 64}, 'lock_sha256': H64,
            'bundle': {'head': H40, 'tree': BUNDLE_TREE, 'url': BUNDLE_URL, 'sha256': sha(BUNDLE_BYTES),
@@ -74,7 +106,9 @@ class Fixture:
 
     def __init__(self, tmp: Path) -> None:
         self.tmp = tmp
-        self.key, self.other = keygen(tmp, 'owner-key'), keygen(tmp, 'stranger')
+        for name in ('owner-key', 'owner-key.pub', 'stranger', 'stranger.pub'):
+            shutil.copy(SHARED / name, tmp / name)  # copy keeps the 0600 mode ssh-keygen insists on
+        self.key, self.other = tmp / 'owner-key', tmp / 'stranger'
         self.pub = tmp / 'owner.pub'
         shutil.copy(str(self.key) + '.pub', self.pub)
         self.dir = tmp / 'release' / TAG
@@ -293,6 +327,182 @@ class Publish(unittest.TestCase):
         doc['kit']['kit_json_sha256'] = sha((self.fx.dir / 'kit.json').read_bytes())
         self.fx.signed_install(doc)
         self.refuses_locally('tree')
+
+    # the one hash rule: the bootstrap assets are the git blobs (ASCII, LF only, no CR, no BOM)
+
+    def swap_boot(self, name: str, data: bytes) -> None:
+        """Replace bootstrap.<name> and re-sign install.json so the signed sha256 and blob are the new bytes' own."""
+        self.fx.put(f'bootstrap.{name}', data)
+        doc = manifest()
+        doc['bootstrap'][name] = {'sha256': sha(data), 'blob': blob(data)}
+        doc['kit']['kit_json_sha256'] = sha((self.fx.dir / 'kit.json').read_bytes())
+        self.fx.signed_install(doc)
+
+    def test_a_bootstrap_with_a_cr_a_bom_or_a_non_ascii_byte_is_refused_boot_bytes_though_hash_and_blob_agree(self):
+        for name, good in (('ps1', PS1), ('sh', SH)):
+            for label, data in (('crlf', good.replace(b'\n', b'\r\n')), ('one cr', good.replace(b'\n', b'\r\n', 1)),
+                                ('lone cr', good + b'\r'), ('bom', b'\xef\xbb\xbf' + good),
+                                ('non-ascii', good + 'caf\u00e9\n'.encode()), ('empty', b'')):
+                with self.subTest(f'{name} ' + label):
+                    self.fx.build()
+                    self.swap_boot(name, data)
+                    self.refuses_locally('boot-bytes')
+
+    def test_a_crlf_copy_whose_manifest_names_the_lf_blob_is_refused_boot_bytes_and_never_matches_the_blob(self):
+        self.fx.build()
+        crlf = PS1.replace(b'\n', b'\r\n')
+        self.fx.put('bootstrap.ps1', crlf)
+        doc = manifest()  # the signed sha256 and blob are the LF file's
+        doc['kit']['kit_json_sha256'] = sha((self.fx.dir / 'kit.json').read_bytes())
+        self.fx.signed_install(doc)
+        self.refuses_locally('boot-bytes')
+        self.assertNotIn(blob(PS1), fp.blob_ids(crlf))
+
+    def test_the_lf_only_rule_is_for_the_bootstraps_while_gitattributes_stays_the_fleet_repos_file(self):
+        self.fx.build()
+        self.assertIn(b'*.ps1 eol=crlf', (self.fx.dir / '.gitattributes').read_bytes())
+        self.assertNotIn(b'\r', (self.fx.dir / 'bootstrap.ps1').read_bytes())
+        self.fx.check()  # an LF .ps1 beside a gitattributes that says crlf is the published set
+
+    # the baked key and expiry
+
+    def baked(self, name: str, key: str | None = None, expires: str | None = None, template: bytes | None = None) -> bytes:
+        template = template or {'ps1': PS1_TEMPLATE, 'sh': SH_TEMPLATE}[name]
+        return bake(template, OWNER_LINE if key is None else key, utc(BAKED_UNTIL) if expires is None else expires)
+
+    def test_an_unbaked_bootstrap_is_refused_baked(self):
+        for name in ('ps1', 'sh'):
+            with self.subTest(name):
+                self.fx.build()
+                self.swap_boot(name, {'ps1': PS1_TEMPLATE, 'sh': SH_TEMPLATE}[name])
+                self.refuses_locally('baked')
+
+    def test_a_baked_key_that_is_not_the_verifying_key_is_refused_baked(self):
+        other = ' '.join(Path(str(self.fx.other) + '.pub').read_text().split()[:2])
+        blob_b64 = OWNER_LINE.split()[1]
+        bad = {'another key': other, 'other type': 'ssh-rsa ' + blob_b64, 'no type': blob_b64,
+               'base64 only changed in one char': OWNER_LINE[:-1] + ('A' if OWNER_LINE[-1] != 'A' else 'B'),
+               'trailing space': OWNER_LINE + ' ', 'comment kept': OWNER_LINE + ' test', 'empty': ''}
+        for name in ('ps1', 'sh'):
+            for label, key in bad.items():
+                with self.subTest(f'{name} ' + label):
+                    self.fx.build()
+                    self.swap_boot(name, self.baked(name, key=key))
+                    self.refuses_locally('baked')
+
+    def test_a_baked_expiry_before_valid_until_or_off_shape_is_refused_baked_and_equal_is_fine(self):
+        valid_until = NOW + timedelta(days=90)
+        for name in ('ps1', 'sh'):
+            for label, value in (('a second early', utc(valid_until - timedelta(seconds=1))), ('placeholder', '1970-01-01T00:00:00Z'),
+                                 ('date only', '2027-06-01'), ('fraction', '2027-06-01T00:00:00.5Z'),
+                                 ('offset', '2027-06-01T00:00:00+00:00'), ('lower case', '2027-06-01t00:00:00z'),
+                                 ('empty', ''), ('impossible', '2027-13-45T00:00:00Z')):
+                with self.subTest(f'{name} ' + label):
+                    self.fx.build()
+                    self.swap_boot(name, self.baked(name, expires=value))
+                    self.refuses_locally('baked')
+            with self.subTest(f'{name} equal to valid_until'):
+                self.fx.build()
+                self.swap_boot(name, self.baked(name, expires=utc(valid_until)))
+                self.fx.check()
+
+    def test_the_baked_expiry_must_also_be_thirty_days_past_now(self):
+        short = NOW + timedelta(days=10)
+        for name in ('ps1', 'sh'):
+            data = self.baked(name, expires=utc(NOW + timedelta(days=30) - timedelta(seconds=1)))
+            with self.subTest(name):
+                with self.assertRaises(fp.Refused) as why:
+                    fp.check_baked(name, data, self.fx.pub.read_bytes(), short, NOW)
+                self.assertEqual(why.exception.code, 'baked')
+                fp.check_baked(name, self.baked(name, expires=utc(NOW + timedelta(days=30))), self.fx.pub.read_bytes(), short, NOW)
+
+    def test_exactly_one_assignment_line_each_with_nothing_after_the_value(self):
+        key, exp = OWNER_LINE, utc(BAKED_UNTIL)
+        ps1_extra = {'key twice': b"$OwnerKey = '%s'\n" % key.encode(), 'expires twice': b"$Expires = '%s'\n" % exp.encode(),
+                     'indented key': b"  $OwnerKey = '%s'\n" % key.encode(), 'other key': b"$OwnerKey = 'ssh-ed25519 UNBAKED'\n",
+                     'no spaces': b"$Expires='%s'\n" % exp.encode()}
+        sh_extra = {'key twice': b"OWNER_KEY='%s'\n" % key.encode(), 'expires twice': b'EXPIRES=%s\n' % exp.encode(),
+                    'indented expires': b'  EXPIRES=%s\n' % exp.encode(), 'other expires': b'EXPIRES=1970-01-01T00:00:00Z\n'}
+        for name, extra in (('ps1', ps1_extra), ('sh', sh_extra)):
+            for label, line in extra.items():
+                with self.subTest(f'{name} ' + label):
+                    self.fx.build()
+                    self.swap_boot(name, self.baked(name) + line)
+                    self.refuses_locally('baked')
+        for name, old, new in (('ps1', f"'{exp}'", f"'{exp}' # soon"), ('ps1', f"'{key}'", f"'{key}'; $x = 1"),
+                               ('sh', f"EXPIRES={exp}", f"EXPIRES={exp} # soon"), ('sh', f"EXPIRES={exp}", f"EXPIRES={exp}; x=1"),
+                               ('sh', f"OWNER_KEY='{key}'", f"OWNER_KEY='{key}' # mine"),
+                               ('ps1', f"$Expires = '{exp}'", ''), ('sh', f"EXPIRES={exp}", ''),
+                               ('ps1', f"$OwnerKey = '{key}'", ''), ('sh', f"OWNER_KEY='{key}'", ''),
+                               ('ps1', f"$Expires = '{exp}'", f'$Expires = "{exp}"'), ('sh', f"EXPIRES={exp}", f"EXPIRES='{exp}'")):
+            with self.subTest(f'{name} ' + new):
+                self.fx.build()
+                data = self.baked(name)
+                self.assertIn(old.encode(), data)
+                self.swap_boot(name, data.replace(old.encode(), new.encode()))
+                self.refuses_locally('baked')
+
+    def test_baking_is_checked_after_the_hash_and_the_blob_and_a_baked_file_passes(self):
+        self.fx.build()
+        self.swap_boot('sh', SH_TEMPLATE)  # unbaked but signed: baked
+        self.refuses_locally('baked')
+        self.fx.build()
+        self.fx.put('bootstrap.sh', SH_TEMPLATE)  # unbaked and not the signed bytes: the hash comes first
+        self.refuses_locally('hash')
+        self.fx.build()
+        self.assertEqual(self.fx.check().tag, TAG)
+
+    # per-name caps, never above the bootstraps'
+
+    def test_each_asset_over_its_own_cap_is_refused_size_and_at_the_cap_it_is_not(self):
+        for name, cap in (('install.json.sig', 4096), ('kit.json.sig', 4096), ('deploy-pin.json.sig', 4096), ('kit.json', 65536),
+                          ('carrier-check.sh', 262144), ('carrier-check.py', 4 << 20), ('check.ps1', 4 << 20),
+                          ('verify-archive.py', 4 << 20), ('VERIFY.txt', 4 << 20)):
+            with self.subTest(name):
+                self.fx.build()
+                self.fx.put(name, b'x' * (cap + 1))
+                self.refuses_locally('size')
+                self.fx.build()
+                self.fx.put(name, b'x' * cap)
+                with self.assertRaises(fp.Refused) as why:
+                    self.fx.check()
+                self.assertNotEqual(why.exception.code, 'size')
+
+    # kit.json's python_zip
+
+    def kit_with(self, python_zip, drop: bool = False) -> None:
+        kit = json.loads((self.fx.dir / 'kit.json').read_bytes())
+        kit.pop('python_zip') if drop else kit.update(python_zip=python_zip)
+        data = json.dumps(kit).encode()
+        sign(self.fx.key, self.fx.put('kit.json', data), fp.PIN_NS)
+        doc = manifest()
+        doc['kit']['kit_json_sha256'] = sha(data)
+        self.fx.signed_install(doc)
+
+    def test_a_python_zip_that_is_not_a_version_and_a_lowercase_sha256_is_refused_form(self):
+        ok_sha = 'ab' * 32
+        bad = {'two parts': {'version': '3.14', 'sha256': ok_sha}, 'four parts': {'version': '3.14.7.1', 'sha256': ok_sha},
+               'three digits': {'version': '100.1.1', 'sha256': ok_sha}, 'letters': {'version': '3.14.x', 'sha256': ok_sha},
+               'rc': {'version': '3.14.7rc1', 'sha256': ok_sha}, 'trailing newline': {'version': '3.14.7\n', 'sha256': ok_sha},
+               'unicode digits': {'version': '3.1\u0664.7', 'sha256': ok_sha}, 'empty': {'version': '', 'sha256': ok_sha},
+               'int version': {'version': 3, 'sha256': ok_sha}, 'no version': {'sha256': ok_sha},
+               'upper sha': {'version': '3.14.7', 'sha256': ok_sha.upper()}, 'short sha': {'version': '3.14.7', 'sha256': ok_sha[:-1]},
+               'long sha': {'version': '3.14.7', 'sha256': ok_sha + 'a'}, 'non-hex sha': {'version': '3.14.7', 'sha256': 'g' * 64},
+               'sha newline': {'version': '3.14.7', 'sha256': ok_sha + '\n'}, 'no sha': {'version': '3.14.7'},
+               'int sha': {'version': '3.14.7', 'sha256': 7}, 'a string': 'python', 'a list': [], 'null': None}
+        for label, value in bad.items():
+            with self.subTest(label):
+                self.fx.build()
+                self.kit_with(value)
+                self.refuses_locally('form')
+        self.fx.build()
+        self.kit_with(None, drop=True)
+        self.refuses_locally('form')
+        for version in ('3.14.7', '3.9.0', '10.10.10', '0.0.0'):
+            with self.subTest(version):
+                self.fx.build()
+                self.kit_with({'version': version, 'sha256': ok_sha})
+                self.fx.check()
 
     def test_a_changed_kit_file_the_kit_json_or_the_bundle_is_refused_hash(self):
         for name in ('carrier-check.py', 'kit.json', BUNDLE):
@@ -755,8 +965,10 @@ class Publish(unittest.TestCase):
         with mock.patch.object(fp, 'snapshot', wraps=fp.snapshot) as spy:
             self.fx.check()
         limits = {call.args[0].name: call.args[2] for call in spy.call_args_list}
-        want = {name: fp.MAX_KIT if name in fp.KIT_FILES else fp.MAX_SMALL for name in fp.FIXED + fp.KIT_FILES}
-        want.update({'install.json': fp.MAX_BYTES, '.gitattributes': fp.MAX_ATTR, BUNDLE: fp.MAX_BUNDLE})
+        want = {name: 4 << 20 for name in fp.KIT_FILES}  # literal numbers: the bootstraps' own caps, never above them
+        want.update({'install.json': 8192, 'install.json.sig': 4096, 'kit.json': 65536, 'kit.json.sig': 4096,
+                     'deploy-pin.json': 1 << 20, 'deploy-pin.json.sig': 4096, 'bootstrap.ps1': 1 << 20,
+                     'bootstrap.sh': 1 << 20, 'carrier-check.sh': 262144, '.gitattributes': 4096, BUNDLE: 1 << 30})
         self.assertEqual(limits, want)
 
     def test_snapshot_refuses_a_fifo_or_a_folder_where_a_file_is_expected(self):
@@ -1072,6 +1284,9 @@ class VendoredVerifier(unittest.TestCase):
         self.assertEqual((fp.NS, fp.PRINCIPAL, fp.KIND), ('mirrorstack-fleet-install', 'owner', 'install'))
         self.assertEqual((fp.MAX_BYTES, fp.MAX_BUNDLE, fp.MAX_COUNT), (8192, 1 << 30, 1 << 31))
         self.assertEqual(fp.CODES, ('size', 'key', 'sig', 'form', 'kind', 'expired', 'rollback', 'tree'))
+        self.assertIn('boot-bytes', fp.PUBLISH_CODES)
+        self.assertIn('baked', fp.PUBLISH_CODES)
+        self.assertEqual(fp.GITATTRIBUTES, b'* text=auto eol=lf\n*.ps1 eol=crlf\n')  # the fleet repo's file, byte for byte
         self.assertEqual(fp.SCHEMA, ('kind', 'serial', 'valid_until', 'source_head', 'bootstrap', 'kit', 'lock_sha256',
                                      'bundle'))
         self.assertEqual((fp.BOOT_KEYS, fp.KIT_KEYS, fp.BUNDLE_KEYS, fp.OSES),
@@ -1140,7 +1355,8 @@ class VendoredVerifier(unittest.TestCase):
         self.assertEqual(calls[0][calls[0].index('-I') + 1], 'owner')
 
     def test_the_publishers_size_limits_are_these_numbers(self):
-        self.assertEqual((fp.MAX_SMALL, fp.MAX_KIT, fp.MAX_ATTR), (1 << 20, 16 << 20, 4096))
+        self.assertEqual((fp.MAX_SMALL, fp.MAX_KIT, fp.MAX_ATTR), (1 << 20, 4 << 20, 4096))
+        self.assertEqual((fp.MAX_SIG, fp.MAX_KIT_JSON, fp.MAX_CARRIER_SH), (4096, 65536, 262144))
 
     def test_the_publisher_only_adds_codes_the_golden_does_not_have(self):
         self.assertFalse(set(fp.PUBLISH_CODES) & set(fp.CODES))
@@ -1304,11 +1520,11 @@ class Seams(unittest.TestCase):
 
     # blob ids
 
-    def test_blob_ids_are_the_bytes_as_they_are_and_with_only_crlf_read_as_lf(self):
-        self.assertEqual(fp.blob_ids(b'a\r\nb\rc\n'), {blob(b'a\r\nb\rc\n'), blob(b'a\nb\rc\n')})
+    def test_blob_ids_is_the_blob_of_the_raw_bytes_only_never_a_crlf_variant(self):
+        self.assertEqual(fp.blob_ids(b'a\r\nb\rc\n'), {blob(b'a\r\nb\rc\n')})
         self.assertEqual(fp.blob_ids(b'a\n'), {blob(b'a\n')})
-        self.assertEqual(fp.blob_ids(b'a\rb'), {blob(b'a\rb')})  # a lone CR is never turned into LF
-        self.assertNotIn(blob(b'a\nb\nc\n'), fp.blob_ids(b'a\r\nb\rc\n'))
+        self.assertEqual(fp.blob_ids(b'a\rb'), {blob(b'a\rb')})
+        self.assertNotIn(blob(b'a\nb\rc\n'), fp.blob_ids(b'a\r\nb\rc\n'))  # CRLF read as LF is not the asset
 
     # the bundle name
 

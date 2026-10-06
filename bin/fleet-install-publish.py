@@ -8,7 +8,9 @@ release will carry is checked first, offline: install.json.sig verifies against 
 mirrorstack-fleet-install, every file's sha256 equals the signed one, no file is unlisted, deploy-pin.json is there with
 its shape, signature and (when the bundle is in the release) the bundle's head and tree, and install.json is valid for at
 least 30 more days. Each file is copied once into a private stage; the checks
-and the upload use that copy. Only then does it refuse an existing tag install-<serial>, require
+and the upload use that copy. The two bootstraps are held to the one-hash rule (ASCII, LF only, no CR, no
+BOM: the asset is the git blob) and must carry the baked values (the owner's key, the one that verified install.json, and
+an expiry no earlier than valid_until and 30 days out); every asset is held to a size cap no larger than the bootstraps' own. Only then does it refuse an existing tag install-<serial>, require
 GitHub's Immutable releases setting, create the release with exactly those assets, read GitHub's digests back and
 require the release to say immutable and not draft.
 Standalone stdlib. An error names the rule and never echoes a value; a refusal is exit 1, a bad command line 2.
@@ -208,12 +210,26 @@ KIT_FILES = ('carrier-check.py', 'check.ps1', 'carrier-check.sh', 'verify-archiv
 # every asset but the kit files and the (optional) bundle, in publish order
 FIXED = ('install.json', 'install.json.sig', 'kit.json', 'kit.json.sig', 'deploy-pin.json', 'deploy-pin.json.sig',
          '.gitattributes', 'bootstrap.ps1', 'bootstrap.sh')
-MAX_SMALL = 1 << 20  # kit.json, the pin, signatures, .gitattributes: far below this; a bigger one is refused
+MAX_SMALL = 1 << 20  # the pin and the two bootstraps (the bootstraps never fetch them): far below this; a bigger one is refused
 MAX_ATTR = 4096
-MAX_KIT = 16 << 20  # one kit file (a script): far above the real ones, refused beyond it
+# the caps below are never above what the bootstraps' own downloads allow (curl --max-filesize): install.json is MAX_BYTES
+MAX_SIG = 4096  # install.json.sig (the bootstraps' cap); the other two signatures are held to it too
+MAX_KIT_JSON = 65536  # kit.json
+MAX_KIT = 4 << 20  # one kit file (the bootstraps' cap)
+MAX_CARRIER_SH = 262144  # carrier-check.sh, the one kit file the POSIX bootstrap fetches, on a lower cap
 # .gitattributes carries no signature and decides the line endings of the checked-out bootstraps, so it is compared with
 # this committed constant: changing it is a reviewed change to this file, never a release folder's data.
+# It is a published copy of the fleet repo's file, byte for byte (its `*.ps1 eol=crlf` line is deliberate there); the
+# bootstraps' own LF-only rule is enforced on the bootstrap assets (BOOT_BYTES), not on this file.
 GITATTRIBUTES = b'* text=auto eol=lf\n*.ps1 eol=crlf\n'
+MIN_DAYS_BAKED = MIN_DAYS  # the baked expiry is at least this many days past the publish
+BAKED = {  # per bootstrap: the one-line assignments of the baked key and expiry (and a looser pattern that must count the same)
+    'ps1': (re.compile(r"^\$OwnerKey = '([^'\n]*)'$", re.M), re.compile(r"^\$Expires = '([^'\n]*)'$", re.M),
+            re.compile(r'^[ \t]*\$OwnerKey\b[ \t]*=', re.M), re.compile(r'^[ \t]*\$Expires\b[ \t]*=', re.M)),
+    'sh': (re.compile(r"^OWNER_KEY='([^'\n]*)'$", re.M), re.compile(r'^EXPIRES=([^\n]*)$', re.M),
+           re.compile(r'^[ \t]*OWNER_KEY=', re.M), re.compile(r'^[ \t]*EXPIRES=', re.M)),
+}
+PYTHON_VERSION = re.compile(r'[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,2}', re.ASCII)
 CHUNK = 1 << 20
 TOOL_TIMEOUT, UPLOAD_TIMEOUT = 600, 1800  # seconds: gh queries; the release upload with the bundle in it
 USAGE, REFUSED = 2, 1
@@ -229,7 +245,7 @@ BUNDLE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*', re.ASCII)  # a plain fil
 REPO = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}', re.ASCII)
 PUBLISH_CODES = ('serial', 'dir', 'missing', 'no-deploy-pin', 'pin-mismatch', 'hash', 'unlisted', 'kit', 'short-validity',
                  'release-env', 'bundle-name', 'tag-check-failed', 'tag-exists', 'not-newer', 'immutable-off', 'immutable-unreadable',
-                 'immutable-not-set', 'attributes', 'tool-missing', 'tool-timeout', 'publish-failed', 'publish-mismatch')
+                 'immutable-not-set', 'attributes', 'boot-bytes', 'baked', 'tool-missing', 'tool-timeout', 'publish-failed', 'publish-mismatch')
 
 
 class Io(Protocol):
@@ -315,9 +331,42 @@ def check_pin(data: bytes, bundle: dict | None) -> None:
 
 
 def blob_ids(data: bytes) -> set[str]:
-    """The git blob ids this file can have in the source tree: its bytes as they are, and with CRLF read as LF (a
-    .ps1 is checked out CRLF by .gitattributes but stored LF)."""
-    return {hashlib.sha1(b'blob %d\0' % len(body) + body).hexdigest() for body in (data, data.replace(b'\r\n', b'\n'))}
+    """The git blob id of this file's raw bytes (the only one: the asset is the blob, a CRLF copy is not the asset)."""
+    return {hashlib.sha1(b'blob %d\0' % len(data) + data).hexdigest()}
+
+
+def check_boot_bytes(data: bytes) -> None:
+    """A bootstrap asset is ASCII with LF only: no BOM, no CR (a CRLF working-tree copy is not the release asset),
+    else Refused('boot-bytes')."""
+    if not data or not data.isascii() or b'\r' in data or data.startswith(b'\xef\xbb\xbf'):
+        raise Refused('boot-bytes')
+
+
+def baked_values(name: str, data: bytes) -> tuple[str, str]:
+    """(key, expires) from the bootstrap's one assignment line each, or Refused('baked') unless exactly one line of
+    each kind is there and nothing follows the value on it (an indented or repeated assignment counts as another)."""
+    key_rx, exp_rx, key_any, exp_any = BAKED[name]
+    text = data.decode('ascii', 'replace')
+    keys, exps = key_rx.findall(text), exp_rx.findall(text)
+    if len(keys) != 1 or len(exps) != 1 or len(key_any.findall(text)) != 1 or len(exp_any.findall(text)) != 1:
+        raise Refused('baked')
+    return keys[0], exps[0]
+
+
+def check_baked(name: str, data: bytes, owner_pub: bytes, valid_until: datetime, now: datetime) -> None:
+    """The baked key must be the one that verified install.json (type and base64) and the baked expiry must be a UTC
+    time of valid_until's shape that is not before valid_until and not before now + 30 days; else Refused('baked').
+    The unbaked placeholders (key UNBAKED, expiry 1970) fail both."""
+    key, expires = baked_values(name, data)
+    words = owner_pub.decode('ascii', 'replace').split()
+    if len(words) < 2 or key != f'{words[0]} {words[1]}':
+        raise Refused('baked')
+    try:
+        until = _parse_utc(expires)
+    except ValueError:
+        raise Refused('baked') from None
+    if until < valid_until or until < now + timedelta(days=MIN_DAYS_BAKED):
+        raise Refused('baked')
 
 
 def owner_key(path: str, want_fpr: str = '', run: Run = run_argv) -> bytes:
@@ -402,7 +451,9 @@ def _check_staged(d: Path, tag: str, folder_serial: int, stage: Path, owner_pub:
     if not all(name in entries for name in FIXED + KIT_FILES):
         raise Refused('missing')
     limits = {name: MAX_KIT if name in KIT_FILES else MAX_SMALL for name in FIXED + KIT_FILES}
-    limits.update({'install.json': MAX_BYTES, '.gitattributes': MAX_ATTR})
+    limits.update({'install.json': MAX_BYTES, 'install.json.sig': MAX_SIG, 'kit.json': MAX_KIT_JSON,
+                   'kit.json.sig': MAX_SIG, 'deploy-pin.json.sig': MAX_SIG, 'carrier-check.sh': MAX_CARRIER_SH,
+                   '.gitattributes': MAX_ATTR})
     snap = {name: snapshot(d / name, stage, limits[name]) for name in FIXED + KIT_FILES}
     data = lambda name: snap[name].path.read_bytes()  # noqa: E731  (the private copy, whose hash is snap[name].sha256)
     text, sig = data('install.json'), data('install.json.sig')
@@ -415,10 +466,13 @@ def _check_staged(d: Path, tag: str, folder_serial: int, stage: Path, owner_pub:
         raise Refused('short-validity')
     for name in OSES:  # each bootstrap is the signed one: its sha256 and its own blob id, not the other's
         want, boot = doc['bootstrap'][name], snap[f'bootstrap.{name}']
+        raw = boot.path.read_bytes()
+        check_boot_bytes(raw)
         if boot.sha256 != want['sha256']:
             raise Refused('hash')
-        if want['blob'] not in blob_ids(boot.path.read_bytes()):
+        if want['blob'] not in blob_ids(raw):
             raise Refused('tree')
+        check_baked(name, raw, owner_pub, _parse_utc(doc['valid_until']), now)
     if snap['kit.json'].sha256 != doc['kit']['kit_json_sha256']:
         raise Refused('hash')
     verify_pin_signature(data('kit.json'), data('kit.json.sig'), owner_pub, run)
@@ -428,6 +482,11 @@ def _check_staged(d: Path, tag: str, folder_serial: int, stage: Path, owner_pub:
             or not all(isinstance(f, dict) and set(f) == {'path', 'sha256'} and type(f['path']) is str for f in files)
             or sorted(f['path'] for f in files) != sorted(KIT_FILES)):
         raise Refused('kit')
+    zipinfo = kit.get('python_zip')  # the Windows bootstrap downloads this exact python.org build and checks its hash
+    if (not isinstance(zipinfo, dict) or type(zipinfo.get('version')) is not str
+            or not PYTHON_VERSION.fullmatch(zipinfo['version']) or type(zipinfo.get('sha256')) is not str
+            or not HEX64.fullmatch(zipinfo['sha256'])):
+        raise Refused('form')
     for f in files:
         if snap[f['path']].sha256 != f['sha256']:
             raise Refused('hash')
