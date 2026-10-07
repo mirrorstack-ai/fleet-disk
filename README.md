@@ -108,12 +108,27 @@ ref's workflow file). The real boundary is set in the repo, not in code:
 `python3 -m unittest discover -s tests` (stdlib only, no network, no qemu, no real gh; the signature tests use a throwaway
 `ssh-keygen` key and are skipped when `ssh-keygen` is missing).
 
-## Boot smoke fixture
+## Boot smoke
 
-`tests/fixture/make_fixture.py` copies the two install bootstraps a PR carries (`release/install-<serial>/bootstrap.ps1`
-and `bootstrap.sh`), bakes a throwaway owner key into the copies with the publisher's own regexes, points their base URLs
-(and the Windows Python ZIP URL) at `127.0.0.1` by pinned regexes, and writes one signed release folder per case (good,
-expired, wrong key, tampered, rolled back, a downgrading redirect, and so on). `tests/fixture/serve.py` serves them over HTTPS
-with a throwaway CA. The PR's files are never changed. `python3 tests/fixture/make_fixture.py --out DIR
+`.github/workflows/boot-smoke.yml` runs the two install bootstraps a PR carries (`release/install-<serial>/bootstrap.ps1`
+and `bootstrap.sh`) on `windows-2022`, `windows-2025`, `ubuntu-24.04`, `ubuntu-22.04` and `macos-15`, with `contents: read`
+and no secret. `tests/fixture/make_fixture.py` copies them, bakes a throwaway owner key into the copies with the
+publisher's own regexes, points their base URLs (and the Windows Python ZIP URL) at `127.0.0.1` by pinned regexes, and writes one
+signed release folder per case (good, expired, wrong key, tampered, rolled back, a downgrading redirect, and so on).
+`tests/fixture/serve.py` serves them over HTTPS with a throwaway CA, and `tests/fixture/smoke_driver.py` runs each case
+and checks the exit code, the last two lines, the info lines, the requests made and that no temp folder is left. The OS's
+own curl must refuse the certificate before the trust step and accept it after (a control). The PR's files are never
+changed; hosted runners are VMs, so this proves the pipeline, not hardware. `python3 tests/fixture/make_fixture.py --out DIR
 --boot-dir release/install-<serial>` builds the tree by hand (it needs `ssh-keygen`, `openssl` and, on the Windows side,
 network access to python.org for the ZIP, or `--python-zip PATH`).
+
+The cases also cover each size cap (the signature, `install.json` with and without a `Content-Length`, `kit.json`, a kit file, the
+ZIP), a wrong `kind`, a missing field, a six-file kit, and bad command lines (below the floor, a repeated or missing flag, an
+abbreviated flag). Every runner but `ubuntu-22.04` (which refuses `os` by design) is run with `--must-run`, so a machine
+refusal there fails the job instead of passing every case without a request. The throwaway certificates and CRL start an hour
+before the build, so a runner clock a little slow still accepts them.
+
+Fork pull requests run this workflow's code (from the PR) on hosted runners, including `sudo` and a trust-store change on the
+Windows and macOS ones. It holds no secret and a read-only token, so the worst a hostile fork can do is spend runner minutes.
+Keep that true in the repository settings: Actions > General > Fork pull request workflows, set "Require approval for all
+outside collaborators", and leave "Send write tokens to workflows from pull requests" off.

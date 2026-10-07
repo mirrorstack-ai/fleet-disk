@@ -1,0 +1,113 @@
+# Runs the install bootstraps a PR carries (release/install-<serial>/bootstrap.{ps1,sh}) on GitHub-hosted runners, against a
+# local HTTPS copy of the release layout signed with a THROWAWAY key. The copies are rebaked and pointed at 127.0.0.1 by
+# tests/fixture/make_fixture.py; the PR's files are never changed and nothing here reaches github.com or any secret.
+# Hosted runners are VMs: this proves the pipeline (fetch, hash, signature, kit, carrier-check, the refusal text), not hardware.
+name: boot-smoke
+on:
+  pull_request:
+    paths:
+      - release/install-*/bootstrap.ps1
+      - release/install-*/bootstrap.sh
+      - tests/fixture/**
+      - tests/test_boot_smoke.py
+      - .github/workflows/boot-smoke.yml
+  workflow_dispatch:
+    inputs:
+      boot_dir:
+        description: the folder holding the two bootstraps, release/install-<serial> (empty = the newest in this ref)
+        required: false
+permissions:
+  contents: read
+concurrency:
+  group: boot-smoke-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+jobs:
+  fixture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      have: ${{ steps.plan.outputs.have }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+      - id: plan
+        env:
+          BOOT_DIR: ${{ inputs.boot_dir }}
+        shell: bash
+        run: |
+          dir=$BOOT_DIR
+          [ -n "$dir" ] || dir=$(ls -d release/install-*/ 2>/dev/null | sed 's|/$||' | sort -t- -k2 -n | tail -n 1)
+          re='^release/install-(0|[1-9][0-9]{0,9})$'   # the whole string: a newline in the input cannot pass or reach the output file
+          if [[ $dir =~ $re ]] && [ -f "$dir/bootstrap.ps1" ] && [ -f "$dir/bootstrap.sh" ]; then
+            printf 'have=true\ndir=%s\n' "$dir" >> "$GITHUB_OUTPUT"
+          else
+            printf 'have=false\n' >> "$GITHUB_OUTPUT"
+            echo "::notice::no release/install-<serial>/ with both bootstraps in this ref: nothing to smoke"
+          fi
+      - if: steps.plan.outputs.have == 'true'
+        env:
+          BOOT_DIR: ${{ steps.plan.outputs.dir }}
+        run: python3 tests/fixture/make_fixture.py --out fixture --boot-dir "$BOOT_DIR"
+      - if: steps.plan.outputs.have == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: fixture
+          path: fixture
+          retention-days: 1
+          if-no-files-found: error
+  fixture-smoke:
+    needs: fixture
+    if: needs.fixture.outputs.have == 'true'
+    name: ${{ matrix.runner }} ${{ matrix.trust }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    continue-on-error: ${{ matrix.experimental }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: windows-2022, os: ps1, trust: root-store, must_run: true, experimental: false}
+          - {runner: windows-2025, os: ps1, trust: root-store, must_run: true, experimental: false}
+          - {runner: ubuntu-24.04, os: sh, trust: ca-certificates, must_run: true, experimental: false}
+          - {runner: ubuntu-22.04, os: sh, trust: none, must_run: false, experimental: false}   # refuses `os` before any network: no trust needed
+          - {runner: macos-15, os: sh, trust: curl-ca-bundle, must_run: true, experimental: false}
+          - {runner: macos-15, os: sh, trust: keychain, must_run: true, experimental: true}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: fixture
+          path: fixture
+      - run: python tests/fixture/smoke_driver.py probe
+      - if: matrix.trust != 'none'
+        run: python tests/fixture/smoke_driver.py control --dir fixture --phase before
+      - if: matrix.trust == 'root-store'
+        shell: pwsh
+        run: Import-Certificate -FilePath fixture\tls\ca.cer -CertStoreLocation Cert:\LocalMachine\Root
+      - if: matrix.trust == 'ca-certificates'
+        run: sudo cp fixture/tls/ca.crt /usr/local/share/ca-certificates/fleet-smoke.crt && sudo update-ca-certificates
+      - if: matrix.trust == 'curl-ca-bundle'
+        run: echo "CURL_CA_BUNDLE=$GITHUB_WORKSPACE/fixture/tls/ca.crt" >> "$GITHUB_ENV"
+      - if: matrix.trust == 'keychain'
+        run: sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain fixture/tls/ca.crt
+      - if: matrix.trust != 'none'
+        run: python tests/fixture/smoke_driver.py control --dir fixture --phase after
+      - env:
+          BOOT_OS: ${{ matrix.os }}
+          BOOT_MUST: ${{ matrix.must_run }}
+        run: |
+          flag=()
+          [ "$BOOT_MUST" = true ] && flag=(--must-run)
+          python tests/fixture/smoke_driver.py fixture --dir fixture --os "$BOOT_OS" "${flag[@]}"
