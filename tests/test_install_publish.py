@@ -39,6 +39,7 @@ sha = lambda data: hashlib.sha256(data).hexdigest()  # noqa: E731
 blob = lambda data: hashlib.sha1(b'blob %d\0' % len(data) + data).hexdigest()  # noqa: E731
 utc = lambda dt: dt.strftime('%Y-%m-%dT%H:%M:%SZ')  # noqa: E731
 H40, H64 = 'c' * 40, 'd' * 64
+SOURCE_HEAD = '9' * 40  # the commit the install set was made from; never the bundle's head
 
 KIT = {name: f'kit file {name}\n'.encode() for name in fp.KIT_FILES}
 PS1_TEMPLATE = (b"# a bootstrap\nWrite-Output 'hi'\n$OwnerKey = 'ssh-ed25519 UNBAKED'\n"
@@ -92,7 +93,7 @@ def sign(key: Path, path: Path, namespace: str) -> None:
 
 
 def manifest(valid_until: datetime = NOW + timedelta(days=90), **over) -> dict:
-    doc = {'kind': 'install', 'serial': SERIAL, 'valid_until': utc(valid_until), 'source_head': H40,
+    doc = {'kind': 'install', 'serial': SERIAL, 'valid_until': utc(valid_until), 'source_head': SOURCE_HEAD,
            'bootstrap': {'ps1': {'sha256': sha(PS1), 'blob': blob(PS1)},
                          'sh': {'sha256': sha(SH), 'blob': blob(SH)}},
            'kit': {'serial': 3, 'kit_json_sha256': 'f' * 64}, 'lock_sha256': H64,
@@ -166,6 +167,7 @@ class FakeGh:
         self.tweak = lambda assets: assets  # a test edits what GitHub "serves" back
         self.query_code = 0
         self.raw: dict[str, tuple[int, str]] = {}  # query name -> (exit code, stdout) to answer instead
+        self.old_pin = (0, json.dumps({'serial': 1, 'head': H40, 'tree': BUNDLE_TREE}))  # what a previous release's pin says
 
     def run(self, argv, env, timeout=fp.TOOL_TIMEOUT):
         self.calls.append(list(argv))
@@ -178,6 +180,8 @@ class FakeGh:
             return self.raw.get('releases') or (0, json.dumps(self.releases))
         if words[:1] == ['api'] and words[1].endswith('/immutable-releases'):
             return self.immutable
+        if words[:2] == ['release', 'download']:
+            return self.old_pin
         if words[:2] == ['release', 'create']:
             self.created = [Path(p) for p in words[3:words.index('--target')]]
             return self.create_code, ''
@@ -757,10 +761,62 @@ class Publish(unittest.TestCase):
     def pin_with(self, **over) -> bytes:
         return json.dumps({**json.loads(PIN_BYTES), **over}).encode()
 
-    def test_a_pin_of_the_bundles_head_and_tree_passes_whatever_its_serial(self):
+    def test_a_pin_of_the_bundles_head_and_tree_passes_the_offline_check_whatever_its_serial(self):
         self.fx.build()
-        self.put_pin(self.pin_with(serial=99))  # the serial is the PC's verify-archive floor, not compared here
+        self.put_pin(self.pin_with(serial=99))  # the serial is held against the previous release's in publish(), not here
         self.assertEqual(self.fx.check().tag, TAG)
+        self.assertEqual(self.fx.check().pin_serial, 99)
+
+    def test_a_pin_equal_to_source_head_but_not_the_bundles_head_is_refused_pin_mismatch(self):
+        self.assertNotEqual(SOURCE_HEAD, H40)  # the two signed fields differ, so a compare with the wrong one shows
+        self.fx.build()
+        self.put_pin(self.pin_with(head=SOURCE_HEAD))
+        self.refuses_locally('pin-mismatch')
+
+    # the pin may not move back: the previous install-N release's pin is the floor (the PC has none of its own)
+
+    def previous(self, serial_or_raw, tag='install-4') -> FakeGh:
+        gh = FakeGh(releases=[{'tagName': tag, 'isDraft': False}])
+        gh.old_pin = (0, json.dumps({'serial': serial_or_raw, 'head': '1' * 40, 'tree': '2' * 40})) \
+            if isinstance(serial_or_raw, int) else serial_or_raw
+        return gh
+
+    def test_a_pin_older_than_the_previous_releases_is_refused_pin_mismatch_before_any_release(self):
+        self.fx.build()  # the pin's serial is 4
+        gh = self.refuses('pin-mismatch', self.previous(5))
+        self.assertEqual((gh.creates(), [c for c in gh.calls if c[2].endswith('/immutable-releases')]), ([], []))
+        self.assertEqual(gh.calls[-1], ['/usr/bin/gh', 'release', 'download', 'install-4', '--pattern', 'deploy-pin.json',
+                                        '--output', '-'])
+
+    def test_a_pin_equal_to_or_newer_than_the_previous_releases_goes_on(self):
+        self.fx.build()
+        for previous in (4, 3, 0):
+            with self.subTest(previous):
+                gh = self.previous(previous)
+                fp.publish(gh, self.fx.check(), REPO, SHA, TOKEN)
+                self.assertEqual(len(gh.creates()), 1)
+
+    def test_the_floor_is_the_newest_install_release_and_the_only_one_asked(self):
+        self.fx.build()
+        gh = FakeGh(releases=[{'tagName': t, 'isDraft': False} for t in ('install-2', 'install-4', 'v1', 'install-3')])
+        fp.publish(gh, self.fx.check(), REPO, SHA, TOKEN)
+        (ask,) = [c for c in gh.calls if c[1:3] == ['release', 'download']]
+        self.assertEqual(ask[3], 'install-4')
+
+    def test_the_first_release_has_no_floor_and_no_download_is_made(self):
+        self.fx.build()
+        gh = FakeGh()
+        fp.publish(gh, self.fx.check(), REPO, SHA, TOKEN)
+        self.assertEqual([c for c in gh.calls if c[1:3] == ['release', 'download']], [])
+
+    def test_a_previous_pin_that_cannot_be_read_or_is_not_a_pin_is_refused_pin_mismatch(self):
+        self.fx.build()
+        junk = ['not json', '', '[]', json.dumps({'serial': 1}), json.dumps({'serial': '1', 'head': H40, 'tree': H40}),
+                json.dumps({'serial': True, 'head': H40, 'tree': H40}), '{"serial": 1, "serial": 1}']
+        for raw in [(1, json.dumps({'serial': 1, 'head': H40, 'tree': H40}))] + [(0, j) for j in junk]:
+            with self.subTest(raw[1][:30], code=raw[0]):
+                gh = self.refuses('pin-mismatch', self.previous(raw))
+                self.assertEqual(gh.creates(), [])
 
     def test_a_pin_of_another_head_than_the_bundle_is_refused_pin_mismatch(self):
         self.fx.build()
@@ -1361,6 +1417,10 @@ class VendoredVerifier(unittest.TestCase):
     def test_the_vendored_file_is_the_one_its_pin_names_and_the_publisher_runs_that_file(self):
         data, pin = (ROOT / 'vendor/manifest.py').read_bytes(), (ROOT / 'vendor/manifest.sha256').read_bytes()
         self.assertEqual(pin, sha(data).encode() + b'\n')
+        stand_ins = {rel: (ROOT / 'vendor/standin' / rel).read_bytes() for rel in fp._STAND_IN_FILES}
+        self.assertEqual((ROOT / 'vendor/standin.sha256').read_bytes(), fp.stand_in_digest(stand_ins).encode() + b'\n')
+        self.assertEqual(fp._STAND_IN_FILES, ('fleet/__init__.py', 'fleet/core/__init__.py', 'fleet/core/canon.py',
+                                              'fleet/core/clock.py'))
         self.assertEqual(fp.manifest.__file__, str(ROOT / 'vendor/manifest.py'))
         self.assertIs(fp.Refused, fp.manifest.Refused)
         self.assertIs(fp.signed_install, fp.manifest.signed_install)
@@ -1390,7 +1450,8 @@ class VendoredVerifier(unittest.TestCase):
                 done = subprocess.run([sys.executable, str(root / 'bin/fleet-install-publish.py'), 'verify', 'release/install-5',
                                        '--owner-pub', 'k', '--min-serial', '0'], capture_output=True, text=True, timeout=60,
                                       env={'PATH': '/usr/bin:/bin'}, cwd=root)
-                self.assertEqual((done.returncode, done.stdout.strip()), (1, 'REFUSED form'))
+                self.assertEqual((done.returncode, done.stdout), (1, 'REFUSED form\n'))  # the exit is the start's own
+                self.assertEqual(done.stderr, 'fleet-install-publish: refused form\n')  # no traceback behind it
         missing = self.vendor_copy()
         (missing / 'vendor/manifest.sha256').unlink()
         with self.assertRaises(ValueError):
@@ -1398,6 +1459,51 @@ class VendoredVerifier(unittest.TestCase):
         (missing / 'vendor/manifest.py').unlink()
         with self.assertRaises(ValueError):
             fp.load_vendored(missing / 'vendor')
+
+    def test_a_stand_in_that_is_not_its_pin_or_a_pin_that_is_not_one_line_is_refused_form(self):
+        """The stand-ins decide how strict the copy's rules are, so they are pinned like the copy (one hash over the four)."""
+        good = (ROOT / 'vendor/standin.sha256').read_bytes()
+        for rel in fp._STAND_IN_FILES:
+            with self.subTest(changed=rel):
+                root = self.vendor_copy()
+                path = root / 'vendor/standin' / rel
+                path.write_bytes(path.read_bytes() + b'# x\n')
+                with self.assertRaises(ValueError):
+                    fp.load_vendored(root / 'vendor')
+                done = subprocess.run([sys.executable, str(root / 'bin/fleet-install-publish.py'), 'verify',
+                                       'release/install-5', '--owner-pub', 'k', '--min-serial', '0'], capture_output=True,
+                                      text=True, timeout=60, env={'PATH': '/usr/bin:/bin'}, cwd=root)
+                self.assertEqual((done.returncode, done.stdout), (1, 'REFUSED form\n'))
+            with self.subTest(missing=rel):
+                root = self.vendor_copy()
+                (root / 'vendor/standin' / rel).unlink()
+                with self.assertRaises(ValueError):
+                    fp.load_vendored(root / 'vendor')
+        for what, pin in {'no newline': good[:64], 'upper case': good.upper(), 'two lines': good + b'\n', 'empty': b'',
+                          'the copy\'s pin': (ROOT / 'vendor/manifest.sha256').read_bytes()}.items():
+            with self.subTest(pin=what):
+                root = self.vendor_copy()
+                (root / 'vendor/standin.sha256').write_bytes(pin)
+                with self.assertRaises(ValueError):
+                    fp.load_vendored(root / 'vendor')
+        root = self.vendor_copy()
+        (root / 'vendor/standin.sha256').unlink()
+        with self.assertRaises(ValueError):
+            fp.load_vendored(root / 'vendor')
+
+    def test_the_bytes_that_were_hashed_are_the_ones_executed_not_a_second_read(self):
+        """Every vendored file read a second time would say something else; the loaded copy must be the first read's."""
+        reads: dict[Path, int] = {}
+        real = Path.read_bytes
+
+        def read_bytes(self):
+            data = real(self)
+            reads[self] = reads.get(self, 0) + 1
+            return data if reads[self] == 1 else data + b'\nMAX_BYTES = 1\nraise SystemExit(7)\n'
+        with mock.patch.object(Path, 'read_bytes', read_bytes):
+            module = fp.load_vendored(ROOT / 'vendor')
+        self.assertEqual(module.MAX_BYTES, 8192)
+        self.assertTrue(reads and all(n == 1 for n in reads.values()))  # and each was read exactly once
 
     def test_the_publishers_rules_are_the_vendored_files_not_a_copy_of_its_own(self):
         """Re-pin a vendored file whose size limit is 10 and run the publisher from that tree: it refuses `size`, which
@@ -1414,14 +1520,32 @@ class VendoredVerifier(unittest.TestCase):
             self.assertEqual(done.stdout.split('\n')[0], first_line)
 
     def test_loading_the_copy_leaves_no_stand_in_behind_and_the_path_as_it_was(self):
-        path, held = list(sys.path), {n for n in sys.modules if n == 'fleet' or n.startswith('fleet.')}
-        fp.load_vendored(ROOT / 'vendor')
-        self.assertEqual(sys.path, path)
-        self.assertEqual({n for n in sys.modules if n == 'fleet' or n.startswith('fleet.')}, held)
-        sentinel = types.ModuleType('fleet')
-        with mock.patch.dict(sys.modules, {'fleet': sentinel}):
+        is_fleet = lambda n: n == 'fleet' or n.startswith('fleet.')  # noqa: E731
+        path = list(sys.path)
+        with mock.patch.dict(sys.modules):
+            for name in [n for n in sys.modules if is_fleet(n)]:  # start from none, so a leftover is the load's own
+                del sys.modules[name]
+            fp.load_vendored(ROOT / 'vendor')
+            self.assertEqual([n for n in sys.modules if is_fleet(n)], [])
+            self.assertEqual(sys.path, path)
+            sentinel = types.ModuleType('fleet')
+            sys.modules['fleet'] = sentinel
             fp.load_vendored(ROOT / 'vendor')
             self.assertIs(sys.modules['fleet'], sentinel)
+            self.assertEqual([n for n in sys.modules if is_fleet(n)], ['fleet'])
+        done = subprocess.run([sys.executable, '-c', 'import importlib.util as u, sys\n'
+                               's = u.spec_from_file_location("p", sys.argv[1])\nm = u.module_from_spec(s); s.loader.exec_module(m)\n'
+                               'print(sorted(n for n in sys.modules if n == "fleet" or n.startswith("fleet.")))',
+                               str(ROOT / 'bin/fleet-install-publish.py')], capture_output=True, text=True, timeout=60,
+                              env={'PATH': '/usr/bin:/bin'})
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, '[]'))  # nothing of it stays in a fresh process either
+
+    def test_gitattributes_keeps_every_vendored_file_out_of_line_ending_rewrites(self):
+        """A checkout that rewrote a pinned file's line endings would fail the pin: Windows hosted runners are where."""
+        lines = set((ROOT / '.gitattributes').read_text().split('\n'))
+        for want in ('vendor/manifest.py -text', 'vendor/manifest.sha256 -text', 'vendor/standin.sha256 -text',
+                     'vendor/standin/** -text'):
+            self.assertIn(want, lines)
 
     def test_the_stand_ins_read_strict_json_and_utc_times_as_the_manifest_needs(self):
         canon, clock = fp.manifest.canon, fp.manifest.clock
@@ -1431,11 +1555,25 @@ class VendoredVerifier(unittest.TestCase):
                     b'[' * 5000, b'', b'{', b'x'):
             with self.subTest(raw=raw[:12]), self.assertRaises(canon.SchemaError):
                 canon.loads_strict(raw)
+        for enc in ('utf-16', 'utf-16-le', 'utf-32', 'utf-32-be'):  # json.loads sniffs these in bytes and bytearray alike
+            for kind in (bytes, bytearray):
+                with self.subTest(enc=enc, kind=kind.__name__), self.assertRaises(canon.SchemaError):
+                    canon.loads_strict(kind('{"a": 1}'.encode(enc)))
+        self.assertEqual(canon.loads_strict(bytearray(b'{"a": 1}')), {'a': 1})
+        for other in (memoryview(b'{}'), None, 1, ['{}']):
+            with self.subTest(other=type(other).__name__), self.assertRaises(canon.SchemaError):
+                canon.loads_strict(other)
+        for text in ('{"a": 1, "a": 1}', '{"a": NaN}', '{"a": -Infinity}', '{"a": 1e400}', '{"a": "\\ud800"}x', '\ufeff{}',
+                     '[' * 5000, '{"a": ' * 2000):
+            with self.subTest(text=text[:16]), self.assertRaises(canon.SchemaError):
+                canon.loads_strict(text)
+        self.assertEqual(canon.loads_strict(b'{"a": 1e2, "b": "\xc3\xa9"}'), {'a': 100.0, 'b': '\u00e9'})
+        self.assertEqual(canon.loads_strict(b' \n[1]\t'), [1])
         with mock.patch.object(json, 'loads', side_effect=RecursionError), self.assertRaises(canon.SchemaError):
             canon.loads_strict(b'{}')
         self.assertTrue(issubclass(canon.SchemaError, ValueError))
         self.assertEqual(clock.parse_utc('2026-12-01T00:00:00Z'), datetime(2026, 12, 1, tzinfo=timezone.utc))
-        for bad in ('2026-12-01T00:00:00', '2026-12-01T00:00:00.5Z', '2026-13-01T00:00:00Z', ' 2026-12-01T00:00:00Z',
+        for bad in ('2026-12-01T00:00:00', '2026-12-01T00:00:00.5Z', '2026-12-01T00:00:00.123456Z',  # stricter than the fleet's: '2026-13-01T00:00:00Z', ' 2026-12-01T00:00:00Z',
                     '2026-1-1T0:0:0Z', '2026-12-01T00:00:00+00:00', ''):
             with self.subTest(bad), self.assertRaises(ValueError):
                 clock.parse_utc(bad)
@@ -1464,9 +1602,14 @@ class VendoredVerifier(unittest.TestCase):
         self.assertEqual(fp.parse_install(json.dumps({**good, 'serial': (1 << 31)}).encode())['serial'], 1 << 31)
         hand = {'fp': 'SHA256:' + 'A' * 43, 'first_serial': SERIAL + 1, 'ps1_sha256': H64, 'sh_sha256': H64}
         self.assertEqual(fp.parse_install(json.dumps({**good, 'handoff': hand}).encode())['handoff'], hand)  # optional
+        top = {**hand, 'first_serial': 1 << 31}  # MAX_COUNT itself is accepted
+        self.assertEqual(fp.parse_install(json.dumps({**good, 'handoff': top}).encode())['handoff'], top)
         for what, bad in {'first_serial not above serial': {**hand, 'first_serial': SERIAL}, 'another key': {**hand, 'x': 1},
                           'a short fingerprint': {**hand, 'fp': 'SHA256:' + 'A' * 42}, 'upper case hash': {**hand, 'sh_sha256': 'D' * 64},
-                          'no hash': {k: v for k, v in hand.items() if k != 'ps1_sha256'}}.items():
+                          'no hash': {k: v for k, v in hand.items() if k != 'ps1_sha256'},
+                          'upper case ps1 hash': {**hand, 'ps1_sha256': 'D' * 64}, 'short ps1 hash': {**hand, 'ps1_sha256': 'd' * 63},
+                          'first_serial above the count': {**hand, 'first_serial': (1 << 31) + 1},
+                          'first_serial far above': {**hand, 'first_serial': 1 << 40}}.items():
             with self.subTest(what), self.assertRaises(fp.Refused) as why:
                 fp.parse_install(json.dumps({**good, 'handoff': bad}).encode())
             self.assertEqual(why.exception.code, 'form')
@@ -1789,7 +1932,7 @@ class VendoredRules(unittest.TestCase):
     def test_the_tree_question_is_asked_for_both_bootstraps_and_either_no_refuses(self):
         doc, asked = manifest(), []
         self.signed(doc, in_tree=lambda head, blob_id: asked.append((head, blob_id)) or True)
-        self.assertEqual(asked, [(H40, doc['bootstrap']['ps1']['blob']), (H40, doc['bootstrap']['sh']['blob'])])
+        self.assertEqual(asked, [(SOURCE_HEAD, doc['bootstrap']['ps1']['blob']), (SOURCE_HEAD, doc['bootstrap']['sh']['blob'])])
         for name in fp.OSES:
             with self.subTest(name):
                 self.assertEqual(self.code_of(doc, in_tree=lambda head, b, name=name: b != doc['bootstrap'][name]['blob']),

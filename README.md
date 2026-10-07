@@ -65,8 +65,14 @@ alone (no network, no gh, no repository variable). After the create it also requ
 `draft: false` (`immutable-not-set` otherwise), so the owner's variable is only an early stop.
 The deploy pin names exactly the commit and tree the bundle was built from: its `head` and `tree` must equal
 `install.json`'s `bundle.head` and `bundle.tree` (`pin-mismatch` otherwise), though the bundle itself is not in this
-release. The pin's `serial` is not compared here
-(the PC's `verify-archive` enforces its own floor). The owner's own check of a release is `VERIFY.txt`'s `ssh-keygen` line.
+release. The pin may also not move back: when an `install-N` release exists, the publisher reads that newest release's
+`deploy-pin.json` (`gh release download`, before anything is created) and refuses `pin-mismatch` if this pin's `serial` is
+lower, or if that previous pin cannot be read or is not a pin (a floor that cannot be read is no floor). The PC has no pin
+floor of its own, so this is one of the bounds on a pin rollback. The previous pin is that release's own asset (immutable,
+made by this publisher after it verified the signature), so it is not verified again, which keeps a key change possible.
+Not enforced here: that the kit host is a pinned one (the host is only held to a path shape and not to be one of GitHub's
+names; the signed sha256, size and pin tree bind the bundle), and that a first release under a new owner key follows a
+published handoff from the old key. The owner's own check of a release is `VERIFY.txt`'s `ssh-keygen` line.
 
 Immutable releases: the job's token usually cannot read the setting (it needs admin). Then the run stops with
 `immutable-unreadable` until the owner records their confirmation as the Environment variable
@@ -89,8 +95,11 @@ variable is only what the publisher checks the release against. `--owner-pub PAT
 holds its sha256 (one lower-case hex line and a newline), and the fleet repository pins the same hash. The publisher loads
 that file at start and stops with `REFUSED form` unless the hash matches, so the rules it applies are exactly the copy's, never
 a second implementation. The copy imports two helpers (a strict JSON reader and a UTC time reader); `vendor/standin/` answers
-those imports without changing a byte of the copy. `.gitattributes` marks both vendored files `-text` so no checkout rewrites
-their line endings. A change to the verifier ships as the same two files in both repositories, in the same step: the fleet
+those imports without changing a byte of the copy. They decide how strict the copy's rules are, so `vendor/standin.sha256`
+pins them too (one hash over the four files, in the order and form `stand_in_digest` in the script says), and the bytes
+that were hashed are the ones executed. The UTC reader is deliberately stricter than the fleet's (no fractional seconds).
+`.gitattributes` marks the vendored files `-text` so no checkout rewrites their line endings.
+A change to the verifier ships as the same two files in both repositories, in the same step: the fleet
 repository's `bin/fleet-install.py vendor-sync <this checkout>` says `OK vendor-sync` when the copy and both pins agree.
 
 ## Trust model

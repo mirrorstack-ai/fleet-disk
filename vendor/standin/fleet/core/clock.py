@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
+# Deliberately stricter than the fleet's own reader, which also takes up to six fractional digits: here a time has none, as in
+# the manifest's UTC_TIME. tests/test_install_publish.py pins the refusal of a fraction.
 _UTC_TIME = re.compile('[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z', re.ASCII)  # no fraction, no offset
 
 

@@ -14,8 +14,10 @@ class SchemaError(ValueError):
         self.path, self.msg = path, msg
 
 
-def loads_strict(text: str | bytes) -> object:
-    if isinstance(text, bytes):
+def loads_strict(text: str | bytes | bytearray) -> object:
+    if not isinstance(text, (str, bytes, bytearray)):  # json.loads would take other types by its own rules
+        raise SchemaError('$', 'not text')
+    if isinstance(text, (bytes, bytearray)):  # json.loads would sniff UTF-16 or UTF-32 in either: only UTF-8 is read
         if text.startswith(b'\xef\xbb\xbf'):
             raise SchemaError('$', 'a byte order mark')
         try:

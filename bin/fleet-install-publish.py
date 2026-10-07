@@ -19,7 +19,8 @@ Standalone stdlib. An error names the rule and never echoes a value; a refusal i
 The install.json rules are not written here: vendor/manifest.py is the one verifier, a byte-identical copy of the fleet's
 install manifest, pinned by vendor/manifest.sha256. It is loaded at start and the script stops with `REFUSED form` unless
 the file's sha256 is that pin (a changed copy needs a new pin, in the same change). The two helpers it imports (strict JSON
-and the UTC time reader) are the stand-ins under vendor/standin; nothing in the copy is altered to run here.
+and the UTC time reader) are the stand-ins under vendor/standin, pinned the same way by one hash over their four files
+(vendor/standin.sha256), since they decide how strict the copy's rules are; nothing in the copy is altered to run here.
 tests/test_install_publish.py freezes the constants and the codes of the copy, so a drift is a red test."""
 from __future__ import annotations
 
@@ -44,28 +45,50 @@ from typing import Protocol
 
 VENDOR = Path(__file__).resolve().parent.parent / 'vendor'
 _STAND_INS = ('fleet', 'fleet.core', 'fleet.core.canon', 'fleet.core.clock')  # what the copy imports, found under standin/
+_STAND_IN_FILES = ('fleet/__init__.py', 'fleet/core/__init__.py', 'fleet/core/canon.py', 'fleet/core/clock.py')  # one each
+_PIN_LINE = re.compile(r'[0-9a-f]{64}\n')
+
+
+def stand_in_digest(files: dict[str, bytes]) -> str:
+    """The one sha256 over the four stand-in files: each path and its bytes, in the order of _STAND_IN_FILES."""
+    digest = hashlib.sha256()
+    for rel in _STAND_IN_FILES:
+        digest.update(rel.encode('ascii') + b'\0' + files[rel] + b'\0')
+    return digest.hexdigest()
 
 
 def load_vendored(root: Path) -> ModuleType:
-    """root/manifest.py as a module, once its sha256 is the pin in root/manifest.sha256 (one lower-case hex line);
-    ValueError if the pin or the file is unreadable or they differ. The copy's own imports resolve to root/standin
-    for the length of the load only: the path and the module table are put back as they were."""
+    """root/manifest.py as a module, once its sha256 is the pin in root/manifest.sha256 (one lower-case hex line) and the
+    stand-ins it imports under root/standin hash to root/standin.sha256 (the same form, see stand_in_digest); ValueError
+    if a pin or a file is unreadable or they differ. Each file is read once and the bytes that were hashed are the ones
+    executed. The stand-ins are put in the module table for the length of the load only (as they were afterwards)."""
     try:
         data = (root / 'manifest.py').read_bytes()
         pin = (root / 'manifest.sha256').read_text(encoding='ascii')
+        stand_ins = {rel: (root / 'standin' / rel).read_bytes() for rel in _STAND_IN_FILES}
+        stand_in_pin = (root / 'standin.sha256').read_text(encoding='ascii')
     except (OSError, UnicodeDecodeError):
         raise ValueError('vendor') from None
-    if not re.fullmatch(r'[0-9a-f]{64}\n', pin) or hashlib.sha256(data).hexdigest() != pin[:64]:
+    if (not _PIN_LINE.fullmatch(pin) or hashlib.sha256(data).hexdigest() != pin[:64]
+            or not _PIN_LINE.fullmatch(stand_in_pin) or stand_in_digest(stand_ins) != stand_in_pin[:64]):
         raise ValueError('vendor')
     held = {name: sys.modules.pop(name) for name in _STAND_INS if name in sys.modules}
-    sys.path.insert(0, str(root / 'standin'))
     try:
+        for name, rel in zip(_STAND_INS, _STAND_IN_FILES):
+            stand = ModuleType(name)
+            stand.__file__ = str(root / 'standin' / rel)
+            if rel.endswith('__init__.py'):
+                stand.__path__ = []
+            exec(compile(stand_ins[rel], stand.__file__, 'exec'), stand.__dict__)
+            sys.modules[name] = stand
+        sys.modules['fleet'].core = sys.modules['fleet.core']
+        sys.modules['fleet.core'].canon, sys.modules['fleet.core'].clock = (sys.modules['fleet.core.canon'],
+                                                                           sys.modules['fleet.core.clock'])
         module = ModuleType('install_manifest')
         module.__file__ = str(root / 'manifest.py')
         exec(compile(data, module.__file__, 'exec'), module.__dict__)  # the bytes that were hashed, not a second read
         return module
     finally:
-        sys.path.remove(str(root / 'standin'))
         for name in _STAND_INS:
             sys.modules.pop(name, None)
         sys.modules.update(held)
@@ -173,8 +196,9 @@ class Plan:
     """What `check_dir` proved: the tag, the manifest and the assets in publish order. The assets are the private
     copy under `stage` that was verified, never the folder it was copied from."""
 
-    def __init__(self, tag: str, doc: dict, assets: list[Asset], key_fpr: str, stage: Path) -> None:
+    def __init__(self, tag: str, doc: dict, assets: list[Asset], key_fpr: str, stage: Path, pin_serial: int = 0) -> None:
         self.tag, self.doc, self.assets, self.key_fpr, self.stage = tag, doc, assets, key_fpr, stage
+        self.pin_serial = pin_serial  # deploy-pin.json's serial, held against the previous release's in publish()
 
     def cleanup(self) -> None:
         """Remove the private copy of the files (the assets live there); safe to call twice."""
@@ -207,18 +231,26 @@ def snapshot(src: Path, stage: Path, limit: int) -> Asset:
     return Asset(dst, digest.hexdigest(), size)
 
 
-def check_pin(data: bytes, bundle: dict) -> None:
-    """deploy-pin.json has verify-archive's signed_pin shape: exactly serial (an integer), head and tree (40 hex). The
-    pin names exactly the commit and tree the bundle was built from, so its head and tree must equal install.json's
-    signed bundle.head and bundle.tree, else Refused('pin-mismatch'); the bundle itself is not in this release. The
-    pin's serial is never compared with install.json: the PC's verify-archive enforces its own floor."""
+def pin_shape(data: bytes) -> dict:
+    """The strict-JSON pin of verify-archive's signed_pin shape: exactly serial (an integer), head and tree (40 hex); else
+    Refused('form')."""
     pin = _loads_strict(data)
     if (not isinstance(pin, dict) or set(pin) != {'serial', 'head', 'tree'} or type(pin['serial']) is not int
             or not 0 <= pin['serial'] <= MAX_COUNT
             or not all(type(pin[k]) is str and HEX40.fullmatch(pin[k]) for k in ('head', 'tree'))):
         raise Refused('form')
+    return pin
+
+
+def check_pin(data: bytes, bundle: dict) -> int:
+    """deploy-pin.json has verify-archive's signed_pin shape: exactly serial (an integer), head and tree (40 hex). The
+    pin names exactly the commit and tree the bundle was built from, so its head and tree must equal install.json's
+    signed bundle.head and bundle.tree, else Refused('pin-mismatch'); the bundle itself is not in this release. Returns
+    the pin's serial, which publish() holds against the previous release's pin (a pin older than that is refused there)."""
+    pin = pin_shape(data)
     if pin['head'] != bundle['head'] or pin['tree'] != bundle['tree']:
         raise Refused('pin-mismatch')
+    return pin['serial']
 
 
 def blob_ids(data: bytes) -> set[str]:
@@ -333,7 +365,11 @@ def verify_pin_signature(text: bytes, sig: bytes, owner_pub: bytes, run: Run) ->
 
 
 # the bundle is served by the invite-gated kit host, never by GitHub: its URL is https://<kit-host>/v1/kit/<serial>/bundle.tar
-NOT_KIT_HOSTS = ('github.com', 'githubusercontent.com')  # the host itself or any name below it
+# GitHub's own names, every one a host that serves or hosts what a user puts there; the host itself or any name below it.
+# The kit host is not pinned here (the owner's release environment would have to hold it): the signed sha256, size and pin
+# tree bind the bundle, and this list only stops a GitHub URL from being signed by mistake.
+NOT_KIT_HOSTS = ('github.com', 'githubusercontent.com', 'github.io', 'ghcr.io', 'githubassets.com', 'githubapp.com',
+                 'github.dev', 'githubusercontent.cn')
 
 
 def check_bundle_url(doc: dict) -> None:
@@ -415,7 +451,7 @@ def _check_staged(d: Path, tag: str, folder_serial: int, stage: Path, owner_pub:
         if snap[f['path']].sha256 != f['sha256']:
             raise Refused('hash')
     verify_pin_signature(data('deploy-pin.json'), data('deploy-pin.json.sig'), owner_pub, run)
-    check_pin(data('deploy-pin.json'), doc['bundle'])
+    pin_serial = check_pin(data('deploy-pin.json'), doc['bundle'])
     if data('.gitattributes') != GITATTRIBUTES:
         raise Refused('attributes')
     names = list(FIXED + KIT_FILES)
@@ -423,7 +459,7 @@ def _check_staged(d: Path, tag: str, folder_serial: int, stage: Path, owner_pub:
         raise Refused('unlisted')
     # every asset's sha256 is that of the verified copy: where the owner signed a hash (bootstraps, kit files, kit.json)
     # it was compared above and is that very value; the rest is covered by a signature over the same bytes
-    return Plan(tag, doc, [snap[n] for n in names], key_fingerprint(owner_pub), stage)
+    return Plan(tag, doc, [snap[n] for n in names], key_fingerprint(owner_pub), stage, pin_serial)
 
 
 def json_out(io: Io, argv: list[str], env: dict[str, str], kind: type, slug: str = 'tag-check-failed'):
@@ -444,10 +480,24 @@ def published_name(name: str) -> str:
     return 'default' + name if name.startswith('.') else name
 
 
+def check_pin_floor(io: Io, env: dict[str, str], tag: str, serial: int) -> None:
+    """The deploy pin of the previous release `tag` must not have a higher serial than this release's (`serial`), else
+    Refused('pin-mismatch'); so must it be readable and of the pin's shape, since a floor that cannot be read is no floor
+    (fail closed). That release is this repository's own immutable one, made only by this publisher after it verified
+    the owner's signature, so the read is of the asset itself; the PC has no pin floor of its own."""
+    code, out = io.run([GH, 'release', 'download', tag, '--pattern', 'deploy-pin.json', '--output', '-'], env)
+    try:
+        previous = pin_shape(out.encode('utf-8')) if code == 0 else None
+    except Refused:
+        previous = None
+    if previous is None or serial < previous['serial']:
+        raise Refused('pin-mismatch')
+
+
 def publish(io: Io, plan: Plan, repo: str, sha: str, token: str, confirmed: str = '') -> list[str]:
     """Refuse an existing tag, require Immutable releases, create the release with exactly the plan's assets and read
     GitHub's digests back; return one line per asset (name, sha256, url). Every check that cannot be answered refuses
-    (fail closed)."""
+    (fail closed). The pin's serial may not be lower than the newest existing release's pin (`pin-mismatch`)."""
     if not (REPO.fullmatch(repo) and re.fullmatch(r'[0-9a-f]{40}', sha) and token):
         raise Refused('release-env')
     tag = plan.tag
@@ -465,6 +515,8 @@ def publish(io: Io, plan: Plan, repo: str, sha: str, token: str, confirmed: str 
                   and (m := INSTALL_TAG.fullmatch(r['tagName']))), default=-1)
     if plan.doc['serial'] <= newest:
         raise Refused('not-newer')
+    if newest >= 0:  # the pin may stay or move forward from the previous release's, never back
+        check_pin_floor(io, env, f'install-{newest}', plan.pin_serial)
     # Immutable releases covers only releases created after it is on, so it is read BEFORE the release exists. The
     # job token cannot always read it: then only the owner's recorded confirmation (confirmed == 'yes') goes on.
     code, out = io.run([GH, 'api', f'repos/{repo}/immutable-releases'], env)

@@ -1,2 +1,4 @@
 vendor/manifest.py -text
 vendor/manifest.sha256 -text
+vendor/standin.sha256 -text
+vendor/standin/** -text
