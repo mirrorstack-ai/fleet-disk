@@ -328,6 +328,20 @@ class Publish(unittest.TestCase):
         self.fx.signed_install(doc)
         self.refuses_locally('tree')
 
+    def test_the_signed_blob_id_is_compared_in_full_so_one_changed_hex_digit_is_refused_tree(self):
+        for name, raw in (('ps1', PS1), ('sh', SH)):
+            real = blob(raw)
+            for label, wrong in (('last digit', real[:-1] + ('0' if real[-1] != '0' else '1')),
+                                 ('last half', real[:20] + ('0' if real[20] != '0' else '1') + real[21:]),
+                                 ('first digit', ('0' if real[0] != '0' else '1') + real[1:])):
+                with self.subTest(f'{name} {label}'):
+                    self.fx.build()
+                    doc = manifest()
+                    doc['bootstrap'][name]['blob'] = wrong
+                    doc['kit']['kit_json_sha256'] = sha((self.fx.dir / 'kit.json').read_bytes())
+                    self.fx.signed_install(doc)
+                    self.refuses_locally('tree')
+
     # the one hash rule: the bootstrap assets are the git blobs (ASCII, LF only, no CR, no BOM)
 
     def swap_boot(self, name: str, data: bytes) -> None:
@@ -420,9 +434,11 @@ class Publish(unittest.TestCase):
         key, exp = OWNER_LINE, utc(BAKED_UNTIL)
         ps1_extra = {'key twice': b"$OwnerKey = '%s'\n" % key.encode(), 'expires twice': b"$Expires = '%s'\n" % exp.encode(),
                      'indented key': b"  $OwnerKey = '%s'\n" % key.encode(), 'other key': b"$OwnerKey = 'ssh-ed25519 UNBAKED'\n",
-                     'no spaces': b"$Expires='%s'\n" % exp.encode()}
+                     'no spaces': b"$Expires='%s'\n" % exp.encode(), 'indented expires': b"  $Expires = '%s'\n" % exp.encode(),
+                     'tab indented expires': b"\t$Expires = '%s'\n" % exp.encode()}
         sh_extra = {'key twice': b"OWNER_KEY='%s'\n" % key.encode(), 'expires twice': b'EXPIRES=%s\n' % exp.encode(),
-                    'indented expires': b'  EXPIRES=%s\n' % exp.encode(), 'other expires': b'EXPIRES=1970-01-01T00:00:00Z\n'}
+                    'indented expires': b'  EXPIRES=%s\n' % exp.encode(), 'other expires': b'EXPIRES=1970-01-01T00:00:00Z\n',
+                    'indented key': b"  OWNER_KEY='%s'\n" % key.encode(), 'tab indented key': b"\tOWNER_KEY='%s'\n" % key.encode()}
         for name, extra in (('ps1', ps1_extra), ('sh', sh_extra)):
             for label, line in extra.items():
                 with self.subTest(f'{name} ' + label):
@@ -441,6 +457,85 @@ class Publish(unittest.TestCase):
                 self.assertIn(old.encode(), data)
                 self.swap_boot(name, data.replace(old.encode(), new.encode()))
                 self.refuses_locally('baked')
+
+    def test_the_baked_assignment_has_exactly_the_contracts_spelling_and_starts_its_line(self):
+        key, exp = OWNER_LINE, utc(BAKED_UNTIL)
+        for name, old, new in (('ps1', f"$OwnerKey = '{key}'", f"$OwnerKey='{key}'"),
+                               ('ps1', f"$OwnerKey = '{key}'", f"$OwnerKey  =  '{key}'"),
+                               ('ps1', f"$OwnerKey = '{key}'", f"$OwnerKey = '{key}' "),
+                               ('ps1', f"$OwnerKey = '{key}'", f"$a = 1; $OwnerKey = '{key}'"),
+                               ('ps1', f"$OwnerKey = '{key}'", f"$ownerkey = '{key}'"),
+                               ('ps1', f"$Expires = '{exp}'", f"$Expires='{exp}'"),
+                               ('ps1', f"$Expires = '{exp}'", f"$a = 1; $Expires = '{exp}'"),
+                               ('ps1', f"$Expires = '{exp}'", f"$expires = '{exp}'"),
+                               ('sh', f"OWNER_KEY='{key}'", f"OWNER_KEY = '{key}'"),
+                               ('sh', f"OWNER_KEY='{key}'", f"true; OWNER_KEY='{key}'"),
+                               ('sh', f"OWNER_KEY='{key}'", f"export OWNER_KEY='{key}'"),
+                               ('sh', f"EXPIRES={exp}", f"true; EXPIRES={exp}"),
+                               ('sh', f"EXPIRES={exp}", f"readonly EXPIRES={exp}")):
+            with self.subTest(f'{name} {new[:30]}'):
+                data = self.baked(name)
+                self.assertIn(old.encode(), data)
+                with self.assertRaises(fp.Refused) as why:
+                    fp.baked_values(name, data.replace(old.encode(), new.encode()))
+                self.assertEqual(why.exception.code, 'baked')
+
+    def test_a_second_way_to_set_the_baked_key_or_expiry_is_refused_however_it_is_spelled(self):
+        key, exp = "ssh-ed25519 B", '2999-01-01T00:00:00Z'
+        later = {
+            'ps1': ["$ownerkey = '%s'" % key, "$OWNERKEY = '%s'" % key, "$script:OwnerKey = '%s'" % key,
+                    "$global:OwnerKey = '%s'" % key, "${OwnerKey} = '%s'" % key, "${script:OwnerKey} = '%s'" % key,
+                    "$OwnerKey += 'x'", "$OwnerKey -= 1", "$x = 1; $OwnerKey = '%s'" % key, "if ($a) { $OwnerKey = 'x' }",
+                    "Set-Variable OwnerKey '%s'" % key, "Set-Variable -Name ownerkey -Value 'x'", "New-Variable -Name OwnerKey -Value 1 -Force",
+                    "Set-Item variable:OwnerKey 'x'", "Get-Thing -OutVariable OwnerKey", "Do-It ([ref]$OwnerKey)", "Do-It [ref] $OwnerKey",
+                    "foreach ($OwnerKey in @('x')) { }", "for ($OwnerKey = 0; $OwnerKey -lt 1; $OwnerKey++) { }",
+                    "$expires = '%s'" % exp, "$EXPIRES = '%s'" % exp, "$script:Expires = '%s'" % exp, "$global:expires = 1",
+                    "Set-Variable Expires '%s'" % exp, "Set-Variable -Name expires -Value 1", "$Expires += 'x'", "  $Expires = 1",
+                    "$a = 1; $Expires = '%s'" % exp, "Get-Thing -OutVariable Expires", "Do-It ([ref]$Expires)",
+                    "foreach ($Expires in 1) { }"],
+            'sh': ["x=1; OWNER_KEY='%s'" % key, "export OWNER_KEY='%s'" % key, "readonly OWNER_KEY='%s'" % key,
+                   "OWNER_KEY+=x", "read OWNER_KEY", "export OWNER_KEY", "unset OWNER_KEY", "eval \"OWNER_KEY='%s'\"" % key,
+                   "for OWNER_KEY in a; do :; done", ": ${OWNER_KEY:=x}", ": ${OWNER_KEY=x}", "f() { local OWNER_KEY=x; }",
+                   "true && OWNER_KEY=x", "{ OWNER_KEY=x; }", "if :; then OWNER_KEY=x; fi",
+                   "x=1; EXPIRES=%s" % exp, "export EXPIRES=%s" % exp, "readonly EXPIRES=%s" % exp, "EXPIRES+=x", "read EXPIRES",
+                   "unset EXPIRES", "eval 'EXPIRES=%s'" % exp, "for EXPIRES in a; do :; done", ": ${EXPIRES:=x}", "true && EXPIRES=x"]}
+        for name, lines in later.items():
+            base = self.baked(name)
+            fp.baked_values(name, base)  # the unchanged file is fine
+            for line in lines:
+                for where, data in (('after', base + line.encode() + b'\n'), ('before', line.encode() + b'\n' + base)):
+                    with self.subTest(f'{name} {where}: {line}'):
+                        with self.assertRaises(fp.Refused) as why:
+                            fp.baked_values(name, data)
+                        self.assertEqual(why.exception.code, 'baked')
+        self.fx.build()  # and through the whole check, as a release folder
+        self.swap_boot('ps1', self.baked('ps1') + b"$ownerkey = 'ssh-ed25519 B'\n")
+        self.refuses_locally('baked')
+        self.fx.build()
+        self.swap_boot('sh', self.baked('sh') + b"x=1; OWNER_KEY='ssh-ed25519 B'\n")
+        self.refuses_locally('baked')
+
+    def test_reading_the_baked_values_or_naming_them_in_a_comment_or_another_name_is_not_a_second_assignment(self):
+        fine = {
+            'ps1': ["Write-Output $OwnerKey", "Write-Output $Expires", "if ($OwnerKey -cnotmatch 'x') { exit }",
+                    "$x = $OwnerKey", "$x = ${OwnerKey}", "Get-Fingerprint $script:OwnerKey", "'owner {0}' -f $Namespace, $OwnerKey",
+                    "# $OwnerKey = 'x' in a comment", "   # Set-Variable Expires 1", "$x = $cert.Expires", "$x = $cert.Expires -eq 1",
+                    "Get-OwnerKey", "function Get-Expires { }", "$OwnerKey2 = 'x'", "$MyOwnerKey = 'x'", "$ExpiresAt = 1",
+                    "$OwnerKeys = @()", "if ($OwnerKey -eq 'x' -or $Expires -ne 1) { }", "if ($OwnerKey -in $list) { }",
+                    "Write-Output \"The $OwnerKey ends at $Expires\""],
+            'sh': ["echo \"$OWNER_KEY\" \"$EXPIRES\"", "echo ${OWNER_KEY} ${EXPIRES}", "echo ${EXPIRES:-x}", "set -- $OWNER_KEY",
+                   "# OWNER_KEY=x in a comment", "  # export EXPIRES=1", "MY_OWNER_KEY=1", "OWNER_KEY_2=1", "EXPIRES_AT=1", "XEXPIRES=1",
+                   "[ \"$OWNER_KEY\" = x ] || die", "[ \"$EXPIRES\" = x ] || die", "echo $OWNER_KEY=x", "x=$OWNER_KEY"]}
+        for name, lines in fine.items():
+            for line in lines:
+                with self.subTest(f'{name}: {line}'):
+                    self.assertEqual(fp.baked_values(name, self.baked(name) + line.encode() + b'\n'), (OWNER_LINE, utc(BAKED_UNTIL)))
+        self.fx.build()
+        self.swap_boot('ps1', self.baked('ps1') + b"Write-Output $OwnerKey $Expires\n")
+        self.fx.check()
+        self.fx.build()
+        self.swap_boot('sh', self.baked('sh') + b'echo "$OWNER_KEY" "$EXPIRES"\n')
+        self.fx.check()
 
     def test_baking_is_checked_after_the_hash_and_the_blob_and_a_baked_file_passes(self):
         self.fx.build()
@@ -468,6 +563,14 @@ class Publish(unittest.TestCase):
                     self.fx.check()
                 self.assertNotEqual(why.exception.code, 'size')
 
+    def test_an_empty_asset_of_any_kind_is_refused(self):
+        for name in (n for n in fp.FIXED + fp.KIT_FILES + (BUNDLE,) if n not in ('deploy-pin.json',)):
+            with self.subTest(name):
+                self.fx.build()
+                self.fx.put(name, b'')
+                with self.assertRaises(fp.Refused):
+                    self.fx.check()
+
     # kit.json's python_zip
 
     def kit_with(self, python_zip, drop: bool = False) -> None:
@@ -485,6 +588,11 @@ class Publish(unittest.TestCase):
                'three digits': {'version': '100.1.1', 'sha256': ok_sha}, 'letters': {'version': '3.14.x', 'sha256': ok_sha},
                'rc': {'version': '3.14.7rc1', 'sha256': ok_sha}, 'trailing newline': {'version': '3.14.7\n', 'sha256': ok_sha},
                'unicode digits': {'version': '3.1\u0664.7', 'sha256': ok_sha}, 'empty': {'version': '', 'sha256': ok_sha},
+               'all unicode digits': {'version': '\u0663.\u0661\u0664.\u0667', 'sha256': ok_sha},
+               'three digit minor': {'version': '3.100.1', 'sha256': ok_sha}, 'three digit patch': {'version': '3.12.100', 'sha256': ok_sha},
+               'letter separators': {'version': '3x12x1', 'sha256': ok_sha}, 'first separator': {'version': '3x12.1', 'sha256': ok_sha},
+               'second separator': {'version': '3.12x1', 'sha256': ok_sha}, 'commas': {'version': '3,12,1', 'sha256': ok_sha},
+               'dashes': {'version': '3-12-1', 'sha256': ok_sha}, 'no separator': {'version': '3121', 'sha256': ok_sha},
                'int version': {'version': 3, 'sha256': ok_sha}, 'no version': {'sha256': ok_sha},
                'upper sha': {'version': '3.14.7', 'sha256': ok_sha.upper()}, 'short sha': {'version': '3.14.7', 'sha256': ok_sha[:-1]},
                'long sha': {'version': '3.14.7', 'sha256': ok_sha + 'a'}, 'non-hex sha': {'version': '3.14.7', 'sha256': 'g' * 64},

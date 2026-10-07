@@ -37,7 +37,9 @@ carry, normally the previous release's). The job runs `bin/fleet-install-publish
   assets themselves; `.gitattributes` stays an exact published copy of the fleet repo's own file (which sets
   `*.ps1 eol=crlf` for checkouts) and does not change that rule. Each bootstrap must also carry its baked values on one
   assignment line each (`$OwnerKey = '...'` and `$Expires = '...'` in the `.ps1`; `OWNER_KEY='...'` and `EXPIRES=...` in the `.sh`),
-  exactly one line each with nothing after the value: the key must equal (type and base64) the owner key that verified
+  exactly one line each with nothing after the value, and nothing else in the file (outside comment lines) may set either
+  variable (a differently cased, scoped, indented or later assignment, `Set-Variable`, `read`, `export` and the like are
+  refused; reading the variable is fine): the key must equal (type and base64) the owner key that verified
   `install.json`, and the expiry must have `valid_until`'s shape and be at least `valid_until` and at least 30 days from now
   (`baked`; the placeholders `ssh-ed25519 UNBAKED` and 1970 are refused);
 - every asset is held to a size cap no larger than the bootstraps' own downloads: `install.json` 8192 bytes, each

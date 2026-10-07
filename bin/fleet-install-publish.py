@@ -223,13 +223,13 @@ MAX_CARRIER_SH = 262144  # carrier-check.sh, the one kit file the POSIX bootstra
 # bootstraps' own LF-only rule is enforced on the bootstrap assets (BOOT_BYTES), not on this file.
 GITATTRIBUTES = b'* text=auto eol=lf\n*.ps1 eol=crlf\n'
 MIN_DAYS_BAKED = MIN_DAYS  # the baked expiry is at least this many days past the publish
-BAKED = {  # per bootstrap: the one-line assignments of the baked key and expiry (and a looser pattern that must count the same)
+BAKED = {  # per bootstrap: the strict one-line assignments of the baked key and expiry, and the variable names whose
+    # every write (see _writes) must be that one line, so a later or hidden second assignment is refused
     'ps1': (re.compile(r"^\$OwnerKey = '([^'\n]*)'$", re.M), re.compile(r"^\$Expires = '([^'\n]*)'$", re.M),
-            re.compile(r'^[ \t]*\$OwnerKey\b[ \t]*=', re.M), re.compile(r'^[ \t]*\$Expires\b[ \t]*=', re.M)),
-    'sh': (re.compile(r"^OWNER_KEY='([^'\n]*)'$", re.M), re.compile(r'^EXPIRES=([^\n]*)$', re.M),
-           re.compile(r'^[ \t]*OWNER_KEY=', re.M), re.compile(r'^[ \t]*EXPIRES=', re.M)),
+            'OwnerKey', 'Expires'),
+    'sh': (re.compile(r"^OWNER_KEY='([^'\n]*)'$", re.M), re.compile(r'^EXPIRES=([^\n]*)$', re.M), 'OWNER_KEY', 'EXPIRES'),
 }
-PYTHON_VERSION = re.compile(r'[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,2}', re.ASCII)
+PYTHON_VERSION = re.compile(r'\d{1,2}\.\d{1,2}\.\d{1,2}', re.ASCII)  # ASCII digits only: \d alone takes Arabic-Indic ones too
 CHUNK = 1 << 20
 TOOL_TIMEOUT, UPLOAD_TIMEOUT = 600, 1800  # seconds: gh queries; the release upload with the bundle in it
 USAGE, REFUSED = 2, 1
@@ -342,13 +342,45 @@ def check_boot_bytes(data: bytes) -> None:
         raise Refused('boot-bytes')
 
 
+_COMMENT_LINE = re.compile(r'^[ \t]*#[^\n]*', re.M)  # a line whose first non-blank character is `#` (both languages)
+_READ_PREFIX = re.compile(r'\$\{?(?:\w+:)?$')  # `$`, `${`, `$script:` or `${global:` right before a name: a read, unless an
+# assignment follows it (below); a bare name is `Set-Variable OwnerKey`, `-OutVariable OwnerKey`, `read OWNER_KEY`, `NAME=`
+_PS_WRITE = re.compile(r'\}?[ \t]*[-+*/%]?=')  # `$Name = ...`, `$Name += ...`, `${Name} = ...`
+_PS_LOOP = re.compile(r'\bfor(?:each)?[ \t]*\([ \t]*\$\{?(?:\w+:)?$', re.I)  # `foreach ($Name in ...)` sets it too
+_PS_REF = re.compile(r'\[ref\][ \t]*\$\{?(?:\w+:)?$', re.I)  # `[ref]$Name` hands it to code that can set it
+
+
+def _writes(name: str, data: str, var: str) -> int:
+    """How many places in the bootstrap (outside comment lines) can set `var`: every mention that is not a plain read,
+    in any position and any case on Windows (PowerShell variables are case-insensitive: $ownerkey, $script:OwnerKey,
+    Set-Variable OwnerKey, [ref]$OwnerKey), and `NAME=` after `;`, `&&`, `export`, `readonly` or in an `eval` on
+    POSIX (also `read NAME`, `export NAME` and `${NAME:=x}`). A read (`$VAR`, `${VAR}`, `$script:VAR`) is not
+    counted; a part of a longer name (`Get-OwnerKey`, `MY_OWNER_KEY`) and a property (`.Expires`) are not mentions.
+    The one baked assignment line is the 1 that is expected."""
+    code = _COMMENT_LINE.sub('', data)
+    ps1, count = name == 'ps1', 0
+    for m in re.finditer(rf'(?<![\w]){re.escape(var)}(?![\w])', code, re.I if ps1 else 0):
+        before, after = code[:m.start()][-40:], code[m.end():m.end() + 8]
+        if ps1:
+            if before.endswith(('.', '-')):
+                continue
+            write = (not _READ_PREFIX.search(before) or _PS_WRITE.match(after) or _PS_LOOP.search(before)
+                     or _PS_REF.search(before))
+        else:
+            write = (not _READ_PREFIX.search(before)
+                     or (before.endswith('${') and re.match(r':?=', after) is not None))
+        count += bool(write)
+    return count
+
+
 def baked_values(name: str, data: bytes) -> tuple[str, str]:
     """(key, expires) from the bootstrap's one assignment line each, or Refused('baked') unless exactly one line of
-    each kind is there and nothing follows the value on it (an indented or repeated assignment counts as another)."""
-    key_rx, exp_rx, key_any, exp_any = BAKED[name]
+    each kind is there, nothing follows the value on it and nothing else in the file can set either variable (an
+    indented, repeated, differently spelled or scoped assignment counts as another)."""
+    key_rx, exp_rx, key_var, exp_var = BAKED[name]
     text = data.decode('ascii', 'replace')
     keys, exps = key_rx.findall(text), exp_rx.findall(text)
-    if len(keys) != 1 or len(exps) != 1 or len(key_any.findall(text)) != 1 or len(exp_any.findall(text)) != 1:
+    if len(keys) != 1 or len(exps) != 1 or _writes(name, text, key_var) != 1 or _writes(name, text, exp_var) != 1:
         raise Refused('baked')
     return keys[0], exps[0]
 
