@@ -138,6 +138,31 @@ class Workflow(unittest.TestCase):
         self.assertIn('upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2', WF)
         self.assertIn('download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0', WF)
 
+    def test_the_plan_step_runs_as_actions_runs_it(self):  # bash -e -o pipefail: a ref with no release folder must skip, not fail
+        import subprocess
+        block = WF.split('      - id: plan\n', 1)[1].split('        run: |\n', 1)[1]
+        lines = []
+        for l in block.split('\n'):
+            if not l.startswith('          '):
+                break
+            lines.append(l[10:])
+        bash = shutil.which('bash')
+        if not bash:
+            self.skipTest('no bash')
+        for folders, want in (((), 'have=false'), (('release/install-3', 'release/install-12'), 'dir=release/install-12')):
+            with tempfile.TemporaryDirectory() as d:
+                for f in folders:
+                    os.makedirs(os.path.join(d, f))
+                    for b in ('bootstrap.ps1', 'bootstrap.sh'):
+                        open(os.path.join(d, f, b), 'w').close()
+                out = os.path.join(d, 'out')
+                r = subprocess.run([bash, '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', '\n'.join(lines)], cwd=d,
+                                   env={'PATH': os.environ['PATH'], 'BOOT_DIR': '', 'GITHUB_OUTPUT': out},
+                                   capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                with open(out) as fh:
+                    self.assertIn(want, fh.read())
+
 
 @unittest.skipUnless(TOOLS and shutil.which('sh') and shutil.which('curl'), 'ssh-keygen, openssl, sh or curl is missing')
 class RealBootstrap(unittest.TestCase):
