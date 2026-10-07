@@ -40,7 +40,7 @@ jobs:
         shell: bash
         run: |
           dir=$BOOT_DIR
-          [ -n "$dir" ] || dir=$(ls -d release/install-*/ 2>/dev/null | sed 's|/$||' | sort -t- -k2 -n | tail -n 1)
+          [ -n "$dir" ] || dir=$(ls -d release/install-*/ 2>/dev/null | sed 's|/$||' | sort -t- -k2 -n | tail -n 1 || true)  # no folder: ls exits 2 and pipefail would end the job
           re='^release/install-(0|[1-9][0-9]{0,9})$'   # the whole string: a newline in the input cannot pass or reach the output file
           if [[ $dir =~ $re ]] && [ -f "$dir/bootstrap.ps1" ] && [ -f "$dir/bootstrap.sh" ]; then
             printf 'have=true\ndir=%s\n' "$dir" >> "$GITHUB_OUTPUT"
