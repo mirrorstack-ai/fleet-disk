@@ -1,0 +1,2 @@
+vendor/manifest.py -text
+vendor/manifest.sha256 -text

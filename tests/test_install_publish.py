@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 from datetime import datetime, timedelta, timezone
@@ -32,8 +33,8 @@ REPO, SHA, TOKEN = 'org/repo', 'ab' * 20, 'tok-' + 'x' * 8  # built at runtime, 
 NOW = datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc)
 SERIAL = 5
 TAG = f'install-{SERIAL}'
-BUNDLE = 'fleet-install-bundle.tar'
-BUNDLE_URL = f'https://github.com/{REPO}/releases/download/{TAG}/{BUNDLE}'
+bundle_url = lambda serial: f'https://kit.example.org/v1/kit/{serial}/bundle.tar'  # noqa: E731  (the kit host, never GitHub)
+BUNDLE_URL = bundle_url(SERIAL)
 sha = lambda data: hashlib.sha256(data).hexdigest()  # noqa: E731
 blob = lambda data: hashlib.sha1(b'blob %d\0' % len(data) + data).hexdigest()  # noqa: E731
 utc = lambda dt: dt.strftime('%Y-%m-%dT%H:%M:%SZ')  # noqa: E731
@@ -95,7 +96,7 @@ def manifest(valid_until: datetime = NOW + timedelta(days=90), **over) -> dict:
            'bootstrap': {'ps1': {'sha256': sha(PS1), 'blob': blob(PS1)},
                          'sh': {'sha256': sha(SH), 'blob': blob(SH)}},
            'kit': {'serial': 3, 'kit_json_sha256': 'f' * 64}, 'lock_sha256': H64,
-           'bundle': {'head': H40, 'tree': BUNDLE_TREE, 'url': BUNDLE_URL, 'sha256': sha(BUNDLE_BYTES),
+           'bundle': {'head': H40, 'tree': BUNDLE_TREE, 'url': bundle_url(over.get('serial', SERIAL)), 'sha256': sha(BUNDLE_BYTES),
                       'size': len(BUNDLE_BYTES)}}
     doc.update(over)
     return doc
@@ -127,8 +128,7 @@ class Fixture:
         path.write_bytes(data)
         return path
 
-    def build(self, valid_until: datetime = NOW + timedelta(days=90), bundle: bool = True, pin: bool = True,
-              **over) -> 'Fixture':
+    def build(self, valid_until: datetime = NOW + timedelta(days=90), pin: bool = True, **over) -> 'Fixture':
         for name, data in KIT.items():
             self.put(name, data)
         kit = json.dumps({'serial': 3, 'files': [{'path': n, 'sha256': sha(d)} for n, d in KIT.items()],
@@ -141,18 +141,14 @@ class Fixture:
         self.put('bootstrap.sh', SH)
         doc = manifest(valid_until, **over)
         doc['kit']['kit_json_sha256'] = sha(kit)
-        if bundle:
-            self.put(BUNDLE, BUNDLE_BYTES)
-        else:
-            doc['bundle']['url'] = 'https://example.org/elsewhere/bundle.tar'
         self.signed_install(doc)
         return self
 
     def signed_install(self, doc: dict, key: Path | None = None, namespace: str = fp.NS) -> None:
         sign(key or self.key, self.put('install.json', json.dumps(doc).encode()), namespace)
 
-    def check(self, min_serial: int = 0, repo: str = REPO, now: datetime = NOW, run=fp.run_argv) -> 'fp.Plan':
-        plan = fp.check_dir(Path('release') / self.dir.name, self.pub.read_bytes(), min_serial, now, repo, run)
+    def check(self, min_serial: int = 0, now: datetime = NOW, run=fp.run_argv) -> 'fp.Plan':
+        plan = fp.check_dir(Path('release') / self.dir.name, self.pub.read_bytes(), min_serial, now, run)
         self.plans.append(plan)
         return plan
 
@@ -230,11 +226,11 @@ class Publish(unittest.TestCase):
         lines = fp.publish(gh, self.fx.check(), REPO, SHA, TOKEN)
         (create,) = gh.creates()
         self.assertEqual([Path(p).name for p in create[4:create.index('--target')]],
-                         list(fp.FIXED + fp.KIT_FILES) + [BUNDLE])
+                         list(fp.FIXED + fp.KIT_FILES))
         self.assertEqual(create[create.index('--target') + 1], SHA)
         self.assertEqual(Path(create[4]).name, 'install.json')
         self.assertNotEqual(Path(create[4]).parent, self.fx.dir)  # uploaded from the private copy, not the folder
-        self.assertEqual(len(lines), 15)
+        self.assertEqual(len(lines), 14)
         self.assertIn(f'bootstrap.sh sha256:{sha(SH)} https://github.com/{REPO}/releases/download/{TAG}/bootstrap.sh',
                       lines)
         self.assertTrue(any(l.startswith('default.gitattributes ') for l in lines))  # the name GitHub served
@@ -248,12 +244,16 @@ class Publish(unittest.TestCase):
         self.assertLess(next(i for i, c in enumerate(gh.calls) if c[2].endswith('/immutable-releases')),
                         next(i for i, c in enumerate(gh.calls) if c[1:3] == ['release', 'create']))
 
-    def test_a_publish_without_a_bundle_here_carries_no_bundle(self):
-        self.fx.build(bundle=False)
+    def test_the_bundle_is_never_a_release_asset_and_a_bundle_file_in_the_folder_is_unlisted(self):
+        self.fx.build()
         gh = FakeGh()
         fp.publish(gh, self.fx.check(), REPO, SHA, TOKEN)
-        self.assertEqual(len(gh.created), 14)
-        self.assertNotIn(BUNDLE, [p.name for p in gh.created])
+        self.assertEqual(sorted(p.name for p in gh.created), sorted(fp.FIXED + fp.KIT_FILES))
+        for name in ('bundle.tar', 'fleet-install-bundle.tar'):
+            with self.subTest(name):
+                self.fx.build()
+                self.fx.put(name, BUNDLE_BYTES)
+                self.refuses_locally('unlisted')
 
     def test_exactly_thirty_days_of_validity_is_enough_and_a_minute_less_is_not(self):
         self.fx.build(valid_until=NOW + timedelta(days=30))
@@ -564,7 +564,7 @@ class Publish(unittest.TestCase):
                 self.assertNotEqual(why.exception.code, 'size')
 
     def test_an_empty_asset_of_any_kind_is_refused(self):
-        for name in (n for n in fp.FIXED + fp.KIT_FILES + (BUNDLE,) if n not in ('deploy-pin.json',)):
+        for name in (n for n in fp.FIXED + fp.KIT_FILES if n not in ('deploy-pin.json',)):
             with self.subTest(name):
                 self.fx.build()
                 self.fx.put(name, b'')
@@ -612,8 +612,8 @@ class Publish(unittest.TestCase):
                 self.kit_with({'version': version, 'sha256': ok_sha})
                 self.fx.check()
 
-    def test_a_changed_kit_file_the_kit_json_or_the_bundle_is_refused_hash(self):
-        for name in ('carrier-check.py', 'kit.json', BUNDLE):
+    def test_a_changed_kit_file_or_the_kit_json_is_refused_hash(self):
+        for name in ('carrier-check.py', 'kit.json'):
             with self.subTest(name):
                 self.fx.build()
                 path = self.fx.dir / name
@@ -636,11 +636,6 @@ class Publish(unittest.TestCase):
         self.fx.put('extra.txt', b'x')
         self.refuses_locally('unlisted')
 
-    def test_a_bundle_the_signed_url_does_not_name_is_unlisted(self):
-        self.fx.build(bundle=False)
-        self.fx.put(BUNDLE, BUNDLE_BYTES)
-        self.refuses_locally('unlisted')
-
     def test_a_link_or_a_folder_in_the_release_folder_is_refused(self):
         self.fx.build()
         (self.fx.dir / 'sub').mkdir()
@@ -654,11 +649,6 @@ class Publish(unittest.TestCase):
         self.refuses_locally('no-deploy-pin')
         self.fx.build()
         (self.fx.dir / 'deploy-pin.json.sig').unlink()
-        self.refuses_locally('missing')
-
-    def test_a_missing_bundle_that_the_url_names_is_refused_missing(self):
-        self.fx.build()
-        (self.fx.dir / BUNDLE).unlink()
         self.refuses_locally('missing')
 
     def test_a_local_refusal_never_reaches_gh(self):
@@ -782,18 +772,14 @@ class Publish(unittest.TestCase):
         self.put_pin(self.pin_with(tree='2' * 40))
         self.refuses_locally('pin-mismatch')
 
-    def test_without_the_bundle_in_the_release_the_pin_is_not_compared(self):
-        self.fx.build(bundle=False)
-        self.put_pin(self.pin_with(head='1' * 40, tree='2' * 40))
+    def test_the_pin_is_compared_with_the_signed_bundle_though_no_bundle_is_in_the_release(self):
+        self.fx.build()
+        self.put_pin(self.pin_with(head='1' * 40, tree='2' * 40))  # both differ: a pin of some other bundle
+        self.refuses_locally('pin-mismatch')
+        self.put_pin(self.pin_with(head='1' * 40))
+        self.refuses_locally('pin-mismatch')
+        self.put_pin(self.pin_with())
         self.assertEqual(self.fx.check().tag, TAG)
-
-    def test_without_the_bundle_a_pin_of_a_bad_shape_or_signature_is_still_refused(self):
-        self.fx.build(bundle=False)
-        self.put_pin(b'[1]')
-        self.refuses_locally('form')
-        self.fx.build(bundle=False)
-        sign(self.fx.other, self.fx.dir / 'deploy-pin.json', fp.PIN_NS)
-        self.refuses_locally('sig')
 
     def test_the_created_release_must_read_back_immutable_and_not_a_draft(self):
         self.fx.build()
@@ -815,13 +801,11 @@ class Publish(unittest.TestCase):
         self.fx.build()
         plan = self.fx.check()
         self.fx.put('bootstrap.sh', SH + b'echo swapped\n')
-        self.fx.put(BUNDLE, b'swapped')
         gh = FakeGh()
         fp.publish(gh, plan, REPO, SHA, TOKEN)  # the read-back digests are those of the signed bytes
         self.assertEqual(gh.created[0].parent, plan.stage)
         by_name = {p.name: p for p in gh.created}
         self.assertEqual(by_name['bootstrap.sh'].read_bytes(), SH)
-        self.assertEqual(by_name[BUNDLE].read_bytes(), BUNDLE_BYTES)
         self.assertEqual(sha(SH), next(a.sha256 for a in plan.assets if a.name == 'bootstrap.sh'))
 
     def test_the_stage_is_removed_after_main_and_on_a_refusal(self):
@@ -856,19 +840,6 @@ class Publish(unittest.TestCase):
             fp.snapshot(link, Path(stage), 1 << 20)
         self.assertEqual(why.exception.code, 'unlisted')
 
-    def test_a_bundle_of_the_right_size_and_other_bytes_is_refused_hash(self):
-        self.fx.build()
-        self.fx.put(BUNDLE, b'X' * len(BUNDLE_BYTES))
-        self.refuses_locally('hash')
-
-    def test_a_bundle_whose_signed_size_is_not_its_size_is_refused_hash_though_the_sha_matches(self):
-        self.fx.build(bundle=True)
-        doc = manifest()
-        doc['bundle']['size'] = len(BUNDLE_BYTES) + 1
-        doc['kit']['kit_json_sha256'] = sha((self.fx.dir / 'kit.json').read_bytes())
-        self.fx.signed_install(doc)
-        self.refuses_locally('hash')
-
     def test_the_folder_must_be_exactly_release_install_serial_in_canonical_form(self):
         self.fx.build()
         pub = self.fx.pub.read_bytes()
@@ -876,7 +847,7 @@ class Publish(unittest.TestCase):
                   str(self.fx.dir), 'release/install-05', 'release/install-005', 'release/install-+5',
                   'release/install-x/y'):
             with self.subTest(d), self.assertRaises(fp.Refused) as why:
-                fp.check_dir(Path(d), pub, 0, NOW, REPO)
+                fp.check_dir(Path(d), pub, 0, NOW)
             self.assertEqual(why.exception.code, 'dir')
         self.assertEqual(self.fx.check().tag, TAG)
 
@@ -977,7 +948,7 @@ class Publish(unittest.TestCase):
                 self.assertEqual((code, out.strip()), (1, 'REFUSED immutable-unreadable'))
                 self.assertEqual(gh.creates(), [])
 
-    # the bundle's name
+    # the bundle's URL: the invite-gated kit host's download of this serial, never GitHub's
 
     def resign(self, url: str | None = None, **bundle) -> None:
         """Re-sign install.json with another bundle url (or fields), keeping kit.json's hash right."""
@@ -988,44 +959,33 @@ class Publish(unittest.TestCase):
         doc['kit']['kit_json_sha256'] = sha((self.fx.dir / 'kit.json').read_bytes())
         self.fx.signed_install(doc)
 
-    def test_a_bundle_whose_signed_name_is_not_a_plain_file_name_is_refused_bundle_name(self):
-        prefix = BUNDLE_URL[:-len(BUNDLE)]
-        for name in ('', '.hidden', '..', '-x.tar', '~x.tar', '_x.tar', '.gitattributes'):
-            with self.subTest(name):
+    def test_a_bundle_url_that_is_not_the_kit_hosts_download_of_this_serial_is_refused_form(self):
+        for url in (f'https://github.com/{REPO}/releases/download/{TAG}/bundle.tar', 'https://github.com/v1/kit/5/bundle.tar',
+                    'https://objects.githubusercontent.com/v1/kit/5/bundle.tar', 'https://x.y.github.com/v1/kit/5/bundle.tar',
+                    'https://githubusercontent.com/v1/kit/5/bundle.tar', 'https://kit.example.org/v1/kit/6/bundle.tar',
+                    'https://kit.example.org/v1/kit/05/bundle.tar', 'https://kit.example.org/v1/kit/5/other.tar',
+                    'https://kit.example.org/v1/kit/5/bundle.tar/', 'https://kit.example.org/v1/kit/5/bundle.tar/x',
+                    'https://kit.example.org/v1/kit/5/../5/bundle.tar', 'https://kit.example.org/kit/5/bundle.tar',
+                    'https://kit.example.org/v2/kit/5/bundle.tar', 'https://kit.example.org/v1/kit/bundle.tar',
+                    'https://kit.example.org//v1/kit/5/bundle.tar', 'https://kit.example.org/V1/kit/5/bundle.tar'):
+            with self.subTest(url):
                 self.fx.build()
-                self.resign(url=prefix + name)
-                self.refuses_locally('bundle-name')
+                self.resign(url=url)
+                self.refuses_locally('form')
 
-    def test_a_plain_bundle_name_with_dots_dashes_and_underscores_is_fine(self):
-        self.fx.build()
-        (self.fx.dir / BUNDLE).unlink()
-        self.fx.put('A_b-1.2.tar.gz', BUNDLE_BYTES)
-        self.resign(url=BUNDLE_URL[:-len(BUNDLE)] + 'A_b-1.2.tar.gz')
-        self.assertEqual(self.fx.check().assets[-1].name, 'A_b-1.2.tar.gz')
-
-    def test_a_bundle_named_like_a_fixed_file_or_its_published_name_is_refused_unlisted_not_a_traceback(self):
-        for name in ('bootstrap.sh', 'install.json', 'carrier-check.py', 'default.gitattributes'):
-            with self.subTest(name):
+    def test_a_bundle_url_of_a_host_that_only_looks_like_github_is_fine(self):
+        for host in ('notgithub.com', 'github.com.example.org', 'github.community', 'kit.example.org', 'a-b.example.co'):
+            with self.subTest(host):
                 self.fx.build()
-                if name == 'default.gitattributes':
-                    (self.fx.dir / BUNDLE).unlink()  # then it is the ONLY extra file: the name rule alone must refuse
-                    self.fx.put(name, BUNDLE_BYTES)
-                self.resign(url=BUNDLE_URL[:-len(BUNDLE)] + name)
-                self.refuses_locally('unlisted')
+                self.resign(url=f'https://{host}/v1/kit/{SERIAL}/bundle.tar')
+                self.assertEqual(self.fx.check().tag, TAG)
+
+    def test_a_github_bundle_url_stops_main_before_any_gh_call(self):
         self.fx.build()
-        self.resign(url=BUNDLE_URL[:-len(BUNDLE)] + 'bootstrap.sh')
+        self.resign(url=f'https://github.com/{REPO}/releases/download/{TAG}/bundle.tar')
         code, out, err, gh = self.run_main()
-        self.assertEqual((code, out.strip(), gh.calls), (1, 'REFUSED unlisted', []))
+        self.assertEqual((code, out.strip(), gh.calls), (1, 'REFUSED form', []))
         self.assertNotIn('Traceback', err)
-
-    def test_the_read_back_name_of_the_bundle_must_equal_the_signed_name_exactly(self):
-        self.fx.build()
-        for served in (f'default.{BUNDLE}', f'default{BUNDLE}', BUNDLE.upper()):
-            with self.subTest(served):
-                gh = FakeGh()
-                gh.tweak = lambda assets, served=served: [dict(a, name=served) if a['name'] == BUNDLE else a
-                                                          for a in assets]
-                self.refuses('publish-mismatch', gh)
 
     def test_only_gitattributes_may_be_read_back_under_the_default_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1039,11 +999,6 @@ class Publish(unittest.TestCase):
             with self.assertRaises(fp.Refused) as why:
                 fp.publish(gh, plan, REPO, SHA, TOKEN)
             self.assertEqual(why.exception.code, 'publish-mismatch')
-
-    def test_a_bundle_url_of_this_release_with_an_empty_repo_is_not_this_release(self):
-        self.fx.build()
-        self.resign(url=f'https://github.com//releases/download/{TAG}/{BUNDLE}')
-        self.refuses_locally('unlisted', repo='')  # the bundle file is then a file nothing signed accounts for
 
     # every size guard, and the path guards, each with the test that fails without it
 
@@ -1059,12 +1014,6 @@ class Publish(unittest.TestCase):
         self.fx.put('verify-archive.py', b'x' * (fp.MAX_KIT + 1))
         self.refuses_locally('size')
 
-    def test_a_bundle_over_the_bundle_limit_is_refused_size_before_its_hash_is_judged(self):
-        self.fx.build()
-        self.fx.put(BUNDLE, b'x' * 2000)
-        with mock.patch.object(fp, 'MAX_BUNDLE', 1500):  # the signed size (1000) still fits the manifest's own bound
-            self.refuses_locally('size')
-
     def test_install_json_over_its_limit_is_refused_size_and_each_file_is_snapshotted_under_its_own_limit(self):
         self.fx.build()
         self.fx.put('install.json', b'x' * (fp.MAX_BYTES + 1))
@@ -1076,7 +1025,7 @@ class Publish(unittest.TestCase):
         want = {name: 4 << 20 for name in fp.KIT_FILES}  # literal numbers: the bootstraps' own caps, never above them
         want.update({'install.json': 8192, 'install.json.sig': 4096, 'kit.json': 65536, 'kit.json.sig': 4096,
                      'deploy-pin.json': 1 << 20, 'deploy-pin.json.sig': 4096, 'bootstrap.ps1': 1 << 20,
-                     'bootstrap.sh': 1 << 20, 'carrier-check.sh': 262144, '.gitattributes': 4096, BUNDLE: 1 << 30})
+                     'bootstrap.sh': 1 << 20, 'carrier-check.sh': 262144, '.gitattributes': 4096})
         self.assertEqual(limits, want)
 
     def test_snapshot_refuses_a_fifo_or_a_folder_where_a_file_is_expected(self):
@@ -1179,12 +1128,24 @@ class Publish(unittest.TestCase):
     # the public repo carries no internal names
 
     def test_the_public_files_name_no_private_repo_commit_or_internal_id(self):
-        banned = re.compile(r'\bI0\d\b|\bP\+|[0-9a-f]{7,40}\b.*\bmerge\b|manifest\.py|private repo|phone|fleet\.core', re.I)
+        ids = re.compile(r'\bI\d{2}[a-z]?\b|\bH\d{1,2}\b|\bP\+|\xa7')  # a plan id, a section sign
+        banned = re.compile(r'[0-9a-f]{7,40}\b.*\bmerge\b|fleet/install/manifest\.py|private repo|phone', re.I)  # the copy's own import of the fleet package is public
         for rel in ('bin/fleet-install-publish.py', 'README.md', '.github/workflows/install.yml'):
             for n, line in enumerate((ROOT / rel).read_text(encoding='utf-8').splitlines(), 1):
                 self.assertIsNone(banned.search(line), f'{rel}:{n}')
+                self.assertIsNone(ids.search(line), f'{rel}:{n}')
         for n, line in enumerate((ROOT / 'bin/fleet-install-publish.py').read_text(encoding='utf-8').splitlines(), 1):
             self.assertIsNone(re.search(r'\bcommit [0-9a-f]{7,40}\b', line), f'script:{n}')
+
+    def test_the_vendored_files_carry_no_internal_id(self):
+        """vendor/manifest.py is public byte for byte: a plan id in its text would be published with it. Its one import
+        names the fleet's own package (that is what the stand-ins answer to), so only the ids are looked for."""
+        ids = re.compile(r'\bI\d{2}[a-z]?\b|\bH\d{1,2}\b|\bP\+|\xa7|\bwave\b|\bamendment\b', re.I)
+        files = [ROOT / 'vendor/manifest.py', ROOT / 'vendor/manifest.sha256', *sorted((ROOT / 'vendor/standin').rglob('*.py'))]
+        self.assertGreaterEqual(len(files), 6)
+        for path in files:
+            for n, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
+                self.assertIsNone(ids.search(line), f'{path.relative_to(ROOT)}:{n}')
 
     # the command line
 
@@ -1298,7 +1259,7 @@ class Publish(unittest.TestCase):
         self.assertEqual(gh.creates(), [])
 
     def test_serial_zero_is_a_first_release(self):
-        self.fx.build(bundle=False, serial=0)
+        self.fx.build(serial=0)
         moved = self.fx.dir.parent / 'install-0'
         self.fx.dir.rename(moved)
         self.fx.dir = moved
@@ -1353,9 +1314,9 @@ class Publish(unittest.TestCase):
             self.refuses('publish-mismatch', gh)
 
     def test_gh_is_asked_about_the_repo_exactly_as_given_not_lower_cased(self):
-        self.fx.build(bundle=False)
+        self.fx.build()
         gh = FakeGh()
-        plan = self.fx.check(repo='Org/Repo')
+        plan = self.fx.check()
         fp.publish(gh, plan, 'Org/Repo', SHA, TOKEN)
         self.assertEqual({env['GH_REPO'] for env in gh.envs}, {'Org/Repo'})
         self.assertTrue(all('repos/Org/Repo/' in c[2] for c in gh.calls if c[1] == 'api'))
@@ -1368,20 +1329,6 @@ class Publish(unittest.TestCase):
                 code, out, _, _ = self.run_main(gh=gh, drop=(name,))
                 self.assertEqual((code, out.strip(), gh.calls), (1, 'REFUSED release-env', []))
 
-    def test_a_bundle_url_below_the_release_folder_is_not_this_release(self):
-        for sub in ('a/b.tar', 'x/', '/y'):
-            with self.subTest(sub):
-                self.fx.build()
-                self.resign(url=BUNDLE_URL[:-len(BUNDLE)] + sub)
-                self.refuses_locally('unlisted')  # not the release's bundle, so the bundle file in the folder is unlisted
-
-    def test_a_bundle_name_with_a_tilde_anywhere_or_trailing_junk_is_refused_bundle_name(self):
-        prefix = BUNDLE_URL[:-len(BUNDLE)]
-        for name in ('a~b.tar', 'ab~', 'a~', 'x.tar~'):
-            with self.subTest(name):
-                self.fx.build()
-                self.resign(url=prefix + name)
-                self.refuses_locally('bundle-name')
 
 
 class VendoredVerifier(unittest.TestCase):
@@ -1389,28 +1336,109 @@ class VendoredVerifier(unittest.TestCase):
     either side must come with a new copy and a new golden."""
 
     def test_the_constants_equal_the_golden(self):
-        self.assertEqual((fp.NS, fp.PRINCIPAL, fp.KIND), ('mirrorstack-fleet-install', 'owner', 'install'))
-        self.assertEqual((fp.MAX_BYTES, fp.MAX_BUNDLE, fp.MAX_COUNT), (8192, 1 << 30, 1 << 31))
-        self.assertEqual(fp.CODES, ('size', 'key', 'sig', 'form', 'kind', 'expired', 'rollback', 'tree'))
+        v = fp.manifest
+        self.assertEqual((v.NS, v.PRINCIPAL, v.KIND), ('mirrorstack-fleet-install', 'owner', 'install'))
+        self.assertEqual((v.MAX_BYTES, v.MAX_BUNDLE, v.MAX_COUNT), (8192, 1 << 30, 1 << 31))
+        self.assertEqual(v.CODES, ('size', 'key', 'sig', 'form', 'kind', 'expired', 'rollback', 'tree'))
+        self.assertEqual((fp.NS, fp.PRINCIPAL, fp.MAX_BYTES, fp.MAX_COUNT), (v.NS, v.PRINCIPAL, v.MAX_BYTES, v.MAX_COUNT))
         self.assertIn('boot-bytes', fp.PUBLISH_CODES)
         self.assertIn('baked', fp.PUBLISH_CODES)
         self.assertEqual(fp.GITATTRIBUTES, b'* text=auto eol=lf\n*.ps1 eol=crlf\n')  # the fleet repo's file, byte for byte
-        self.assertEqual(fp.SCHEMA, ('kind', 'serial', 'valid_until', 'source_head', 'bootstrap', 'kit', 'lock_sha256',
-                                     'bundle'))
-        self.assertEqual((fp.BOOT_KEYS, fp.KIT_KEYS, fp.BUNDLE_KEYS, fp.OSES),
+        self.assertEqual(v.SCHEMA, ('kind', 'serial', 'valid_until', 'source_head', 'bootstrap', 'kit', 'lock_sha256',
+                                    'bundle'))
+        self.assertEqual((v.BOOT_KEYS, v.KIT_KEYS, v.BUNDLE_KEYS, v.OSES),
                          (('sha256', 'blob'), ('serial', 'kit_json_sha256'), ('head', 'tree', 'url', 'sha256', 'size'),
                           ('ps1', 'sh')))
-        self.assertEqual((fp.HEX40.pattern, fp.HEX64.pattern, fp.UTC_TIME.pattern, fp._KEY.pattern),
+        self.assertEqual(v.HANDOFF_KEYS, ('fp', 'first_serial', 'ps1_sha256', 'sh_sha256'))
+        self.assertEqual((v.HEX40.pattern, v.HEX64.pattern, v.UTC_TIME.pattern, v._KEY.pattern),
                          ('[0-9a-f]{40}', '[0-9a-f]{64}', '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z',
                           '[A-Za-z0-9+/]{68}'))
         label = r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
-        self.assertEqual(fp.URL.pattern, rf'https://({label}(?:\.{label})+)/[A-Za-z0-9._~/-]{{1,200}}')
-        self.assertEqual(fp.SSH_KEYGEN, '/usr/bin/ssh-keygen' if os.name != 'nt'
+        self.assertEqual(v.URL.pattern, rf'https://({label}(?:\.{label})+)/[A-Za-z0-9._~/-]{{1,200}}')
+        self.assertEqual(v.SSH_KEYGEN, '/usr/bin/ssh-keygen' if os.name != 'nt'
                          else 'C:\\Windows\\System32\\OpenSSH\\ssh-keygen.exe')
 
-    def test_the_top_of_the_file_names_the_copied_rules_by_their_schema_version(self):
-        self.assertIn("a copy of the fleet's install manifest rules, schema version 1",
-                      (ROOT / 'bin/fleet-install-publish.py').read_text(encoding='utf-8')[:2500])
+    def test_the_vendored_file_is_the_one_its_pin_names_and_the_publisher_runs_that_file(self):
+        data, pin = (ROOT / 'vendor/manifest.py').read_bytes(), (ROOT / 'vendor/manifest.sha256').read_bytes()
+        self.assertEqual(pin, sha(data).encode() + b'\n')
+        self.assertEqual(fp.manifest.__file__, str(ROOT / 'vendor/manifest.py'))
+        self.assertIs(fp.Refused, fp.manifest.Refused)
+        self.assertIs(fp.signed_install, fp.manifest.signed_install)
+        self.assertIs(fp.parse_install, fp.manifest.parse_install)
+
+    def vendor_copy(self, edit=None, pin=None) -> Path:
+        """A throwaway copy of bin/ and vendor/, with manifest.py edited by `edit` and the pin recomputed (or `pin`)."""
+        root = Path(tempfile.mkdtemp(prefix='vendor-copy-'))
+        self.addCleanup(shutil.rmtree, root, True)
+        shutil.copytree(ROOT / 'bin', root / 'bin', ignore=shutil.ignore_patterns('__pycache__'))
+        shutil.copytree(ROOT / 'vendor', root / 'vendor', ignore=shutil.ignore_patterns('__pycache__'))
+        data = (root / 'vendor/manifest.py').read_bytes()
+        data = edit(data) if edit else data
+        (root / 'vendor/manifest.py').write_bytes(data)
+        (root / 'vendor/manifest.sha256').write_bytes(pin if pin is not None else sha(data).encode() + b'\n')
+        return root
+
+    def test_a_vendored_file_that_is_not_its_pin_is_refused_form_before_anything_else(self):
+        for what, root in {'a changed byte': self.vendor_copy(lambda d: d + b'# x\n', pin=sha(b'').encode() + b'\n'),
+                           'no newline': self.vendor_copy(pin=sha((ROOT / 'vendor/manifest.py').read_bytes()).encode()),
+                           'upper case': self.vendor_copy(pin=sha((ROOT / 'vendor/manifest.py').read_bytes()).upper().encode() + b'\n'),
+                           'two lines': self.vendor_copy(pin=sha((ROOT / 'vendor/manifest.py').read_bytes()).encode() + b'\n\n'),
+                           'empty': self.vendor_copy(pin=b'')}.items():
+            with self.subTest(what):
+                with self.assertRaises(ValueError):
+                    fp.load_vendored(root / 'vendor')
+                done = subprocess.run([sys.executable, str(root / 'bin/fleet-install-publish.py'), 'verify', 'release/install-5',
+                                       '--owner-pub', 'k', '--min-serial', '0'], capture_output=True, text=True, timeout=60,
+                                      env={'PATH': '/usr/bin:/bin'}, cwd=root)
+                self.assertEqual((done.returncode, done.stdout.strip()), (1, 'REFUSED form'))
+        missing = self.vendor_copy()
+        (missing / 'vendor/manifest.sha256').unlink()
+        with self.assertRaises(ValueError):
+            fp.load_vendored(missing / 'vendor')
+        (missing / 'vendor/manifest.py').unlink()
+        with self.assertRaises(ValueError):
+            fp.load_vendored(missing / 'vendor')
+
+    def test_the_publishers_rules_are_the_vendored_files_not_a_copy_of_its_own(self):
+        """Re-pin a vendored file whose size limit is 10 and run the publisher from that tree: it refuses `size`, which
+        only the vendored rule can say (a publisher with its own copy of the rules would not)."""
+        root = self.vendor_copy(lambda d: d.replace(b'MAX_BYTES = 8192', b'MAX_BYTES = 10'))
+        fx = Fixture(Path(tempfile.mkdtemp(prefix='fleet-install-vendored-')))
+        self.addCleanup(shutil.rmtree, fx.tmp, True)
+        self.addCleanup(fx.cleanup)
+        fx.build()
+        for tree, first_line in ((root, 'REFUSED size'), (ROOT, 'OK install-5')):
+            done = subprocess.run([sys.executable, str(tree / 'bin/fleet-install-publish.py'), 'verify', f'release/{TAG}',
+                                   '--owner-pub', str(fx.pub), '--min-serial', '0'], capture_output=True, text=True,
+                                  timeout=60, env={'PATH': '/usr/bin:/bin'}, cwd=fx.tmp)
+            self.assertEqual(done.stdout.split('\n')[0], first_line)
+
+    def test_loading_the_copy_leaves_no_stand_in_behind_and_the_path_as_it_was(self):
+        path, held = list(sys.path), {n for n in sys.modules if n == 'fleet' or n.startswith('fleet.')}
+        fp.load_vendored(ROOT / 'vendor')
+        self.assertEqual(sys.path, path)
+        self.assertEqual({n for n in sys.modules if n == 'fleet' or n.startswith('fleet.')}, held)
+        sentinel = types.ModuleType('fleet')
+        with mock.patch.dict(sys.modules, {'fleet': sentinel}):
+            fp.load_vendored(ROOT / 'vendor')
+            self.assertIs(sys.modules['fleet'], sentinel)
+
+    def test_the_stand_ins_read_strict_json_and_utc_times_as_the_manifest_needs(self):
+        canon, clock = fp.manifest.canon, fp.manifest.clock
+        self.assertEqual(canon.loads_strict(b'{"a": [1, 2.5, null, true]}'), {'a': [1, 2.5, None, True]})
+        self.assertEqual(canon.loads_strict('{"a": 1}'), {'a': 1})
+        for raw in (b'\xef\xbb\xbf{}', b'\xff', b'{"a": 1, "a": 2}', b'{"a": NaN}', b'{"a": Infinity}', b'{"a": 1e999}',
+                    b'[' * 5000, b'', b'{', b'x'):
+            with self.subTest(raw=raw[:12]), self.assertRaises(canon.SchemaError):
+                canon.loads_strict(raw)
+        with mock.patch.object(json, 'loads', side_effect=RecursionError), self.assertRaises(canon.SchemaError):
+            canon.loads_strict(b'{}')
+        self.assertTrue(issubclass(canon.SchemaError, ValueError))
+        self.assertEqual(clock.parse_utc('2026-12-01T00:00:00Z'), datetime(2026, 12, 1, tzinfo=timezone.utc))
+        for bad in ('2026-12-01T00:00:00', '2026-12-01T00:00:00.5Z', '2026-13-01T00:00:00Z', ' 2026-12-01T00:00:00Z',
+                    '2026-1-1T0:0:0Z', '2026-12-01T00:00:00+00:00', ''):
+            with self.subTest(bad), self.assertRaises(ValueError):
+                clock.parse_utc(bad)
 
     def test_a_good_manifest_parses_and_each_misfit_has_its_golden_code(self):
         good = manifest()
@@ -1434,6 +1462,14 @@ class VendoredVerifier(unittest.TestCase):
                     fp.parse_install(json.dumps(doc).encode())
                 self.assertEqual(why.exception.code, code)
         self.assertEqual(fp.parse_install(json.dumps({**good, 'serial': (1 << 31)}).encode())['serial'], 1 << 31)
+        hand = {'fp': 'SHA256:' + 'A' * 43, 'first_serial': SERIAL + 1, 'ps1_sha256': H64, 'sh_sha256': H64}
+        self.assertEqual(fp.parse_install(json.dumps({**good, 'handoff': hand}).encode())['handoff'], hand)  # optional
+        for what, bad in {'first_serial not above serial': {**hand, 'first_serial': SERIAL}, 'another key': {**hand, 'x': 1},
+                          'a short fingerprint': {**hand, 'fp': 'SHA256:' + 'A' * 42}, 'upper case hash': {**hand, 'sh_sha256': 'D' * 64},
+                          'no hash': {k: v for k, v in hand.items() if k != 'ps1_sha256'}}.items():
+            with self.subTest(what), self.assertRaises(fp.Refused) as why:
+                fp.parse_install(json.dumps({**good, 'handoff': bad}).encode())
+            self.assertEqual(why.exception.code, 'form')
         for raw in (b'\xef\xbb\xbf' + json.dumps(good).encode(), b'\xff', b'{"kind": "install", "kind": "install"}',
                     b'{"kind": NaN}', b'{"kind": 1e999}', b'[' * 5000, b''):
             with self.subTest(raw=raw[:20]), self.assertRaises(fp.Refused) as why:
@@ -1467,7 +1503,7 @@ class VendoredVerifier(unittest.TestCase):
         self.assertEqual((fp.MAX_SIG, fp.MAX_KIT_JSON, fp.MAX_CARRIER_SH), (4096, 65536, 262144))
 
     def test_the_publisher_only_adds_codes_the_golden_does_not_have(self):
-        self.assertFalse(set(fp.PUBLISH_CODES) & set(fp.CODES))
+        self.assertFalse(set(fp.PUBLISH_CODES) & set(fp.manifest.CODES))
 
 
 BLOB68 = 'A' * 68
@@ -1605,13 +1641,14 @@ class Seams(unittest.TestCase):
 
     def test_the_pin_serial_may_be_zero_and_head_and_tree_must_be_strings(self):
         head, tree = 'a' * 40, 'b' * 40
-        fp.check_pin(json.dumps({'serial': 0, 'head': head, 'tree': tree}).encode(), None)
+        bundle = {'head': head, 'tree': tree}
+        fp.check_pin(json.dumps({'serial': 0, 'head': head, 'tree': tree}).encode(), bundle)
         for what in ('1' * 40, '[]', 'null', 'true', '{}'):
             for key in ('head', 'tree'):
                 doc = {'serial': 1, 'head': head, 'tree': tree}
                 raw = json.dumps(doc).replace(f'"{doc[key]}"', what).encode()
                 with self.subTest(key=key, what=what):
-                    self.assertEqual(self.code_of(fp.check_pin, raw, None), 'form')
+                    self.assertEqual(self.code_of(fp.check_pin, raw, bundle), 'form')
 
     # the command line
 
@@ -1634,19 +1671,17 @@ class Seams(unittest.TestCase):
         self.assertEqual(fp.blob_ids(b'a\rb'), {blob(b'a\rb')})
         self.assertNotIn(blob(b'a\nb\rc\n'), fp.blob_ids(b'a\r\nb\rc\n'))  # CRLF read as LF is not the asset
 
-    # the bundle name
+    # the bundle url
 
-    def test_bundle_name_of_a_url_below_the_release_or_with_a_tilde_or_junk(self):
-        prefix = f'https://github.com/{REPO}/releases/download/{TAG}/'
-        doc = lambda name: {'bundle': {'url': prefix + name}}  # noqa: E731
-        self.assertEqual(fp.bundle_name(doc('a.tar'), REPO, TAG), 'a.tar')
-        for name in ('a/b.tar', 'x/', 'dir/../b.tar', '/b'):
-            self.assertIsNone(fp.bundle_name(doc(name), REPO, TAG), name)
-        for name in ('a~b', 'ab~', 'a b', 'a\n', 'a?b', '', '.x', '-x', 'aé'):
-            self.assertEqual(self.code_of(fp.bundle_name, doc(name), REPO, TAG), 'bundle-name', name)
-        self.assertIsNone(fp.bundle_name({'bundle': {'url': 'https://example.org/x'}}, REPO, TAG))
-        self.assertIsNone(fp.bundle_name(doc('a.tar'), '', TAG))
-        self.assertIsNone(fp.bundle_name(doc('a.tar'), REPO, 'install-6'))
+    def test_check_bundle_url_wants_the_kit_path_of_the_doc_serial_on_a_host_that_is_not_githubs(self):
+        doc = lambda url, serial=5: {'serial': serial, 'bundle': {'url': url}}  # noqa: E731
+        self.assertIsNone(fp.check_bundle_url(doc('https://kit.example.org/v1/kit/5/bundle.tar')))
+        self.assertIsNone(fp.check_bundle_url(doc('https://kit.example.org/v1/kit/0/bundle.tar', 0)))
+        for url, serial in (('https://kit.example.org/v1/kit/5/bundle.tar', 6), ('https://github.com/v1/kit/5/bundle.tar', 5),
+                            ('https://a.githubusercontent.com/v1/kit/5/bundle.tar', 5),
+                            ('https://kit.example.org/v1/kit/5/bundle.tar?x=1', 5), ('https://kit.example.org/', 5)):
+            with self.subTest(url=url, serial=serial):
+                self.assertEqual(self.code_of(fp.check_bundle_url, doc(url, serial)), 'form')
 
     # the owner's key line and fingerprint
 
@@ -1684,7 +1719,7 @@ class Seams(unittest.TestCase):
     # the two signature checks
 
     def test_a_signature_counts_only_with_a_zero_exit_and_the_right_good_line(self):
-        for verify, ns in ((fp.verify_signature, fp.NS), (fp.verify_pin_signature, fp.PIN_NS)):
+        for verify, ns in ((fp.manifest.verify_signature, fp.NS), (fp.verify_pin_signature, fp.PIN_NS)):
             ok = good_out(ns)
             self.assertIsNone(verify(b't', b's', KEY_LINE, fake_run(0, ok)))
             for what, code, out in (('a nonzero exit', 1, ok), ('another nonzero exit', 255, ok), ('no output', 0, b''),
@@ -1696,7 +1731,7 @@ class Seams(unittest.TestCase):
                     self.assertEqual(self.code_of(verify, b't', b's', KEY_LINE, fake_run(code, out)), 'sig')
 
     def test_the_signature_check_writes_one_allowed_signers_line_for_its_own_namespace(self):
-        for verify, ns in ((fp.verify_signature, fp.NS), (fp.verify_pin_signature, fp.PIN_NS)):
+        for verify, ns in ((fp.manifest.verify_signature, fp.NS), (fp.verify_pin_signature, fp.PIN_NS)):
             seen = []
 
             def spy(argv, stdin):
@@ -1716,7 +1751,7 @@ class Seams(unittest.TestCase):
                           'dash': b'ssh-ed25519 ' + b'A' * 67 + b'-', 'padding': b'ssh-ed25519 ' + b'A' * 67 + b'=',
                           'trailing junk glued on': b'ssh-ed25519 ' + b'A' * 68 + b'!'}.items():
             with self.subTest(what):
-                self.assertEqual(self.code_of(fp.verify_signature, b't', b's', key, no_run), 'key')
+                self.assertEqual(self.code_of(fp.manifest.verify_signature, b't', b's', key, no_run), 'key')
 
 
 class VendoredRules(unittest.TestCase):
@@ -1766,8 +1801,8 @@ class VendoredRules(unittest.TestCase):
                  ('bootstrap', 'sh', 'sha256'), ('bootstrap', 'sh', 'blob'), ('kit', 'serial'),
                  ('kit', 'kit_json_sha256'), ('bundle', 'head'), ('bundle', 'tree'), ('bundle', 'url'),
                  ('bundle', 'sha256'), ('bundle', 'size')]
-        keys = {('bootstrap',): fp.OSES, ('kit',): fp.KIT_KEYS, ('bundle',): fp.BUNDLE_KEYS,
-                ('bootstrap', 'ps1'): fp.BOOT_KEYS, ('bootstrap', 'sh'): fp.BOOT_KEYS}
+        keys = {('bootstrap',): fp.OSES, ('kit',): fp.manifest.KIT_KEYS, ('bundle',): fp.manifest.BUNDLE_KEYS,
+                ('bootstrap', 'ps1'): fp.manifest.BOOT_KEYS, ('bootstrap', 'sh'): fp.manifest.BOOT_KEYS}
         for path in paths:
             for bad in ('zz', 1.5, -1, None, [], True, {'x': 1}) + ((list(keys[path]),) if path in keys else ()):
                 doc = manifest()
