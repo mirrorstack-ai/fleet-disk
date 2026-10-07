@@ -265,10 +265,10 @@ def build_case(x: Ctx, boots: dict[str, bytes], zip_info: dict, c: dict, osn: st
     listed = [entry(n) for n in KIT] + ([{'path': 'extra.txt', 'sha256': sha(b'extra')}] if o.get('kit_extra') else [])
     kit = dumps({'serial': 1, 'files': listed, 'python_zip': {'version': zip_info['version'], 'sha256': zsha}})
     valid = (x.now + timedelta(days=o.get('days', 60))).strftime(TIME)
-    doc = {'kind': o.get('kind', 'install'), 'serial': dserial, 'valid_until': valid, 'source_head': 'a' * 40,
+    doc = {'kind': o.get('kind', 'install'), 'serial': dserial, 'valid_until': valid, 'source_head': '9' * 40,
            'bootstrap': {n: {'sha256': sha(boots[n]), 'blob': PUB.blob_ids(boots[n]).pop()} for n in ('ps1', 'sh')},
            'kit': {'serial': 1, 'kit_json_sha256': sha(kit)}, 'lock_sha256': '0' * 64,
-           'bundle': {'head': 'a' * 40, 'tree': 'b' * 40, 'url': 'https://example.org/bundle.tar', 'sha256': '1' * 64, 'size': 1}}
+           'bundle': {'head': 'a' * 40, 'tree': 'b' * 40, 'url': f'https://example.org/v1/kit/{dserial}/bundle.tar', 'sha256': '1' * 64, 'size': 1}}
     doc.pop(o.get('drop'), None)
     install = dumps(doc, bool(o.get('pretty')))
     sig = x.sign(o.get('signer', 'owner'), o.get('ns', NS), install)

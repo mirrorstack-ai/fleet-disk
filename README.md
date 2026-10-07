@@ -18,9 +18,9 @@ release asset limit).
 
 The release inputs are committed here by PR under `release/install-<serial>/`: `install.json` and `.sig`, `kit.json` and
 `.sig`, the five kit files (`carrier-check.py`, `check.ps1`, `carrier-check.sh`, `verify-archive.py`, `VERIFY.txt`),
-`deploy-pin.json` and `.sig`, `.gitattributes`, `bootstrap.ps1`, `bootstrap.sh` and, when the bundle is public, the bundle
-(its name is the last part of the signed `bundle.url`, which must point at this very release). The signatures are made on
-signed offline by the owner; nothing here holds a private key, and nothing here holds the owner's public key either (see below).
+`deploy-pin.json` and `.sig`, `.gitattributes`, `bootstrap.ps1` and `bootstrap.sh`. The bundle is never part of a release
+here: the signed `bundle.url` is the invite-gated kit host's download of this serial, and a bundle file in the folder is
+refused as unlisted. The signatures are made on signed offline by the owner; nothing here holds a private key, and nothing here holds the owner's public key either (see below).
 
 Actions, then `install`, then Run workflow on `main` with `serial` and `min_serial` (the lowest serial this publish may
 carry, normally the previous release's). The job runs `bin/fleet-install-publish.py publish`, which refuses (exit 1,
@@ -29,8 +29,10 @@ carry, normally the previous release's). The job runs `bin/fleet-install-publish
 - `install.json.sig` verifies with `ssh-keygen -Y verify -n mirrorstack-fleet-install -I owner` against
   the owner's public key (one `ssh-ed25519 <base64>[ comment]` line from the `release` environment, see "The owner's
   key" below; the log prints its `SHA256:` fingerprint), and `install.json` has exactly the signed shape
-  (`bin/fleet-install-publish.py` carries a copy of the fleet's install manifest rules, schema version 1, and a test
-  freezes its constants);
+  (the rules are `vendor/manifest.py`, a byte-identical copy of the fleet's install manifest verifier; see "The vendored
+  verifier" below);
+- the signed `bundle.url` is `https://<kit-host>/v1/kit/<serial>/bundle.tar` for this very serial and the host is not
+  GitHub's (`github.com`, `githubusercontent.com` or a name below them), else `form`;
 - its `serial` is the folder's and at least `min_serial`, and `valid_until` is at least 30 days away;
 - both bootstraps are byte-exact release assets: ASCII, LF only, no CR, no BOM (`boot-bytes`), so the asset is the git
   blob and its blob id is the sha1 of the raw bytes only (no CRLF variant). The LF rule is enforced on the bootstrap
@@ -47,9 +49,9 @@ carry, normally the previous release's). The job runs `bin/fleet-install-publish
   must be a `version` of the form `N.N.N` (one or two digits each) and a lowercase 64-hex `sha256` (`form`);
 - both bootstraps equal the signed sha256 and carry the signed git blob id, `kit.json` equals the signed
   `kit_json_sha256`, and `kit.json` and `deploy-pin.json` carry the owner's signature (namespace
-  `mirrorstack-fleet-pin`); the five kit files equal `kit.json`, the bundle equals the signed sha256 and size;
-- `deploy-pin.json` is present with exactly `serial` (an integer), `head` and `tree` (40 hex) and, when the bundle is in
-  the release, its `head` and `tree` equal the signed `bundle.head` and `bundle.tree` (`pin-mismatch`), and no file in the folder
+  `mirrorstack-fleet-pin`); the five kit files equal `kit.json`;
+- `deploy-pin.json` is present with exactly `serial` (an integer), `head` and `tree` (40 hex), its `head` and `tree`
+  always equal the signed `bundle.head` and `bundle.tree` (`pin-mismatch`), and no file in the folder
   is unlisted (a link or a folder is unlisted); `.gitattributes` equals the constant committed in the script (it carries
   no signature); the folder is exactly `release/install-<serial>` with a canonical serial (no leading zeros);
 - every file is read once into a private temporary copy, and the checks and the upload use that copy only.
@@ -59,12 +61,18 @@ release (`min_serial` stays an extra floor; any check it cannot answer refuses t
 **Immutable releases** setting (read through the API before the release is created), creates the release with exactly
 those assets and reads GitHub's digests back: every asset must be there with the checked sha256, and nothing else.
 `python3 bin/fleet-install-publish.py verify <dir> --owner-pub <key file> --min-serial N` runs the offline half
-alone (with `GITHUB_REPOSITORY` set). After the create it also requires the read-back release to say `immutable: true` and
+alone (no network, no gh, no repository variable). After the create it also requires the read-back release to say `immutable: true` and
 `draft: false` (`immutable-not-set` otherwise), so the owner's variable is only an early stop.
-The deploy pin names exactly the commit and tree the bundle was built from: when the release carries the bundle, the pin's
-`head` and `tree` must equal `install.json`'s `bundle.head` and `bundle.tree` (`pin-mismatch` otherwise). Without the bundle
-in the release the pin is only checked for shape and signature, not compared. The pin's `serial` is not compared here
-(the PC's `verify-archive` enforces its own floor). The owner's own check of a release is `VERIFY.txt`'s `ssh-keygen` line.
+The deploy pin names exactly the commit and tree the bundle was built from: its `head` and `tree` must equal
+`install.json`'s `bundle.head` and `bundle.tree` (`pin-mismatch` otherwise), though the bundle itself is not in this
+release. The pin may also not move back: when an `install-N` release exists, the publisher reads that newest release's
+`deploy-pin.json` (`gh release download`, before anything is created) and refuses `pin-mismatch` if this pin's `serial` is
+lower, or if that previous pin cannot be read or is not a pin (a floor that cannot be read is no floor). The PC has no pin
+floor of its own, so this is one of the bounds on a pin rollback. The previous pin is that release's own asset (immutable,
+made by this publisher after it verified the signature), so it is not verified again, which keeps a key change possible.
+Not enforced here: that the kit host is a pinned one (the host is only held to a path shape and not to be one of GitHub's
+names; the signed sha256, size and pin tree bind the bundle), and that a first release under a new owner key follows a
+published handoff from the old key. The owner's own check of a release is `VERIFY.txt`'s `ssh-keygen` line.
 
 Immutable releases: the job's token usually cannot read the setting (it needs admin). Then the run stops with
 `immutable-unreadable` until the owner records their confirmation as the Environment variable
@@ -80,6 +88,19 @@ missing, is not exactly one such line, or, when the owner also sets `OWNER_PIN_S
 `ssh-keygen -lf`), when the key's fingerprint differs. The run log prints the fingerprint of the key it used (`owner key
 SHA256:...`): the owner compares it with their own key's. The bootstraps carry their own baked copy of the key; this
 variable is only what the publisher checks the release against. `--owner-pub PATH` stays for running `verify` locally.
+
+## The vendored verifier
+
+`vendor/manifest.py` is the install.json verifier, copied byte for byte from the fleet's own repository; `vendor/manifest.sha256`
+holds its sha256 (one lower-case hex line and a newline), and the fleet repository pins the same hash. The publisher loads
+that file at start and stops with `REFUSED form` unless the hash matches, so the rules it applies are exactly the copy's, never
+a second implementation. The copy imports two helpers (a strict JSON reader and a UTC time reader); `vendor/standin/` answers
+those imports without changing a byte of the copy. They decide how strict the copy's rules are, so `vendor/standin.sha256`
+pins them too (one hash over the four files, in the order and form `stand_in_digest` in the script says), and the bytes
+that were hashed are the ones executed. The UTC reader is deliberately stricter than the fleet's (no fractional seconds).
+`.gitattributes` marks the vendored files `-text` so no checkout rewrites their line endings.
+A change to the verifier ships as the same two files in both repositories, in the same step: the fleet
+repository's `bin/fleet-install.py vendor-sync <this checkout>` says `OK vendor-sync` when the copy and both pins agree.
 
 ## Trust model
 
