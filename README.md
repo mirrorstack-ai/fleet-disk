@@ -107,3 +107,13 @@ ref's workflow file). The real boundary is set in the repo, not in code:
 
 `python3 -m unittest discover -s tests` (stdlib only, no network, no qemu, no real gh; the signature tests use a throwaway
 `ssh-keygen` key and are skipped when `ssh-keygen` is missing).
+
+## Boot smoke fixture
+
+`tests/fixture/make_fixture.py` copies the two install bootstraps a PR carries (`release/install-<serial>/bootstrap.ps1`
+and `bootstrap.sh`), bakes a throwaway owner key into the copies with the publisher's own regexes, points their base URLs
+(and the Windows Python ZIP URL) at `127.0.0.1` by pinned regexes, and writes one signed release folder per case (good,
+expired, wrong key, tampered, rolled back, a downgrading redirect, and so on). `tests/fixture/serve.py` serves them over HTTPS
+with a throwaway CA. The PR's files are never changed. `python3 tests/fixture/make_fixture.py --out DIR
+--boot-dir release/install-<serial>` builds the tree by hand (it needs `ssh-keygen`, `openssl` and, on the Windows side,
+network access to python.org for the ZIP, or `--python-zip PATH`).
