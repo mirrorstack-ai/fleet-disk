@@ -30,6 +30,7 @@ OTHER = '1234' * 10
 PINNED = 'D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81'
 IMAGE = fd.QCOW2_MAGIC + b'qcow2 body'
 VHDX = b'vhdx body'
+QCOW2 = b'qcow2 out'  # what the fake's second convert writes (the same length as VHDX: one size limit fits both)
 REPO, SHA, TOKEN = 'org/repo', 'ab' * 20, 'tok-' + 'x' * 8  # built at runtime, never a secret-shaped literal
 SIGNED = calendar.timegm((2026, 9, 30, 12, 0, 0))  # the signature's stamp: the serial's day, midday UTC
 NOW = SIGNED + 3600  # the clock the builds run on in tests
@@ -51,14 +52,14 @@ class FakeIo:
 
     def __init__(self, image: bytes = IMAGE, sums: bytes | None = None, gpgv: tuple[int, str] | None = None,
                  qemu: int = 0, gh: int = 0, release_exists: bool = False, tag_exists: bool = False,
-                 vhdx: bytes = VHDX, check_fails: bool = False, check_out: str | None = None,
+                 vhdx: bytes = VHDX, qcow2: bytes = QCOW2, check_fails: bool = False, check_out: str | None = None,
                  readback: tuple[int, str] | None = None):
         self.bodies = {'SHA256SUMS': sums if sums is not None else sums_for(image), 'SHA256SUMS.gpg': b'sig',
                        fd.IMAGE: image}
         self.gpgv, self.qemu, self.gh = gpgv or (0, validsig(FPR)), qemu, gh
-        self.release_exists, self.tag_exists, self.vhdx = release_exists, tag_exists, vhdx
+        self.release_exists, self.tag_exists, self.vhdx, self.qcow2 = release_exists, tag_exists, vhdx, qcow2
         self.check_fails, self.check_out, self.readback = check_fails, check_out, readback  # existing-tag check answers
-        self.uploaded = ''
+        self.uploaded: list[str] = []
         self.fetched: list[str] = []
         self.ran: list[tuple[list[str], dict[str, str]]] = []
         self.timeouts: list[int] = []
@@ -75,7 +76,7 @@ class FakeIo:
         if argv[0] == fd.GPGV:
             return self.gpgv
         if argv[0] == fd.QEMU_IMG:
-            Path(argv[-1]).write_bytes(self.vhdx)
+            Path(argv[-1]).write_bytes(self.vhdx if argv[argv.index('-O') + 1] == 'vhdx' else self.qcow2)
             return self.qemu, ''
         tag = f'disk-noble-{SERIAL}'
         if argv[:3] == [fd.GH, 'release', 'list']:  # another tag is always listed: only the exact name counts
@@ -87,9 +88,10 @@ class FakeIo:
         if argv[:2] == [fd.GH, 'api']:  # the read-back of the published release
             if self.readback is not None:
                 return self.readback
-            return self.gh, json.dumps({'assets': [{'name': self.uploaded, 'digest': 'sha256:' + sha(self.vhdx)}]})
+            return self.gh, json.dumps({'assets': [{'name': n, 'digest': 'sha256:' + sha(b)} for n, b in zip(
+                self.uploaded, (self.vhdx, self.qcow2))]})
         if argv[:3] == [fd.GH, 'release', 'create']:
-            self.uploaded = Path(argv[4]).name
+            self.uploaded = [Path(a).name for a in argv[4:6]]
         return self.gh, ''
 
     def answer(self, out: str) -> tuple[int, str]:
@@ -116,15 +118,37 @@ class Build(unittest.TestCase):
         self.assertEqual(build(io_), {
             'disk_input': {'url': BASE + 'noble-server-cloudimg-amd64.img', 'sha256': sha(IMAGE)},
             'disk': {'url': f'https://github.com/{REPO}/releases/download/disk-noble-{SERIAL}/noble-{SERIAL}.vhdx',
-                     'sha256': sha(VHDX)}})
-        self.assertEqual(io_.tools(), ['gh api', 'gh release', 'gpgv', 'qemu-img', 'gh release', 'gh api'])
-        gpgv, qemu, gh = io_.ran[2][0], io_.ran[3][0], io_.ran[4][0]
+                     'sha256': sha(VHDX)},
+            'disk_qcow2': {'url': f'https://github.com/{REPO}/releases/download/disk-noble-{SERIAL}/noble-{SERIAL}.qcow2',
+                           'sha256': sha(QCOW2), 'size': len(QCOW2)}})
+        self.assertEqual(io_.tools(), ['gh api', 'gh release', 'gpgv', 'qemu-img', 'qemu-img', 'gh release', 'gh api'])
+        gpgv, qemu, gh = io_.ran[2][0], io_.ran[3][0], io_.ran[5][0]
         self.assertEqual(gpgv[:5], [fd.GPGV, '--keyring', fd.KEYRING, '--status-fd', '1'])
         self.assertEqual(qemu[:8], [fd.QEMU_IMG, 'convert', '-f', 'qcow2', '-O', 'vhdx', '-o',
                                     'subformat=dynamic,block_size=1M'])
         self.assertEqual(gh[:4], [fd.GH, 'release', 'create', f'disk-noble-{SERIAL}'])
         self.assertEqual(gh[gh.index('--target') + 1], SHA)
+        self.assertEqual([Path(a).name for a in gh[4:6]], [f'noble-{SERIAL}.vhdx', f'noble-{SERIAL}.qcow2'])  # one release, both
         self.assertEqual(io_.fetched, [BASE + 'SHA256SUMS', BASE + 'SHA256SUMS.gpg', BASE + fd.IMAGE])
+
+    def test_the_qcow2_is_made_from_the_same_verified_input_uncompressed(self):
+        io_ = FakeIo()
+        build(io_)
+        vhdx, qcow2 = io_.ran[3][0], io_.ran[4][0]
+        self.assertEqual(qcow2[:8], [fd.QEMU_IMG, 'convert', '-f', 'qcow2', '-O', 'qcow2', '-o', 'compat=1.1'])
+        self.assertEqual((qcow2[8], Path(qcow2[9]).name), (vhdx[8], f'noble-{SERIAL}.qcow2'))  # the one image that was checked
+        self.assertNotIn('-c', qcow2)  # no compression: the hash does not depend on a compressor's version
+        self.assertEqual(io_.fetched.count(BASE + fd.IMAGE), 1)
+
+    def test_a_failed_qcow2_convert_publishes_nothing(self):
+        class SecondFails(FakeIo):
+            def run(self, argv, env, timeout=fd.TOOL_TIMEOUT):
+                if argv[0] == fd.QEMU_IMG and argv[argv.index('-O') + 1] == 'qcow2':
+                    return 1, ''
+                return super().run(argv, env, timeout)
+        io_ = SecondFails()
+        self.refused('convert-failed', io_)
+        self.assertEqual((io_.tools()[-1], io_.uploaded), ('qemu-img', []))
 
     def test_every_tool_is_an_absolute_path_under_a_fixed_path(self):
         io_ = FakeIo()
@@ -136,8 +160,8 @@ class Build(unittest.TestCase):
     def test_only_gh_sees_the_token(self):
         io_ = FakeIo()
         build(io_)
-        self.assertEqual([TOKEN in env.values() for _, env in io_.ran], [True, True, False, False, True, True])
-        self.assertEqual(io_.ran[4][1]['GH_REPO'], REPO)
+        self.assertEqual([TOKEN in env.values() for _, env in io_.ran], [True, True, False, False, False, True, True])
+        self.assertEqual(io_.ran[5][1]['GH_REPO'], REPO)
 
     def test_a_bad_signature_stops_before_the_image(self):
         io_ = FakeIo(gpgv=(1, ''))
@@ -289,23 +313,27 @@ class Build(unittest.TestCase):
 
     def test_the_published_asset_is_read_back_and_must_match_what_was_hashed(self):
         name, good = f'noble-{SERIAL}.vhdx', 'sha256:' + sha(VHDX)
+        qname, qgood = f'noble-{SERIAL}.qcow2', 'sha256:' + sha(QCOW2)
+        both = [{'name': name, 'digest': good}, {'name': qname, 'digest': qgood}]
         for readback in ((1, ''), (0, ''), (0, 'not json'), (0, '[]'), (0, '{}'), (0, '{"assets": []}'),
                          (0, json.dumps({'assets': [{'name': name, 'digest': 'sha256:' + sha(b'other')}]})),
                          (0, json.dumps({'assets': [{'name': name, 'digest': None}]})),
                          (0, json.dumps({'assets': [{'name': name, 'digest': sha(VHDX)}]})),
                          (0, json.dumps({'assets': [{'name': 'other.vhdx', 'digest': good}]})),
-                         (0, json.dumps({'assets': [{'name': name, 'digest': good}, {'name': 'x', 'digest': good}]})),
-                         (0, json.dumps({'assets': [{'name': name, 'digest': good}] * 2}))):
+                         (0, json.dumps({'assets': [{'name': name, 'digest': good}]})),  # the qcow2 is not there
+                         (0, json.dumps({'assets': [{'name': name, 'digest': good}, {'name': 'x', 'digest': qgood}]})),
+                         (0, json.dumps({'assets': [{'name': name, 'digest': good}, {'name': qname, 'digest': good}]})),
+                         (0, json.dumps({'assets': [{'name': name, 'digest': good}] * 2})),
+                         (0, json.dumps({'assets': [*both, {'name': 'x', 'digest': good}]}))):
             with self.subTest(readback=readback):
                 self.refused('publish-mismatch', FakeIo(readback=readback))
-        self.assertEqual(build(FakeIo(readback=(0, json.dumps({'assets': [{'name': name, 'digest': good}]}))))
-                         ['disk']['sha256'], sha(VHDX))
+        self.assertEqual(build(FakeIo(readback=(0, json.dumps({'assets': both[::-1]}))))['disk_qcow2']['sha256'], sha(QCOW2))
 
     def test_slow_tools_get_a_timeout_and_the_convert_a_longer_one(self):
         io_ = FakeIo()
         build(io_)
         self.assertEqual(io_.timeouts, [fd.TOOL_TIMEOUT, fd.TOOL_TIMEOUT, fd.TOOL_TIMEOUT, fd.CONVERT_TIMEOUT,
-                                        fd.TOOL_TIMEOUT, fd.TOOL_TIMEOUT])
+                                        fd.CONVERT_TIMEOUT, fd.TOOL_TIMEOUT, fd.TOOL_TIMEOUT])
         self.assertLess(fd.CONVERT_TIMEOUT + fd.FETCH_DEADLINE, 60 * 60)
 
     def test_an_asset_of_2_gib_or_more_is_refused_before_the_upload(self):
@@ -317,6 +345,9 @@ class Build(unittest.TestCase):
         self.assertEqual(io_.tools()[-1], 'qemu-img')
         fd.MAX_ASSET = len(VHDX) + 1
         self.assertEqual(build(FakeIo())['disk']['sha256'], sha(VHDX))
+        io_ = FakeIo(qcow2=QCOW2 + b'x')  # the qcow2 alone is over the limit
+        self.refused('too-big', io_)
+        self.assertEqual((io_.tools()[-2:], io_.uploaded), (['qemu-img', 'qemu-img'], []))
 
     def test_the_asset_limit_is_2_gib(self):
         self.assertEqual(fd.MAX_ASSET, 2 * 1024 ** 3)
@@ -371,8 +402,9 @@ class Main(unittest.TestCase):
         head, _, body = out.getvalue().partition('\n')
         self.assertIn('carrier.lock.json', head)
         entries = json.loads(body)
-        self.assertEqual(sorted(entries), ['disk', 'disk_input'])
+        self.assertEqual(sorted(entries), ['disk', 'disk_input', 'disk_qcow2'])
         self.assertEqual(sorted(entries['disk']), ['sha256', 'url'])
+        self.assertEqual(sorted(entries['disk_qcow2']), ['sha256', 'size', 'url'])
         self.assertTrue(entries['disk']['url'].startswith(f'https://github.com/{REPO}/releases/download/disk-noble-'))
         self.assertNotIn(TOKEN, out.getvalue())
 

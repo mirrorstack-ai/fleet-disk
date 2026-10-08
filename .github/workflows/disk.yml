@@ -1,5 +1,5 @@
-# Builds the fleet's L1 disk: one dispatch converts Ubuntu's signed noble cloud image to a VHDX, publishes it as
-# release disk-noble-<serial> in this repo and prints the two lock entries for the owner to pin and sign. The input
+# Builds the fleet's L1 disk: one dispatch converts Ubuntu's signed noble cloud image to a VHDX and a qcow2, publishes
+# both as release disk-noble-<serial> in this repo and prints the three lock entries for the owner to pin and sign. The input
 # reaches the script only through env:; the script refuses anything but Ubuntu's signature by the pinned key.
 name: disk
 on:

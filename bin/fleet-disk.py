@@ -1,10 +1,11 @@
 """Build the MirrorStack fleet's L1 disk: `fleet-disk.py <serial>`, run by .github/workflows/disk.yml on a GitHub-hosted
 runner. It fetches Ubuntu's noble cloud image of that serial with its SHA256SUMS and SHA256SUMS.gpg, checks the
 signature with gpgv against the cloud-image key PINNED BY FINGERPRINT below, the image's sha256 against the signed line
-and its qcow2 magic, converts it with `qemu-img convert -O vhdx`, publishes the VHDX as the release asset of tag
-disk-noble-<serial> in this repo and prints the two lock entries to paste into the fleet's carrier.lock.json:
-`disk_input` (the signed upstream image) and `disk` (the artifact; qemu-img's VHDX is not byte-reproducible, so the
-owner's signature over the lock is what vouches for it). It never edits the lock and refuses to overwrite a tag.
+and its qcow2 magic, converts it with `qemu-img convert -O vhdx` (Hyper-V) and `-O qcow2 -o compat=1.1`, uncompressed
+(Linux L1), publishes both as the release assets of tag disk-noble-<serial> in this repo and prints the three lock
+entries to paste into the fleet's carrier.lock.json: `disk_input` (the signed upstream image), `disk` (the VHDX) and
+`disk_qcow2` (the qcow2, with its size; qemu-img's output is not promised byte-reproducible, so the owner's signature
+over the lock is what vouches for each). It never edits the lock and refuses to overwrite a tag.
 Standalone stdlib. An error names the rule and never echoes a value; every refusal is exit 1, a bad command line 2."""
 from __future__ import annotations
 
@@ -33,6 +34,8 @@ REPO = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}', re.ASC
 SHA = re.compile(r'[0-9a-f]{64}', re.ASCII)
 MAX_SUMS, MAX_IMAGE = 1 << 20, 2 << 30  # a longer SHA256SUMS or image is refused, not read to the end
 VHDX_OPTS = 'subformat=dynamic,block_size=1M'  # see build(): the smallest block Hyper-V's VHDX allows
+QCOW2_OPTS = 'compat=1.1'  # the Linux disk, uncompressed and with no backing file; nothing relies on byte-for-byte rebuilds:
+# the release pins the sha256 this run produced, and the carrier checks that
 MAX_ASSET = 2 << 30  # GitHub release assets must be under 2 GiB: refuse here rather than fail at upload
 CHUNK = 1 << 20
 TOOL_TIMEOUT, CONVERT_TIMEOUT = 600, 1800  # seconds: gpgv and gh, qemu-img; a hung tool must not hold the job
@@ -162,10 +165,10 @@ def json_out(io: Io, argv: list[str], env: dict[str, str], kind: type, slug: str
 
 def build(io: Io, serial: str, work: Path, repo: str, sha: str, token: str, fpr: str,
           now: float | None = None) -> dict:
-    """Fetch, verify, convert and publish serial's disk; return the two lock entries. Refusals come before any
+    """Fetch, verify, convert and publish serial's disks; return the lock entries. Refusals come before any
     network call (serial, key, repo), then an existing tag or release (a check that cannot be answered refuses too),
-    then in the order the evidence is strongest (signature, sum, magic), then the asset's size; after the upload the
-    published asset is read back and must carry the digest the lock entry will state."""
+    then in the order the evidence is strongest (signature, sum, magic), then each asset's size; after the upload the
+    published assets are read back and must carry the digests the lock entries will state."""
     if not SERIAL.fullmatch(serial):
         raise Refused('serial')
     if not FPR.fullmatch(fpr):
@@ -182,7 +185,8 @@ def build(io: Io, serial: str, work: Path, repo: str, sha: str, token: str, fpr:
             or any(isinstance(r, dict) and r.get('tagName') == tag for r in releases)):
         raise Refused('tag-exists')
     base = f'{BASE}{serial}/'
-    sums, sig, image, vhdx = work / 'SHA256SUMS', work / 'SHA256SUMS.gpg', work / IMAGE, work / f'noble-{serial}.vhdx'
+    sums, sig, image = work / 'SHA256SUMS', work / 'SHA256SUMS.gpg', work / IMAGE
+    vhdx, qcow2 = work / f'noble-{serial}.vhdx', work / f'noble-{serial}.qcow2'
     io.fetch(base + 'SHA256SUMS', sums, MAX_SUMS)
     io.fetch(base + 'SHA256SUMS.gpg', sig, MAX_SUMS)
     verify_signature(io, sums, sig, fpr, serial, time.time() if now is None else now)
@@ -194,24 +198,27 @@ def build(io: Io, serial: str, work: Path, repo: str, sha: str, token: str, fpr:
             raise Refused('not-qcow2')
     # a dynamic VHDX allocates whole blocks: the default 32 MiB block over a sparse 3.5 GiB disk passed 2 GiB (the
     # first build, 2026-10-05); 1 MiB blocks keep the file near the data actually written
-    if io.run([QEMU_IMG, 'convert', '-f', 'qcow2', '-O', 'vhdx', '-o', VHDX_OPTS, str(image), str(vhdx)],
-              {'PATH': '/usr/bin'}, CONVERT_TIMEOUT)[0] != 0:
-        raise Refused('convert-failed')
-    size = vhdx.stat().st_size
-    print(f'fleet-disk: vhdx {size} bytes', file=sys.stderr, flush=True)  # a size, never a secret: how close the limit is
-    if size >= MAX_ASSET:
-        raise Refused('too-big')
-    disk = file_sha(vhdx)
-    if io.run([GH, 'release', 'create', tag, str(vhdx), '--target', sha, '--title', tag,
-               '--notes', f'Ubuntu noble {serial} as VHDX'], env)[0] != 0:
+    for out, fmt, opts in ((vhdx, 'vhdx', VHDX_OPTS), (qcow2, 'qcow2', QCOW2_OPTS)):  # both from the one verified input
+        if io.run([QEMU_IMG, 'convert', '-f', 'qcow2', '-O', fmt, '-o', opts, str(image), str(out)],
+                  {'PATH': '/usr/bin'}, CONVERT_TIMEOUT)[0] != 0:
+            raise Refused('convert-failed')
+        print(f'fleet-disk: {fmt} {out.stat().st_size} bytes', file=sys.stderr, flush=True)  # a size, never a secret
+        if out.stat().st_size >= MAX_ASSET:
+            raise Refused('too-big')
+    disk, disk_qcow2, qcow2_size = file_sha(vhdx), file_sha(qcow2), qcow2.stat().st_size
+    if io.run([GH, 'release', 'create', tag, str(vhdx), str(qcow2), '--target', sha, '--title', tag,
+               '--notes', f'Ubuntu noble {serial} as VHDX and qcow2'], env)[0] != 0:
         raise Refused('publish-failed')
     published = json_out(io, [GH, 'api', f'repos/{repo}/releases/tags/{tag}'], env, dict, 'publish-mismatch')
     assets = published.get('assets')
-    if not (isinstance(assets, list) and len(assets) == 1 and isinstance(assets[0], dict)
-            and assets[0].get('name') == vhdx.name and assets[0].get('digest') == f'sha256:{disk}'):
+    if not (isinstance(assets, list) and len(assets) == 2 and all(isinstance(a, dict) for a in assets)
+            and {a.get('name'): a.get('digest') for a in assets} == {vhdx.name: f'sha256:{disk}',
+                                                                      qcow2.name: f'sha256:{disk_qcow2}'}):
         raise Refused('publish-mismatch')  # what GitHub now serves is not what was hashed: nothing is printed to sign
+    url = f'https://github.com/{repo}/releases/download/{tag}/'
     return {'disk_input': {'url': base + IMAGE, 'sha256': want},
-            'disk': {'url': f'https://github.com/{repo}/releases/download/{tag}/{vhdx.name}', 'sha256': disk}}
+            'disk': {'url': url + vhdx.name, 'sha256': disk},
+            'disk_qcow2': {'url': url + qcow2.name, 'sha256': disk_qcow2, 'size': qcow2_size}}
 
 
 def main(argv: list[str], environ: dict[str, str], io: Io) -> int:

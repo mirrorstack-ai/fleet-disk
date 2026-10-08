@@ -1,6 +1,6 @@
 # fleet-disk
 
-Public, pinned build artifacts for the MirrorStack fleet: the converted Ubuntu noble L1 disk (a VHDX) and the
+Public, pinned build artifacts for the MirrorStack fleet: the converted Ubuntu noble L1 disk (a VHDX for Hyper-V, a qcow2 for Linux) and the
 owner-signed install set (the `install-<serial>` releases).
 
 ## How a build runs
@@ -8,11 +8,12 @@ owner-signed install set (the `install-<serial>` releases).
 Actions, then `disk`, then Run workflow on `main` with the Ubuntu cloud image `serial` (for example `20260930` or
 `20260930.1`). The job runs `bin/fleet-disk.py` on a GitHub-hosted runner with no secrets beyond the job's own token. It
 fetches that image with Ubuntu's `SHA256SUMS` and `SHA256SUMS.gpg`, verifies them, converts the image with
-`qemu-img`, publishes the VHDX as the release `disk-noble-<serial>` and prints the two lock entries (`disk_input` and
-`disk`, each a url and a sha256). A release or tag that already exists is refused, and so is any
-check that cannot be answered (fail closed); after the upload the published asset's digest is read back and must equal the
-printed one. A signature stamped before the serial's date or in the future is refused. A VHDX of 2 GiB or more is refused (GitHub's
-release asset limit).
+`qemu-img` into a VHDX and into an uncompressed `compat=1.1` qcow2 (the Linux disk), publishes both as the release
+`disk-noble-<serial>` and prints the three lock entries (`disk_input`, `disk` and `disk_qcow2`: a url and a sha256 each, and
+the qcow2's size). A release or tag that already exists is refused, and so is any
+check that cannot be answered (fail closed); after the upload the published assets' digests are read back and must equal the
+printed ones. A signature stamped before the serial's date or in the future is refused. A VHDX or qcow2 of 2 GiB or more is
+refused (GitHub's release asset limit).
 
 ## How an install set is released and verified
 
