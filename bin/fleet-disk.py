@@ -34,7 +34,8 @@ REPO = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}', re.ASC
 SHA = re.compile(r'[0-9a-f]{64}', re.ASCII)
 MAX_SUMS, MAX_IMAGE = 1 << 20, 2 << 30  # a longer SHA256SUMS or image is refused, not read to the end
 VHDX_OPTS = 'subformat=dynamic,block_size=1M'  # see build(): the smallest block Hyper-V's VHDX allows
-QCOW2_OPTS = 'compat=1.1'  # the Linux disk: no compression and no backing file, so the same input gives the same bytes
+QCOW2_OPTS = 'compat=1.1'  # the Linux disk, uncompressed and with no backing file; nothing relies on byte-for-byte rebuilds:
+# the release pins the sha256 this run produced, and the carrier checks that
 MAX_ASSET = 2 << 30  # GitHub release assets must be under 2 GiB: refuse here rather than fail at upload
 CHUNK = 1 << 20
 TOOL_TIMEOUT, CONVERT_TIMEOUT = 600, 1800  # seconds: gpgv and gh, qemu-img; a hung tool must not hold the job
