@@ -1388,7 +1388,7 @@ class Publish(unittest.TestCase):
 
 
 class VendoredVerifier(unittest.TestCase):
-    """Section 1 (a copy of the fleet's install manifest rules, the optional proof block; there is no version field, this golden is the guard) against a frozen golden: a change to
+    """Section 1 (a copy of the fleet's install manifest rules, with the optional proof block) against a frozen golden: a change to
     either side must come with a new copy and a new golden."""
 
     def test_the_constants_equal_the_golden(self):
@@ -1607,7 +1607,8 @@ class VendoredVerifier(unittest.TestCase):
         top = {**hand, 'first_serial': 1 << 31}  # MAX_COUNT itself is accepted
         self.assertEqual(fp.parse_install(json.dumps({**good, 'handoff': top}).encode())['handoff'], top)
         proof = {'canaries': ['a' * 64, 'b' * 64], 'net_port': 4443}  # the optional proof block: one or more distinct canaries, a port
-        for ok in (proof, {**proof, 'canaries': [f'{i:x}' * 64 for i in range(8)]}, {**proof, 'net_port': 1024}, {**proof, 'net_port': 65535}):
+        for ok in (proof, {**proof, 'canaries': [f'{i:x}' * 64 for i in range(12)]},  # twelve: no cap
+                   {**proof, 'net_port': 1024}, {**proof, 'net_port': 65535}):
             self.assertEqual(fp.parse_install(json.dumps({**good, 'proof': ok}).encode())['proof'], ok)
         for what, bad in {'no canaries': {**proof, 'canaries': []},
                           'a repeat': {**proof, 'canaries': ['a' * 64] * 2}, 'upper case': {**proof, 'canaries': ['A' * 64]},
