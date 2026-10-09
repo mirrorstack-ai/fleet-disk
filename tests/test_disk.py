@@ -1,6 +1,7 @@
 """bin/fleet-disk.py over fakes, with no network and no qemu: the signature by the pinned fingerprint, the signed sum,
 the qcow2 magic, the serial shape, the existing-tag (fail closed) and size refusals, the signature's date, the published digest, timeouts, the two lock entries printed, the real script
-refusing before any network call, and the two workflows' shape. Plain unittest, stdlib only."""
+refusing before any network call, and the two workflows' shape; the arm64 build over the same fakes: its serial and
+sha pins, the vfkit re-check, the raw EFI layout, the zstd round trip, the one asset. Plain unittest, stdlib only."""
 from __future__ import annotations
 
 import calendar
@@ -11,11 +12,13 @@ import io
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -37,8 +40,8 @@ NOW = SIGNED + 3600  # the clock the builds run on in tests
 sha = lambda data: hashlib.sha256(data).hexdigest()  # noqa: E731
 
 
-def sums_for(image: bytes = IMAGE) -> bytes:
-    return f'{sha(image)} *noble-server-cloudimg-amd64.img\n{sha(b"other")} *other.img\n'.encode()
+def sums_for(image: bytes = IMAGE, name: str = 'noble-server-cloudimg-amd64.img') -> bytes:
+    return f'{sha(image)} *{name}\n{sha(b"other")} *other.img\n'.encode()
 
 
 def validsig(*fprs: str, good: bool = True, stamp: int = SIGNED) -> str:
@@ -57,15 +60,19 @@ class FakeIo:
         self.bodies = {'SHA256SUMS': sums if sums is not None else sums_for(image), 'SHA256SUMS.gpg': b'sig',
                        fd.IMAGE: image}
         self.gpgv, self.qemu, self.gh = gpgv or (0, validsig(FPR)), qemu, gh
-        self.release_exists, self.tag_exists, self.vhdx, self.qcow2 = release_exists, tag_exists, vhdx, qcow2
+        self.release_exists, self.tag_exists, self.formats = release_exists, tag_exists, {'vhdx': vhdx, 'qcow2': qcow2}
         self.check_fails, self.check_out, self.readback = check_fails, check_out, readback  # existing-tag check answers
         self.uploaded: list[str] = []
+        self.written: dict[str, bytes] = {}  # what the fake tools wrote, by file name: GitHub's digests are read from it
+        self.tag = f'disk-noble-{SERIAL}'
         self.fetched: list[str] = []
+        self.limits: dict[str, int] = {}
         self.ran: list[tuple[list[str], dict[str, str]]] = []
         self.timeouts: list[int] = []
 
     def fetch(self, url: str, dest: Path, limit: int) -> str:
         self.fetched.append(url)
+        self.limits[url.rpartition('/')[2]] = limit
         body = self.bodies[url.rpartition('/')[2]]
         dest.write_bytes(body)
         return sha(body)
@@ -76,9 +83,10 @@ class FakeIo:
         if argv[0] == fd.GPGV:
             return self.gpgv
         if argv[0] == fd.QEMU_IMG:
-            Path(argv[-1]).write_bytes(self.vhdx if argv[argv.index('-O') + 1] == 'vhdx' else self.qcow2)
+            self.written[Path(argv[-1]).name] = self.formats[argv[argv.index('-O') + 1]]
+            Path(argv[-1]).write_bytes(self.written[Path(argv[-1]).name])
             return self.qemu, ''
-        tag = f'disk-noble-{SERIAL}'
+        tag = self.tag
         if argv[:3] == [fd.GH, 'release', 'list']:  # another tag is always listed: only the exact name counts
             listed = [{'tagName': tag + '0', 'isDraft': False}] + [{'tagName': tag, 'isDraft': True}] * self.release_exists
             return self.answer(json.dumps(listed))
@@ -88,10 +96,10 @@ class FakeIo:
         if argv[:2] == [fd.GH, 'api']:  # the read-back of the published release
             if self.readback is not None:
                 return self.readback
-            return self.gh, json.dumps({'assets': [{'name': n, 'digest': 'sha256:' + sha(b)} for n, b in zip(
-                self.uploaded, (self.vhdx, self.qcow2))]})
+            return self.gh, json.dumps({'assets': [{'name': n, 'digest': 'sha256:' + sha(self.written[n])}
+                                                   for n in self.uploaded]})
         if argv[:3] == [fd.GH, 'release', 'create']:
-            self.uploaded = [Path(a).name for a in argv[4:6]]
+            self.uploaded = [Path(a).name for a in argv[4:argv.index('--target')]]
         return self.gh, ''
 
     def answer(self, out: str) -> tuple[int, str]:
@@ -106,6 +114,58 @@ def build(io_: FakeIo, serial: str = SERIAL, **kw) -> dict:
     with tempfile.TemporaryDirectory() as tmp:
         return fd.build(io_, serial, Path(tmp), kw.get('repo', REPO), kw.get('sha', SHA), kw.get('token', TOKEN),
                         kw.get('fpr', FPR), kw.get('now', NOW))
+
+
+ARM_SERIAL = fd.ARM64_SERIAL
+ARM_BASE = f'https://cloud-images.ubuntu.com/noble/{ARM_SERIAL}/'
+ARM_IMAGE = fd.QCOW2_MAGIC + b'arm64 qcow2 body'
+ARM_TAG = f'disk-noble-arm64-{ARM_SERIAL}'
+ARM_ASSET = f'noble-arm64-{ARM_SERIAL}.raw.zst'
+VFKIT = b'vfkit body'
+IMAGE_PIN, VFKIT_PIN = sha(ARM_IMAGE), sha(VFKIT)
+# the shipped pins are the real image's and the real vfkit's, which no fake can have: the arm64 tests point them at the fakes
+ARM_PINS = {'ARM64_IMAGE_SHA256': IMAGE_PIN, 'VFKIT_SHA256': VFKIT_PIN, 'VFKIT_SIZE': len(VFKIT)}
+LINUX_FS = uuid.UUID('0FC63DAF-8483-4772-8E79-3D69D8477DE4').bytes_le  # a GPT partition type that is not the ESP's
+EMPTY = bytes(16)
+ZST = b'zst:'  # the fake zstd's marker: its output is the marker plus its input, so a round trip really compares bytes
+
+
+def gpt_disk(types: tuple[bytes, ...] = (EMPTY, fd.ESP_TYPE, EMPTY, EMPTY), size: int = 128) -> bytes:
+    """A tiny raw disk: a protective MBR, a GPT header at LBA 1 pointing at len(types) entries of `size` bytes at LBA 2,
+    each entry starting with its partition type GUID (the default has an EFI System Partition as its second)."""
+    disk = bytearray(2 * fd.SECTOR + len(types) * size)
+    disk[510:512], disk[512:520] = b'\x55\xaa', b'EFI PART'
+    struct.pack_into('<QII', disk, fd.SECTOR + 72, 2, len(types), size)
+    for i, kind in enumerate(types):
+        disk[2 * fd.SECTOR + i * size:2 * fd.SECTOR + i * size + 16] = kind
+    return bytes(disk)
+
+
+RAW = gpt_disk()
+
+
+class ArmIo(FakeIo):
+    """FakeIo for the arm64 build: the signed list names the arm64 image, vfkit can be fetched, qemu-img writes a raw
+    disk and zstd compresses and expands it."""
+
+    def __init__(self, image: bytes = ARM_IMAGE, raw: bytes = RAW, vfkit: bytes = VFKIT, zstd: int = 0,
+                 again: bytes | None = None, **kw):
+        kw.setdefault('sums', sums_for(image, fd.IMAGE_ARM64))
+        super().__init__(image=image, **kw)
+        self.bodies[fd.IMAGE_ARM64], self.bodies['vfkit'] = self.bodies.pop(fd.IMAGE), vfkit
+        self.tag, self.zstd, self.again = ARM_TAG, zstd, again
+        self.formats['raw'] = raw
+
+    def run(self, argv: list[str], env: dict[str, str], timeout: int = fd.TOOL_TIMEOUT) -> tuple[int, str]:
+        if argv[0] != fd.ZSTD:
+            return super().run(argv, env, timeout)
+        self.timeouts.append(timeout)
+        self.ran.append((argv, env))
+        src, out = Path(argv[-1]), Path(argv[argv.index('-o') + 1])
+        out.write_bytes((self.again if self.again is not None else src.read_bytes()[len(ZST):]) if '-d' in argv
+                        else ZST + src.read_bytes())
+        self.written[out.name] = out.read_bytes()
+        return self.zstd, ''
 
 
 class Build(unittest.TestCase):
@@ -361,13 +421,202 @@ class Build(unittest.TestCase):
                 self.assertEqual((io_.fetched, io_.ran), ([], []))
 
 
+def arm_build(io_: FakeIo, serial: str = ARM_SERIAL, **kw) -> dict:
+    with tempfile.TemporaryDirectory() as tmp:
+        return fd.build_arm64(io_, serial, Path(tmp), kw.get('repo', REPO), kw.get('sha', SHA), kw.get('token', TOKEN),
+                              kw.get('fpr', FPR), kw.get('now', NOW))
+
+
+class Arm64(unittest.TestCase):
+    def setUp(self):
+        self.patch(**ARM_PINS)
+
+    def patch(self, **consts) -> None:
+        for name, value in consts.items():
+            self.addCleanup(setattr, fd, name, getattr(fd, name))
+            setattr(fd, name, value)
+
+    def refused(self, why: str, io_: FakeIo | None = None, **kw) -> FakeIo:
+        io_ = io_ or ArmIo()
+        with self.assertRaisesRegex(fd.Refused, f'^{why}$'):
+            arm_build(io_, **kw)
+        return io_
+
+    def test_the_happy_path_returns_the_three_lock_entries_and_publishes_one_asset(self):
+        io_, zst = ArmIo(), ZST + RAW
+        self.assertEqual(arm_build(io_), {
+            'disk_arm64_input': {'url': ARM_BASE + fd.IMAGE_ARM64, 'sha256': IMAGE_PIN},
+            'disk_arm64': {'url': f'https://github.com/{REPO}/releases/download/{ARM_TAG}/{ARM_ASSET}',
+                           'sha256': sha(zst), 'size': len(zst), 'raw_sha256': sha(RAW), 'raw_size': len(RAW)},
+            'vfkit': {'version': 'v0.6.4', 'url': fd.VFKIT_URL, 'sha256': VFKIT_PIN, 'size': len(VFKIT)}})
+        self.assertEqual(io_.tools(), ['gh api', 'gh release', 'gpgv', 'qemu-img', 'zstd', 'zstd', 'gh release', 'gh api'])
+        self.assertEqual(io_.fetched, [ARM_BASE + 'SHA256SUMS', ARM_BASE + 'SHA256SUMS.gpg', fd.VFKIT_URL,
+                                       ARM_BASE + fd.IMAGE_ARM64])  # the cheap evidence first, the big image last
+        self.assertEqual(io_.limits['vfkit'], len(VFKIT))  # upstream may not serve more than the pinned size
+        self.assertEqual(io_.uploaded, [ARM_ASSET])  # never the raw disk: it is far over GitHub's asset limit
+        qemu, comp, expand, gh = io_.ran[3][0], io_.ran[4][0], io_.ran[5][0], io_.ran[6][0]
+        work = Path(qemu[-2]).parent  # the whole argv, so an option added anywhere is seen: no -o, a plain sparse raw file
+        self.assertEqual(qemu, [fd.QEMU_IMG, 'convert', '-f', 'qcow2', '-O', 'raw', str(work / fd.IMAGE_ARM64),
+                                str(work / f'noble-arm64-{ARM_SERIAL}.raw')])
+        self.assertEqual(comp[:5], [fd.ZSTD, '-19', '-T0', '-q', '-o'])
+        self.assertEqual(expand[:3], [fd.ZSTD, '-d', '-q'])
+        self.assertEqual((gh[3], gh[gh.index('--target') + 1]), (ARM_TAG, SHA))
+        for argv, env in io_.ran:
+            self.assertTrue(argv[0].startswith('/usr/bin/'))
+            self.assertEqual(env['PATH'], '/usr/bin')
+        self.assertEqual([TOKEN in env.values() for _, env in io_.ran], [True, True, False, False, False, False, True, True])
+
+    def test_the_serial_the_key_and_the_environment_are_refused_before_any_network_call(self):
+        cases = (('serial', {'serial': 'current'}), ('serial-not-pinned', {'serial': '20260930'}),
+                 ('serial-not-pinned', {'serial': ARM_SERIAL + '.1'}), ('unpinned-key', {'fpr': ''}),
+                 ('release-env', {'token': ''}))
+        for why, kw in cases:
+            with self.subTest(kw=kw):
+                io_ = self.refused(why, **kw)
+                self.assertEqual((io_.fetched, io_.ran), ([], []))
+
+    def test_a_bad_wrong_or_stale_signature_stops_before_vfkit_and_the_image(self):
+        old = validsig(FPR, stamp=SIGNED - 5 * 86400)  # four days before the serial's date: a replayed list
+        for why, gpgv in (('bad-signature', (1, '')), ('bad-signature', (0, validsig(FPR, good=False))),
+                          ('wrong-key', (0, validsig(OTHER))), ('stale-signature', (0, old))):
+            with self.subTest(why=why):
+                io_ = self.refused(why, ArmIo(gpgv=gpgv))
+                self.assertEqual(io_.fetched, [ARM_BASE + 'SHA256SUMS', ARM_BASE + 'SHA256SUMS.gpg'])
+
+    def test_a_signed_sha_that_is_not_the_pinned_one_stops_before_vfkit_and_the_image(self):
+        other = fd.QCOW2_MAGIC + b'a rebuilt image'  # validly signed, but not the pinned image
+        io_ = self.refused('image-pin-mismatch', ArmIo(image=other))
+        self.assertEqual(io_.fetched, [ARM_BASE + 'SHA256SUMS', ARM_BASE + 'SHA256SUMS.gpg'])
+        self.refused('no-signed-sum', ArmIo(sums=sums_for(ARM_IMAGE)))  # the list names only the amd64 image
+
+    def test_an_image_that_is_not_the_signed_sha_or_not_a_qcow2_is_refused_before_the_convert(self):
+        io_ = ArmIo(sums=sums_for(ARM_IMAGE, fd.IMAGE_ARM64))
+        io_.bodies[fd.IMAGE_ARM64] = fd.QCOW2_MAGIC + b'swapped on the way'
+        self.refused('sum-mismatch', io_)
+        self.assertEqual(io_.tools()[-1], 'gpgv')
+        bad = b'MZ not a qcow2'  # its sha is signed and pinned: the magic is the second line of defense
+        self.patch(ARM64_IMAGE_SHA256=sha(bad))
+        self.refused('not-qcow2', ArmIo(image=bad))
+
+    def test_vfkit_bytes_that_are_not_the_pinned_sha_stop_before_the_image(self):
+        replaced = b'vfkit evil'  # the pinned size, other bytes: only the sha can refuse it
+        self.assertEqual(len(replaced), len(VFKIT))
+        io_ = self.refused('vfkit-mismatch', ArmIo(vfkit=replaced))
+        self.assertEqual(io_.fetched[-1], fd.VFKIT_URL)
+        self.assertEqual(io_.tools(), ['gh api', 'gh release', 'gpgv'])
+
+    def test_vfkit_of_another_size_than_the_pinned_one_is_refused_even_with_the_pinned_sha(self):
+        for size in (len(VFKIT) + 1, len(VFKIT) - 1):  # the lock entry states VFKIT_SIZE: it must be the fetched file's own
+            with self.subTest(size=size):
+                self.patch(VFKIT_SIZE=size)
+                io_ = self.refused('vfkit-mismatch')  # the sha is the pinned one; a short (or long) body is not
+                self.assertEqual(io_.tools(), ['gh api', 'gh release', 'gpgv'])
+
+    def test_the_raw_disk_must_be_gpt_with_an_efi_system_partition(self):
+        no_esp = gpt_disk((LINUX_FS,) * 4)
+        for raw in (no_esp, b'', RAW[:1024], b'\x00' * len(RAW), RAW[:510] + b'\x00\x00' + RAW[512:],
+                    RAW[:512] + b'EFI PARX' + RAW[520:]):
+            with self.subTest(raw=raw[:8]):
+                io_ = self.refused('not-efi-disk', ArmIo(raw=raw))
+                self.assertEqual(io_.tools()[-1], 'qemu-img')  # nothing compressed, nothing published
+
+    def test_a_header_that_points_past_any_file_offset_is_not_an_efi_disk_and_does_not_raise(self):
+        for lba in (1 << 55, (1 << 55) - 1, (1 << 64) - 1):
+            with self.subTest(lba=lba):
+                disk = bytearray(RAW)
+                struct.pack_into('<Q', disk, fd.SECTOR + 72, lba)
+                io_ = self.refused('not-efi-disk', ArmIo(raw=bytes(disk)))
+                self.assertEqual((io_.tools()[-1], io_.uploaded), ('qemu-img', []))
+
+    def has_esp(self, raw: bytes) -> bool:
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, 'raw').write_bytes(raw)
+            return fd.has_esp(Path(tmp, 'raw'))
+
+    def test_has_esp_reads_the_whole_entry_table(self):
+        self.assertTrue(self.has_esp(RAW))
+        for size, count in ((128, 4), (256, 4), (128, 128), (128, 512)):  # the last of up to 64 KiB of entries counts too
+            with self.subTest(size=size, count=count):
+                self.assertTrue(self.has_esp(gpt_disk((LINUX_FS,) * (count - 1) + (fd.ESP_TYPE,), size)))
+        self.assertFalse(self.has_esp(gpt_disk((LINUX_FS,) * 512 + (fd.ESP_TYPE,))))  # 64 KiB + 128: over the cap
+        self.assertFalse(self.has_esp(gpt_disk((LINUX_FS, EMPTY, fd.ESP_TYPE[:-1] + b'\x00', LINUX_FS))))  # no ESP type, one byte off
+        self.assertFalse(self.has_esp(b''))  # a file that is not even a header
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(fd.has_esp(Path(tmp, 'absent')))  # unreadable: False, not an exception
+
+    def test_has_esp_refuses_a_table_inside_the_headers_or_with_entries_under_128_bytes(self):
+        for lba in (0, 1):  # an ESP GUID planted where that LBA's table would put its second entry: only the LBA stops it
+            with self.subTest(lba=lba):
+                disk = bytearray(RAW)
+                struct.pack_into('<Q', disk, fd.SECTOR + 72, lba)
+                disk[lba * fd.SECTOR + 128:lba * fd.SECTOR + 144] = fd.ESP_TYPE
+                self.assertFalse(self.has_esp(bytes(disk)))
+        for size in (127, 64, 0):  # the same table, with the ESP as its first entry, but entries too small for a GPT's
+            with self.subTest(size=size):
+                self.assertFalse(self.has_esp(gpt_disk((fd.ESP_TYPE, EMPTY, EMPTY, EMPTY), size)))
+        self.assertTrue(self.has_esp(gpt_disk((fd.ESP_TYPE, EMPTY, EMPTY, EMPTY))))  # the control: 128 bytes passes
+        for offset, fmt, value in ((72, '<Q', 99999), (84, '<I', 0), (80, '<I', 1 << 20)):  # past the end, size 0, 64 KiB+
+            with self.subTest(offset=offset):
+                disk = bytearray(RAW)
+                struct.pack_into(fmt, disk, fd.SECTOR + offset, value)
+                self.assertFalse(self.has_esp(bytes(disk)))
+
+    def test_a_failed_convert_or_compress_publishes_nothing(self):
+        self.assertEqual(self.refused('convert-failed', ArmIo(qemu=1)).uploaded, [])
+        self.assertEqual(self.refused('compress-failed', ArmIo(zstd=1)).uploaded, [])
+
+    def test_an_asset_that_does_not_expand_to_the_raw_sha_is_refused_before_the_upload(self):
+        io_ = self.refused('roundtrip-mismatch', ArmIo(again=RAW + b'\x00'))
+        self.assertEqual((io_.tools()[-1], io_.uploaded), ('zstd', []))
+
+    def test_a_raw_disk_over_the_cap_and_an_asset_of_2_gib_or_more_are_refused(self):
+        self.assertEqual((fd.MAX_RAW, fd.MAX_ASSET), (8 * 1024 ** 3, 2 * 1024 ** 3))
+        for name, limit, why, last in (('MAX_RAW', len(RAW) - 1, 'too-big', 'qemu-img'),
+                                       ('MAX_ASSET', len(ZST + RAW), 'too-big', 'zstd')):
+            with self.subTest(name=name):
+                self.addCleanup(setattr, fd, name, getattr(fd, name))
+                setattr(fd, name, limit)  # 2 GiB cannot be written in a unit test: shrink the limit to the fake's size
+                io_ = self.refused(why)
+                self.assertEqual((io_.tools()[-1], io_.uploaded), (last, []))
+                setattr(fd, name, limit + 1)
+                arm_build(ArmIo())  # one byte more room and the same build passes
+
+    def test_the_tag_is_its_own_so_the_amd64_release_of_the_same_serial_does_not_block_it(self):
+        amd = f'[{{"ref": "refs/tags/disk-noble-{ARM_SERIAL}", "tagName": "disk-noble-{ARM_SERIAL}", "isDraft": false}}]'
+        self.assertEqual(arm_build(ArmIo(check_out=amd))['disk_arm64']['url'].split('/')[-2], ARM_TAG)
+        self.assertEqual(self.refused('tag-exists', ArmIo(tag_exists=True)).fetched, [])  # tag_is_free is shared with amd64
+
+    def test_the_published_asset_is_read_back_and_must_match_what_was_hashed(self):
+        good = {'name': ARM_ASSET, 'digest': 'sha256:' + sha(ZST + RAW)}
+        for readback in ((1, ''), (0, json.dumps({'assets': [{**good, 'digest': 'sha256:' + sha(b'other')}]})),
+                         (0, json.dumps({'assets': [good, {**good, 'name': 'extra'}]}))):
+            with self.subTest(readback=readback):
+                self.refused('publish-mismatch', ArmIo(readback=readback))
+        arm_build(ArmIo(readback=(0, json.dumps({'assets': [good]}))))
+
+
+class Arm64Pins(unittest.TestCase):
+    """What the script ships, with nothing patched."""
+
+    def test_the_shipped_constants_are_the_reviewed_ones(self):
+        self.assertEqual(fd.ARM64_SERIAL, '20260926')
+        self.assertEqual((fd.VFKIT_VERSION, fd.VFKIT_SIZE), ('v0.6.4', 66431936))
+        self.assertEqual(fd.VFKIT_URL, 'https://github.com/crc-org/vfkit/releases/download/v0.6.4/vfkit')
+        # each pin is a full lowercase sha256 that starts and ends as the value checked against Ubuntu's SHA256SUMS for
+        # that serial and against the digest of the vfkit release asset
+        for pin, head, tail in ((fd.ARM64_IMAGE_SHA256, '1d6bffe6', 'fc55'), (fd.VFKIT_SHA256, '0ed83fc8', '652d')):
+            self.assertRegex(pin, r'\A[0-9a-f]{64}\Z')
+            self.assertEqual((pin[:8], pin[-4:]), (head, tail))
+        self.assertEqual(uuid.UUID(bytes_le=fd.ESP_TYPE), uuid.UUID('C12A7328-F81F-11D2-BA4B-00A0C93EC93B'))
+
+
 class Main(unittest.TestCase):
     ENV = {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN}
 
-    def pin(self, fpr: str) -> None:
-        pinned = fd.CLOUDIMAGE_KEY_FPR
-        fd.CLOUDIMAGE_KEY_FPR = fpr
-        self.addCleanup(setattr, fd, 'CLOUDIMAGE_KEY_FPR', pinned)
+    def pin(self, fpr: str, **consts: str) -> None:
+        for name, value in {'CLOUDIMAGE_KEY_FPR': fpr, **consts}.items():
+            self.addCleanup(setattr, fd, name, getattr(fd, name))
+            setattr(fd, name, value)
 
     def go(self, argv: list[str], io_: FakeIo, **env: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -408,6 +657,40 @@ class Main(unittest.TestCase):
         self.assertTrue(entries['disk']['url'].startswith(f'https://github.com/{REPO}/releases/download/disk-noble-'))
         self.assertNotIn(TOKEN, out.getvalue())
 
+    def test_arm64_is_a_word_before_the_serial_and_amd64_may_be_named(self):
+        for argv in (['arm64', ARM_SERIAL, 'x'], ['sparc', ARM_SERIAL], ['arm64', 'amd64', ARM_SERIAL]):
+            self.assertEqual(self.go(argv, FakeIo())[0], fd.USAGE)
+        self.pin(FPR)
+        code, out, _ = self.go(['amd64', SERIAL], FakeIo(), **self.ENV)
+        self.assertEqual((code, sorted(json.loads(out.partition('\n')[2]))), (0, ['disk', 'disk_input', 'disk_qcow2']))
+
+    def test_arm64_refuses_another_serial_before_any_fetch(self):
+        self.pin(FPR, **ARM_PINS)
+        io_ = ArmIo()
+        self.assertEqual(self.go(['arm64', '20260930'], io_, **self.ENV),
+                         (fd.REFUSED, '', 'fleet-disk: refused serial-not-pinned\n'))
+        self.assertEqual((io_.fetched, io_.ran), ([], []))
+
+    def test_arm64_runs_against_the_shipped_pins_and_stops_at_an_image_that_is_not_the_pinned_one(self):
+        self.pin(FPR)  # nothing else patched: the fake image is validly signed but is not the shipped pin
+        io_ = ArmIo()
+        self.assertEqual(self.go(['arm64', ARM_SERIAL], io_, **self.ENV),
+                         (fd.REFUSED, '', 'fleet-disk: refused image-pin-mismatch\n'))
+        self.assertEqual(io_.fetched, [ARM_BASE + 'SHA256SUMS', ARM_BASE + 'SHA256SUMS.gpg'])
+
+    def test_arm64_prints_its_three_entries_to_paste_and_leaves_no_files(self):
+        self.pin(FPR, **ARM_PINS)
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as out:
+            code = fd.main(['fleet-disk.py', 'arm64', ARM_SERIAL], {'RUNNER_TEMP': tmp, **self.ENV}, ArmIo())
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+        head, _, body = out.getvalue().partition('\n')
+        entries = json.loads(body)
+        self.assertEqual((code, sorted(entries)), (0, ['disk_arm64', 'disk_arm64_input', 'vfkit']))
+        self.assertIn('carrier.lock.json', head)
+        self.assertEqual(sorted(entries['disk_arm64']), ['raw_sha256', 'raw_size', 'sha256', 'size', 'url'])
+        self.assertEqual(sorted(entries['vfkit']), ['sha256', 'size', 'url', 'version'])
+        self.assertNotIn(TOKEN, out.getvalue())
+
     def test_the_disk_url_names_this_repo_when_run_there(self):
         self.pin(FPR)
         env = {**self.ENV, 'GITHUB_REPOSITORY': 'mirrorstack-ai/fleet-disk'}
@@ -435,6 +718,11 @@ class Entry(unittest.TestCase):
         self.assertEqual(self.run_script().returncode, fd.USAGE)
         done = self.run_script('current')
         self.assertEqual((done.returncode, done.stdout, done.stderr), (fd.REFUSED, '', 'fleet-disk: refused serial\n'))
+
+    def test_arm64_refuses_another_serial_before_any_network_call(self):
+        done = self.run_script('arm64', '20260930')
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (fd.REFUSED, '', 'fleet-disk: refused serial-not-pinned\n'))
+        self.assertEqual(self.run_script('arm64', ARM_SERIAL, 'x').returncode, fd.USAGE)
 
     def test_a_missing_release_environment_is_refused(self):
         done = self.run_script(SERIAL, GH_TOKEN='')
@@ -503,9 +791,11 @@ class Workflows(unittest.TestCase):
             self.assertNotIn('self-hosted', text)
             self.assertNotRegex(text, r'(?i)secrets')
 
-    def test_the_disk_workflow_is_a_main_only_dispatch_with_one_input(self):
+    def test_the_disk_workflow_is_a_main_only_dispatch_with_a_serial_and_an_arch(self):
         self.assertRegex(self.DISK, r'(?m)^on:\n  workflow_dispatch:\n    inputs:\n      serial:\n')
-        self.assertEqual(re.findall(r'(?m)^      (\w+):\n        (?:description|required)', self.DISK), ['serial'])
+        self.assertEqual(re.findall(r'(?m)^      (\w+):\n        (?:description|required)', self.DISK),
+                         ['serial', 'arch'])
+        self.assertIn('        type: choice\n        options: [amd64, arm64]\n        default: amd64\n', self.DISK)
         self.assertNotIn('pull_request', self.DISK)
         self.assertIn("if: github.ref == 'refs/heads/main'", self.DISK)
         self.assertIn('timeout-minutes: 60', self.DISK)
@@ -527,14 +817,15 @@ class Workflows(unittest.TestCase):
 
     def test_the_input_reaches_the_script_only_through_env(self):
         runs = re.findall(r'(?m)^\s+(?:- )?run: (.*)$', self.DISK)
-        self.assertEqual(runs[-1], 'python3 bin/fleet-disk.py "$SERIAL"')
+        self.assertEqual(runs[-1], 'python3 bin/fleet-disk.py "$ARCH" "$SERIAL"')
         self.assertIn('SERIAL: ${{ inputs.serial }}', self.DISK)
+        self.assertIn('ARCH: ${{ inputs.arch }}', self.DISK)
         self.assertIn('GH_TOKEN: ${{ github.token }}', self.DISK)
         for run in runs:
             self.assertNotIn('${{', run)
 
-    def test_the_disk_workflow_installs_only_qemu_utils_with_apt(self):
-        self.assertEqual(re.findall(r'apt-get install (.*)', self.DISK), ['-y --no-install-recommends qemu-utils'])
+    def test_the_disk_workflow_installs_only_qemu_utils_and_zstd_with_apt(self):
+        self.assertEqual(re.findall(r'apt-get install (.*)', self.DISK), ['-y --no-install-recommends qemu-utils zstd'])
 
     def test_the_actions_are_the_sha_pinned_ones_and_match_across_workflows(self):
         for text in (self.DISK, self.TEST):

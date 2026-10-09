@@ -1,6 +1,8 @@
-# Builds the fleet's L1 disk: one dispatch converts Ubuntu's signed noble cloud image to a VHDX and a qcow2, publishes
-# both as release disk-noble-<serial> in this repo and prints the three lock entries for the owner to pin and sign. The input
-# reaches the script only through env:; the script refuses anything but Ubuntu's signature by the pinned key.
+# Builds the fleet's L1 disk: one dispatch converts Ubuntu's signed noble cloud image to a VHDX and a qcow2 (arch amd64),
+# publishes both as release disk-noble-<serial> in this repo and prints the three lock entries for the owner to pin and sign;
+# arch arm64 (the macOS lane) makes one zstd-compressed raw disk for vfkit at the pinned serial, release disk-noble-arm64-<serial>.
+# qemu-img only re-encodes the image and executes none of it, so both arches build on the same x86 runner. The inputs reach the
+# script only through env:; the script refuses anything but Ubuntu's signature by the pinned key.
 name: disk
 on:
   workflow_dispatch:
@@ -8,6 +10,11 @@ on:
       serial:
         description: the noble cloud image serial, 20260930 or 20260930.1
         required: true
+      arch:
+        description: amd64 (a VHDX and a qcow2) or arm64 (a zstd raw disk for vfkit; its serial is pinned in the script)
+        type: choice
+        options: [amd64, arm64]
+        default: amd64
 permissions:
   contents: read
 concurrency:
@@ -26,8 +33,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-utils
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-utils zstd
       - env:
+          ARCH: ${{ inputs.arch }}
           SERIAL: ${{ inputs.serial }}
           GH_TOKEN: ${{ github.token }}
-        run: python3 bin/fleet-disk.py "$SERIAL"
+        run: python3 bin/fleet-disk.py "$ARCH" "$SERIAL"
