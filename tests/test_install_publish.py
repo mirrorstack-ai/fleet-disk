@@ -1388,7 +1388,7 @@ class Publish(unittest.TestCase):
 
 
 class VendoredVerifier(unittest.TestCase):
-    """Section 1 (a copy of the fleet's install manifest rules, schema version 1) against a frozen golden: a change to
+    """Section 1 (a copy of the fleet's install manifest rules, with the optional proof block) against a frozen golden: a change to
     either side must come with a new copy and a new golden."""
 
     def test_the_constants_equal_the_golden(self):
@@ -1406,6 +1406,8 @@ class VendoredVerifier(unittest.TestCase):
                          (('sha256', 'blob'), ('serial', 'kit_json_sha256'), ('head', 'tree', 'url', 'sha256', 'size'),
                           ('ps1', 'sh')))
         self.assertEqual(v.HANDOFF_KEYS, ('fp', 'first_serial', 'ps1_sha256', 'sh_sha256'))
+        self.assertEqual((v.PROOF_KEYS, v.PORTS), (('canaries', 'net_port'), (1024, 65535)))
+        self.assertFalse(hasattr(v, 'MAX_CANARIES'))  # the canary count is not capped (the proof takes any number)
         self.assertEqual((v.HEX40.pattern, v.HEX64.pattern, v.UTC_TIME.pattern, v._KEY.pattern),
                          ('[0-9a-f]{40}', '[0-9a-f]{64}', '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z',
                           '[A-Za-z0-9+/]{68}'))
@@ -1604,6 +1606,19 @@ class VendoredVerifier(unittest.TestCase):
         self.assertEqual(fp.parse_install(json.dumps({**good, 'handoff': hand}).encode())['handoff'], hand)  # optional
         top = {**hand, 'first_serial': 1 << 31}  # MAX_COUNT itself is accepted
         self.assertEqual(fp.parse_install(json.dumps({**good, 'handoff': top}).encode())['handoff'], top)
+        proof = {'canaries': ['a' * 64, 'b' * 64], 'net_port': 4443}  # the optional proof block: one or more distinct canaries, a port
+        for ok in (proof, {**proof, 'canaries': [f'{i:x}' * 64 for i in range(12)]},  # twelve: no cap
+                   {**proof, 'net_port': 1024}, {**proof, 'net_port': 65535}):
+            self.assertEqual(fp.parse_install(json.dumps({**good, 'proof': ok}).encode())['proof'], ok)
+        for what, bad in {'no canaries': {**proof, 'canaries': []},
+                          'a repeat': {**proof, 'canaries': ['a' * 64] * 2}, 'upper case': {**proof, 'canaries': ['A' * 64]},
+                          'not a list': {**proof, 'canaries': 'a' * 64}, 'port 1023': {**proof, 'net_port': 1023},
+                          'port 65536': {**proof, 'net_port': 65536}, 'port as text': {**proof, 'net_port': '4443'},
+                          'port a bool': {**proof, 'net_port': True}, 'another key': {**proof, 'x': 1},
+                          'no port': {'canaries': proof['canaries']}, 'null': None, 'a list': [proof]}.items():
+            with self.subTest(proof=what), self.assertRaises(fp.Refused) as why:
+                fp.parse_install(json.dumps({**good, 'proof': bad}).encode())
+            self.assertEqual(why.exception.code, 'form')
         for what, bad in {'first_serial not above serial': {**hand, 'first_serial': SERIAL}, 'another key': {**hand, 'x': 1},
                           'a short fingerprint': {**hand, 'fp': 'SHA256:' + 'A' * 42}, 'upper case hash': {**hand, 'sh_sha256': 'D' * 64},
                           'no hash': {k: v for k, v in hand.items() if k != 'ps1_sha256'},

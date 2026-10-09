@@ -2,7 +2,8 @@
 bytes only when `ssh-keygen -Y verify -n mirrorstack-fleet-install -I owner` accepts them (the signature before the
 bytes are parsed, as verify-archive.signed_pin does for the pin), then reads them strictly: exactly the keys of
 SCHEMA, kind `install`, not expired, no older than the caller's --min-serial, and each bootstrap blob in the source
-head's tree; an optional `handoff` names the successor key's first release. Pure: the clock, the tree and the
+head's tree; an optional `handoff` names the successor key's first release and an optional `proof` the canaries and
+network port an update proves the computer again with. Pure: the clock, the tree and the
 ssh-keygen runner come from the caller. A refusal is a code, never a value."""
 from __future__ import annotations
 
@@ -35,6 +36,8 @@ HANDOFF_KEYS = ('fp', 'first_serial', 'ps1_sha256', 'sh_sha256')  # not `serial`
 FP = re.compile('SHA256:[A-Za-z0-9+/]{43}', re.ASCII)  # what ssh-keygen -l prints for an ed25519 key
 BUNDLE_KEYS = ('head', 'tree', 'url', 'sha256', 'size')
 OSES = ('ps1', 'sh')  # the two bootstraps
+PROOF_KEYS = ('canaries', 'net_port')  # not `serial`: bootstrap.sh's sed pick would read it
+PORTS = (1024, 65535)  # the unprivileged ports a proof's network probe may use
 
 
 class Refused(Exception):
@@ -92,7 +95,8 @@ def _count(v: object, lo: int, hi: int) -> int:
 
 def parse_install(text: bytes) -> dict[str, object]:
     """The exact shape of SCHEMA, plus the optional handoff (a fingerprint, a first_serial above
-    serial, two hashes), from strict JSON: hashes lower-case hex, an https URL with a host name, a valid_until like
+    serial, two hashes) and the optional proof (one or more distinct canary sha256s and a net_port in PORTS), from
+    strict JSON: hashes lower-case hex, an https URL with a host name, a valid_until like
     2026-12-01T00:00:00Z; kind other than `install` is `kind`, any other misfit `form`."""
     try:
         doc = canon.loads_strict(text)
@@ -100,7 +104,7 @@ def parse_install(text: bytes) -> dict[str, object]:
         raise Refused('form') from None
     if not isinstance(doc, dict) or doc.get('kind') != KIND:
         raise Refused('kind')
-    _obj(doc, SCHEMA + ('handoff',) if 'handoff' in doc else SCHEMA)
+    _obj(doc, SCHEMA + tuple(k for k in ('handoff', 'proof') if k in doc))
     _count(doc['serial'], 0, MAX_COUNT)
     try:
         clock.parse_utc(_match(doc['valid_until'], UTC_TIME))
@@ -128,6 +132,14 @@ def parse_install(text: bytes) -> dict[str, object]:
         _count(hand['first_serial'], doc['serial'] + 1, MAX_COUNT)  # the successor series starts after this release
         _match(hand['ps1_sha256'], HEX64)
         _match(hand['sh_sha256'], HEX64)
+    if 'proof' in doc:
+        proof = _obj(doc['proof'], PROOF_KEYS)
+        canaries = proof['canaries']
+        if not isinstance(canaries, list) or not canaries:
+            raise Refused('form')
+        if len({_match(canary, HEX64) for canary in canaries}) != len(canaries):  # a set: no canary twice
+            raise Refused('form')
+        _count(proof['net_port'], *PORTS)
     return doc
 
 
