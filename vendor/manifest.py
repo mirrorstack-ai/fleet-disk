@@ -37,7 +37,6 @@ FP = re.compile('SHA256:[A-Za-z0-9+/]{43}', re.ASCII)  # what ssh-keygen -l prin
 BUNDLE_KEYS = ('head', 'tree', 'url', 'sha256', 'size')
 OSES = ('ps1', 'sh')  # the two bootstraps
 PROOF_KEYS = ('canaries', 'net_port')  # not `serial`: bootstrap.sh's sed pick would read it
-MAX_CANARIES = 8  # a proof run has a handful of canaries; more is refused
 PORTS = (1024, 65535)  # the unprivileged ports a proof's network probe may use
 
 
@@ -96,7 +95,7 @@ def _count(v: object, lo: int, hi: int) -> int:
 
 def parse_install(text: bytes) -> dict[str, object]:
     """The exact shape of SCHEMA, plus the optional handoff (a fingerprint, a first_serial above
-    serial, two hashes) and the optional proof (1 to MAX_CANARIES distinct canary sha256s and a net_port in PORTS), from
+    serial, two hashes) and the optional proof (one or more distinct canary sha256s and a net_port in PORTS), from
     strict JSON: hashes lower-case hex, an https URL with a host name, a valid_until like
     2026-12-01T00:00:00Z; kind other than `install` is `kind`, any other misfit `form`."""
     try:
@@ -136,7 +135,7 @@ def parse_install(text: bytes) -> dict[str, object]:
     if 'proof' in doc:
         proof = _obj(doc['proof'], PROOF_KEYS)
         canaries = proof['canaries']
-        if not isinstance(canaries, list) or not 1 <= len(canaries) <= MAX_CANARIES:
+        if not isinstance(canaries, list) or not canaries:
             raise Refused('form')
         if len({_match(canary, HEX64) for canary in canaries}) != len(canaries):  # a set: no canary twice
             raise Refused('form')
