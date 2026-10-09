@@ -15,16 +15,18 @@ check that cannot be answered (fail closed); after the upload the published asse
 printed ones. A signature stamped before the serial's date or in the future is refused. A VHDX or qcow2 of 2 GiB or more is
 refused (GitHub's release asset limit).
 
-## How the arm64 disk (macOS lane, M08) is built
+## How the arm64 disk (macOS lane) is built
 
 The same workflow with `arch` set to `arm64` runs `bin/fleet-disk.py arm64 <serial>` on the same runner (`qemu-img` only re-encodes the image
 and executes none of it), through the amd64 build's shared steps (tag check, signed `SHA256SUMS`, image check, upload read-back). It adds:
 the serial must be `ARM64_SERIAL` (20260926); the signed sha of `noble-server-cloudimg-arm64.img` must equal `ARM64_IMAGE_SHA256`; vfkit
-v0.6.4 is fetched from upstream and must hash to `VFKIT_SHA256` (hashed only, never run or published); the raw disk must be GPT with an EFI
-System Partition; `zstd -19` of it must expand to the same raw sha. The one asset of `disk-noble-arm64-<serial>` is `noble-arm64-<serial>.raw.zst`;
-the printed entries are `disk_arm64_input`, `disk_arm64` (url, sha256, size, `raw_sha256`, `raw_size`) and `vfkit` (version, url, sha256, size).
-Both sha constants ship empty and the build refuses `unpinned-image` / `unpinned-vfkit` until the owner fills them (each must start and end
-as the design quotes it).
+v0.6.4 is fetched from upstream and must hash to `VFKIT_SHA256` and be exactly `VFKIT_SIZE` bytes (hashed only, never run or published); the raw
+disk must be GPT with an EFI System Partition; `zstd -19` of it must expand to the same raw sha. The one asset of `disk-noble-arm64-<serial>`
+is `noble-arm64-<serial>.raw.zst`; the printed entries are `disk_arm64_input`, `disk_arm64` (url, sha256, size, `raw_sha256`, `raw_size`) and
+`vfkit` (version, url, sha256, size). Both sha constants are filled in the script; a different serial or vfkit release is a PR that changes them.
+A wrong pin fails closed (`image-pin-mismatch` / `vfkit-mismatch`): the evidence is Ubuntu's signature on `SHA256SUMS` (checked with the pinned
+key at build time) and the bytes upstream serves, and a pin that does not match them stops the build. The printed `vfkit` lock entry must get `cdhash` and `entitlements` added from a Mac before the owner signs it, because a Linux runner
+has no `codesign`.
 
 ## How an install set is released and verified
 

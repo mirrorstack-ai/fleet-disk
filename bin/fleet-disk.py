@@ -6,7 +6,7 @@ and its qcow2 magic, converts it with `qemu-img convert -O vhdx` (Hyper-V) and `
 entries to paste into the fleet's carrier.lock.json: `disk_input` (the signed upstream image), `disk` (the VHDX) and
 `disk_qcow2` (the qcow2, with its size; qemu-img's output is not promised byte-reproducible, so the owner's signature
 over the lock is what vouches for each). It never edits the lock and refuses to overwrite a tag.
-`fleet-disk.py arm64 <serial>` (M08, the macOS lane) takes the same chain for Ubuntu's noble arm64 image at the ONE
+`fleet-disk.py arm64 <serial>` (the macOS lane) takes the same chain for Ubuntu's noble arm64 image at the ONE
 pinned serial: the signed sha must equal the pinned one, vfkit's upstream bytes are re-checked against their pin, the
 image becomes a raw GPT disk with an EFI System Partition (what vfkit's EFI boot needs) and a zstd of it is the one
 release asset of disk-noble-arm64-<serial>; the lock entries are `disk_arm64_input`, `disk_arm64` and `vfkit`.
@@ -33,13 +33,12 @@ GPGV, QEMU_IMG, GH, ZSTD = '/usr/bin/gpgv', '/usr/bin/qemu-img', '/usr/bin/gh', 
 BASE = 'https://cloud-images.ubuntu.com/noble/'
 IMAGE = 'noble-server-cloudimg-amd64.img'
 IMAGE_ARM64 = 'noble-server-cloudimg-arm64.img'
-ARM64_SERIAL = '20260926'  # the one serial the design reviewed (M08): another serial is a PR that changes this and both pins
-ARM64_IMAGE_SHA256 = ''  # PLACEHOLDER (gap G-M08-1): the reviewed image's full sha256; the build refuses until it is filled
-ARM64_IMAGE_QUOTE = ('1d6bffe6', 'fc55')  # how the design quotes that sha: a filled pin must start and end so
+ARM64_SERIAL = '20260926'  # the one serial the arm64 build accepts: another serial is a PR that changes this and both pins
+ARM64_IMAGE_SHA256 = '1d6bffe64b848468ac97f821d369a4846d983de1800ccf6b5ec8853e85cefc55'  # noble-server-cloudimg-arm64.img
+# in that serial's SHA256SUMS; the build still checks the list's signature, so a wrong pin fails closed
 VFKIT_VERSION, VFKIT_SIZE = 'v0.6.4', 66431936
 VFKIT_URL = f'https://github.com/crc-org/vfkit/releases/download/{VFKIT_VERSION}/vfkit'  # upstream's own, ad-hoc signed
-VFKIT_SHA256 = ''  # PLACEHOLDER (gap G-M08-2): upstream's full sha256 of that asset; the build refuses until it is filled
-VFKIT_QUOTE = ('0ed83fc8', '652d')
+VFKIT_SHA256 = '0ed83fc8ca7aa708598835480dba1362406aa7cd1dab3b27464eb76327d9652d'  # the digest GitHub lists for that asset
 ESP_TYPE = bytes.fromhex('28732ac11ff8d211ba4b00a0c93ec93b')  # C12A7328-F81F-11D2-BA4B-00A0C93EC93B in GPT byte order
 SECTOR = 512
 ARCHES = ('amd64', 'arm64')
@@ -47,7 +46,6 @@ QCOW2_MAGIC = b'QFI\xfb'
 SERIAL = re.compile(r'[0-9]{8}(?:\.[0-9]{1,2})?', re.ASCII)  # Ubuntu's build serials: 20260930 or 20260930.1
 FPR = re.compile(r'[0-9A-F]{40}', re.ASCII)
 REPO = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}', re.ASCII)
-SHA = re.compile(r'[0-9a-f]{64}', re.ASCII)
 MAX_SUMS, MAX_IMAGE = 1 << 20, 2 << 30  # a longer SHA256SUMS or image is refused, not read to the end
 MAX_RAW = 8 << 30  # the raw arm64 disk is sparse (about 3.5 GiB): one that is longer is refused
 VHDX_OPTS = 'subformat=dynamic,block_size=1M'  # see build(): the smallest block Hyper-V's VHDX allows
@@ -271,45 +269,42 @@ def build(io: Io, serial: str, work: Path, repo: str, sha: str, token: str, fpr:
             'disk_qcow2': {'url': url + qcow2.name, 'sha256': digests[qcow2.name], 'size': qcow2.stat().st_size}}
 
 
-def pinned(pin: str, quote: tuple[str, str], slug: str) -> None:
-    """A pin is a full lowercase sha256 that starts and ends as the design quotes it; the '' placeholder is Refused."""
-    if not (SHA.fullmatch(pin) and pin.startswith(quote[0]) and pin.endswith(quote[1])):
-        raise Refused(slug)
-
-
 def has_esp(raw: Path) -> bool:
-    """The raw disk is what vfkit's EFI boot needs: a protective MBR, a GPT header at LBA 1, an EFI System Partition."""
-    with raw.open('rb') as f:
-        head = f.read(2 * SECTOR)
-        if len(head) < 2 * SECTOR or head[510:512] != b'\x55\xaa' or head[SECTOR:SECTOR + 8] != b'EFI PART':
-            return False
-        lba, count, size = struct.unpack_from('<QII', head, SECTOR + 72)  # the entry table's LBA, its count and entry size
-        if not (lba >= 2 and size >= 128 and 0 < count * size <= 1 << 16):
-            return False
-        f.seek(lba * SECTOR)
-        table = f.read(count * size)
+    """The raw disk is what vfkit's EFI boot needs: a protective MBR, a GPT header at LBA 1, an EFI System Partition.
+    A header that points past what a file offset can hold is not such a disk (False), never an exception."""
+    try:
+        with raw.open('rb') as f:
+            head = f.read(2 * SECTOR)
+            if len(head) < 2 * SECTOR or head[510:512] != b'\x55\xaa' or head[SECTOR:SECTOR + 8] != b'EFI PART':
+                return False
+            lba, count, size = struct.unpack_from('<QII', head, SECTOR + 72)  # the entry table's LBA, count, entry size
+            if not (lba >= 2 and size >= 128 and 0 < count * size <= 1 << 16):
+                return False
+            f.seek(lba * SECTOR)
+            table = f.read(count * size)
+    except (OverflowError, ValueError, OSError):
+        return False
     return any(table[i:i + 16] == ESP_TYPE for i in range(0, len(table) - size + 1, size))
 
 
-def build_arm64(io: Io, serial: str, work: Path, repo: str, sha: str, token: str, fpr: str, image_pin: str,
-                vfkit_pin: str, now: float | None = None) -> dict:
-    """The macOS lane's disk (M08): the pinned serial's signed noble arm64 image as a zstd'd raw GPT/EFI disk, the one
-    asset of disk-noble-arm64-<serial>; vfkit's upstream bytes are re-checked on the way. Refusals come before any
-    network call (serial and its pin, key, repo, both sha pins), then an existing tag, then signature, signed sum (it
-    must be the pinned one), vfkit, image, raw layout, asset size and round trip; the upload is read back."""
+def build_arm64(io: Io, serial: str, work: Path, repo: str, sha: str, token: str, fpr: str,
+                now: float | None = None) -> dict:
+    """The macOS lane's disk: the pinned serial's signed noble arm64 image as a zstd'd raw GPT/EFI disk, the one asset
+    of disk-noble-arm64-<serial>; vfkit's upstream bytes are re-checked on the way. Refusals come before any network
+    call (serial and its pin, key, repo), then an existing tag, then signature, signed sum (it must be
+    ARM64_IMAGE_SHA256), vfkit (sha and size), image, raw layout, asset size and round trip; the upload is read back."""
     env = release_env(serial, fpr, repo, sha, token)
     if serial != ARM64_SERIAL:
         raise Refused('serial-not-pinned')
-    pinned(image_pin, ARM64_IMAGE_QUOTE, 'unpinned-image')
-    pinned(vfkit_pin, VFKIT_QUOTE, 'unpinned-vfkit')
     tag = f'disk-noble-arm64-{serial}'
     tag_is_free(io, repo, tag, env)
     base = f'{BASE}{serial}/'
     want = signed_image_sum(io, base, IMAGE_ARM64, work, fpr, serial, now)
-    if want != image_pin:
+    if want != ARM64_IMAGE_SHA256:
         raise Refused('image-pin-mismatch')
-    if io.fetch(VFKIT_URL, work / 'vfkit', VFKIT_SIZE) != vfkit_pin:  # never run here: only the bytes upstream serves
-        raise Refused('vfkit-mismatch')
+    vfkit = work / 'vfkit'  # never run here: only the bytes upstream serves are hashed and measured
+    if io.fetch(VFKIT_URL, vfkit, VFKIT_SIZE) != VFKIT_SHA256 or vfkit.stat().st_size != VFKIT_SIZE:
+        raise Refused('vfkit-mismatch')  # the size the lock entry states is the fetched file's own
     image = fetch_image(io, base, IMAGE_ARM64, work, want)
     raw, zst, again = work / f'noble-arm64-{serial}.raw', work / f'noble-arm64-{serial}.raw.zst', work / 'again.raw'
     if convert(io, image, raw, 'raw') > MAX_RAW:
@@ -329,7 +324,7 @@ def build_arm64(io: Io, serial: str, work: Path, repo: str, sha: str, token: str
             'disk_arm64': {'url': f'https://github.com/{repo}/releases/download/{tag}/{zst.name}',
                            'sha256': digests[zst.name], 'size': zst.stat().st_size,
                            'raw_sha256': raw_sha, 'raw_size': raw_size},
-            'vfkit': {'version': VFKIT_VERSION, 'url': VFKIT_URL, 'sha256': vfkit_pin, 'size': VFKIT_SIZE}}
+            'vfkit': {'version': VFKIT_VERSION, 'url': VFKIT_URL, 'sha256': VFKIT_SHA256, 'size': VFKIT_SIZE}}
 
 
 def main(argv: list[str], environ: dict[str, str], io: Io) -> int:
@@ -343,7 +338,7 @@ def main(argv: list[str], environ: dict[str, str], io: Io) -> int:
         with tempfile.TemporaryDirectory(dir=environ.get('RUNNER_TEMP') or None) as tmp:
             job = (io, args[0], Path(tmp), environ.get('GITHUB_REPOSITORY', ''), environ.get('GITHUB_SHA', ''),
                    environ.get('GH_TOKEN', ''), CLOUDIMAGE_KEY_FPR)
-            entries = build_arm64(*job, ARM64_IMAGE_SHA256, VFKIT_SHA256) if arch == 'arm64' else build(*job)
+            entries = build_arm64(*job) if arch == 'arm64' else build(*job)
     except Refused as why:
         sys.stderr.write(f'fleet-disk: refused {why}\n')
         return REFUSED
