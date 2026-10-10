@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import os
+import urllib.error
 import re
 import shutil
 import socket
@@ -278,6 +279,35 @@ class Judges(unittest.TestCase):
             with self.assertRaises(kc.Refused):
                 kc.scan_console(d)
 
+    def test_console_scan_is_recursive_and_catches_aliases_splits_and_other_suffixes(self):
+        cases = (('lib/a.js', 'console.log(c)\n'), ('worker.ts', 'console.log(1)\n'), ('x.cjs', 'console.log(1)\n'),
+                 ('alias.js', 'const c = console; c.log(1)\n'), ('opt.js', 'console?.log(2)\n'),
+                 ('split.js', 'const a = 1\nconsole\n.log(3)\n'), ('destr.js', 'const {error} = console\n'),
+                 ('glob.js', 'globalThis.console.log(1)\n'), ('deep/er/m.mts', 'console.warn(1)\n'))
+        for name, text in cases:
+            with tempfile.TemporaryDirectory() as d:
+                Path(d, 'worker.js').write_text('export default {}\n')
+                Path(d, name).parent.mkdir(parents=True, exist_ok=True)
+                Path(d, name).write_text(text)
+                self.assertEqual([h.split(':')[0] for h in kc.scan_console(d)], [name], name)
+        with tempfile.TemporaryDirectory() as d:     # node_modules is not Worker source; a nested test file is skipped
+            Path(d, 'worker.js').write_text('export default {}\n')
+            Path(d, 'node_modules/x').mkdir(parents=True)
+            Path(d, 'node_modules/x/i.js').write_text('console.log(1)\n')
+            Path(d, 'lib').mkdir()
+            Path(d, 'lib/t.test.js').write_text('console.log(1)\n')
+            self.assertEqual(kc.scan_console(d), [])
+
+    def test_console_scan_refuses_a_shipped_file_that_imports_a_skipped_one(self):
+        for spec in ("import './helpers.test-util.js'", "import {x} from './helpers.test-util'", "await import('./fake-storage.js')",
+                     "const f = require('./lib/fake-storage')"):
+            with tempfile.TemporaryDirectory() as d:
+                Path(d, 'gate.js').write_text(spec + '\n')
+                Path(d, 'helpers.test-util.js').write_text('console.log(1)\n')
+                Path(d, 'fake-storage.js').write_text('console.log(1)\n')
+                with self.assertRaises(kc.Refused, msg=spec):
+                    kc.scan_console(d)
+
     def test_the_real_kit_folder_has_no_console_call(self):
         self.assertEqual(kc.scan_console(str(ROOT / 'kit')), [])
 
@@ -294,7 +324,20 @@ class Judges(unittest.TestCase):
     def test_good_settings_pass(self):
         self.assertEqual(kc.judge_settings([self.GOOD], self.SUB), [])
         self.assertEqual(kc.judge_settings([self.GOOD, {'logpush': False, 'tail_consumers': None}], self.SUB), [])
-        self.assertEqual(kc.judge_settings([{'observability': {'enabled': False, 'logs': {'enabled': False}}}], self.SUB), [])
+        # each guarded key is read back by some blob; they need not be the same blob
+        self.assertEqual(kc.judge_settings([{'observability': {'enabled': False, 'logs': {'enabled': False}}},
+                                            {'logpush': False, 'tail_consumers': []}], self.SUB), [])
+        self.assertEqual(kc.judge_settings([{'observability': {'enabled': False}, 'tail_consumers': None},
+                                            {'logpush': False}], self.SUB), [])
+
+    def test_a_guarded_key_nobody_reports_is_refused_not_passed(self):
+        obs = {'observability': {'enabled': False}}
+        self.assertEqual(kc.judge_settings([obs], self.SUB), ['logpush: not reported', 'tail_consumers: not reported'])
+        self.assertEqual(kc.judge_settings([dict(obs, logpush=False)], self.SUB), ['tail_consumers: not reported'])
+        self.assertEqual(kc.judge_settings([dict(obs, tail_consumers=[])], self.SUB), ['logpush: not reported'])
+        # present but not a clean value is a named failure, not a pass
+        self.assertEqual(kc.judge_settings([dict(obs, tail_consumers=None, logpush=None)], self.SUB), ['logpush: not reported'])
+        self.assertEqual(kc.judge_settings([dict(obs, tail_consumers=None, logpush='yes')], self.SUB), ['logpush is on'])
 
     def test_each_bad_setting_is_named(self):
         def bad(blob=None, sub=None):
@@ -311,9 +354,132 @@ class Judges(unittest.TestCase):
         self.assertIn('preview URLs are not off', kc.judge_settings([self.GOOD], {'enabled': True}))  # unknown is not off
 
     def test_a_missing_observability_answer_is_not_off(self):
-        self.assertEqual(kc.judge_settings([{'logpush': False}], self.SUB), ['observability: no explicit off in the settings read back'])
+        self.assertEqual(kc.judge_settings([{'logpush': False, 'tail_consumers': []}], self.SUB),
+                         ['observability: no explicit off in the settings read back'])
         self.assertIn('observability is not off',
                       kc.judge_settings([self.GOOD, {'observability': {'enabled': True}}], self.SUB))  # any source can veto
+
+    def test_a_redirect_is_never_followed_and_so_never_carries_the_token(self):
+        req = urllib.request.Request('https://api.cloudflare.com/client/v4/x', headers={'Authorization': 'Bearer SECRETTOKEN'})
+        self.assertIsNone(kc.NoRedirect().redirect_request(req, None, 302, 'Found', {}, 'http://attacker.example/steal'))
+
+        class H(BaseHTTPRequestHandler):
+            seen: list = []
+
+            def do_GET(self):
+                H.seen.append(self.headers.get('Authorization'))
+                redirect = self.path == '/start'
+                self.send_response(302 if redirect else 200)
+                if redirect:
+                    self.send_header('Location', '/other')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            r = urllib.request.Request('http://127.0.0.1:%d/start' % srv.server_address[1], headers={'Authorization': 'Bearer T'})
+            with self.assertRaises(urllib.error.HTTPError) as why:
+                kc._OPENER.open(r, timeout=5)
+            self.assertEqual(why.exception.code, 302)
+            why.exception.close()
+            self.assertEqual(H.seen, ['Bearer T'])          # one request: /other was never asked for
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    ACCOUNT = 'a' * 32
+    GOOD_ANSWERS = {'/settings': {'observability': {'enabled': False}, 'logpush': False, 'tail_consumers': []},
+                    '/script-settings': {'logpush': False},
+                    '/subdomain': {'enabled': True, 'previews_enabled': False}}
+
+    def cf(self, answers):
+        """Run check_settings with kc._open replaced; answers maps a path tail to a result dict, an int HTTP code,
+        'fail' (success: false), or an exception. Returns (outcome, urls asked, authorization headers sent)."""
+        asked, auths = [], []
+
+        class Reply:
+            def __init__(self, doc):
+                self.doc = doc
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps(self.doc).encode()
+
+        def fake_open(req, timeout):
+            asked.append(req.full_url)
+            auths.append(req.get_header('Authorization'))
+            a = answers['/' + req.full_url.rsplit('/', 1)[-1]]
+            if isinstance(a, BaseException):
+                raise a
+            if isinstance(a, int):
+                raise urllib.error.HTTPError(req.full_url, a, 'x', {}, io.BytesIO(b''))
+            if a == 'fail':
+                return Reply({'success': False, 'result': {}})
+            return Reply({'success': True, 'result': a})
+
+        old, kc._open = kc._open, fake_open
+        try:
+            with redirect_stdout(io.StringIO()):
+                try:
+                    return kc.check_settings('fleet-kit', 'TOKEN', self.ACCOUNT), asked, auths
+                except kc.Refused as e:
+                    return e, asked, auths
+        finally:
+            kc._open = old
+
+    def test_the_settings_gate_asks_the_three_exact_endpoints_with_the_token(self):
+        out, asked, auths = self.cf(self.GOOD_ANSWERS)
+        base = 'https://api.cloudflare.com/client/v4/accounts/%s/workers/scripts/fleet-kit' % self.ACCOUNT
+        self.assertEqual(asked, [base + '/settings', base + '/script-settings', base + '/subdomain'])
+        self.assertEqual(set(auths), {'Bearer TOKEN'})
+        self.assertEqual(out, {'worker': 'fleet-kit', 'sources': 2})
+
+    def test_the_settings_gate_tolerates_one_settings_endpoint_failing_but_not_both_or_the_subdomain(self):
+        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/script-settings': 404}))
+        self.assertEqual(out, {'worker': 'fleet-kit', 'sources': 1})
+        # the one endpoint left must still prove everything: /script-settings alone says nothing about tail consumers
+        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/settings': 'fail'}))
+        self.assertIsInstance(out, kc.Refused)
+        self.assertIn('tail_consumers: not reported', str(out))
+        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/settings': 500}))
+        self.assertIsInstance(out, kc.Refused)
+        self.assertIn('tail_consumers: not reported', str(out))
+        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/settings': 500, '/script-settings': 403}))
+        self.assertIsInstance(out, kc.Refused)
+        self.assertIn('did not answer', str(out))
+        for sub in (404, 'fail'):
+            out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/subdomain': sub}))
+            self.assertIsInstance(out, kc.Refused, sub)
+            self.assertIn('did not answer', str(out))
+
+    def test_the_settings_gate_refuses_a_network_failure_and_names_a_bad_answer(self):
+        for exc in (urllib.error.URLError('down'), TimeoutError(), ValueError('bad json')):
+            out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/settings': exc}))
+            self.assertIsInstance(out, kc.Refused, repr(exc))
+        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/script-settings': {'logpush': True}}))
+        self.assertIn('logpush is on', str(out))
+        self.assertNotIn('TOKEN', str(out))
+
+    def test_cf_get_only_talks_to_the_cloudflare_api_host(self):
+        old = kc.CF_API
+        kc.CF_API = 'http://api.cloudflare.com/client/v4'
+        try:
+            with self.assertRaises(kc.Refused):
+                kc.cf_get('/x', 't')
+            kc.CF_API = 'https://api.cloudflare.com.evil.example/client/v4'
+            with self.assertRaises(kc.Refused):
+                kc.cf_get('/x', 't')
+        finally:
+            kc.CF_API = old
 
     def test_settings_refuses_a_malformed_worker_or_account(self):
         with self.assertRaises(kc.Refused):
@@ -373,7 +539,7 @@ class OverHttp(unittest.TestCase):
         self.assertIn('vectors passed', text)
         self.assertIn('429 after 30 failures', text)
         self.assertIn('(a) client cuts: 2, count restored: 2', text)
-        self.assertIn('(c) wrong bytes: 422, overwrite: 409, identical re-upload: 200', text)
+        self.assertIn('(c) wrong bytes: 422 (R2 checksum), overwrite: 409 (Worker head guard; the R2 onlyIf wildcard is not separately observable), identical re-upload: 200', text)
         self.assertIn('not CPU time', text)
         self.assertRegex(text, r'404 answers compared: \d+, identical')
         self.assertEqual(kit.fails, 30)
@@ -432,15 +598,57 @@ class OverHttp(unittest.TestCase):
         self.assertTrue(buf.getvalue().strip().splitlines()[-1].startswith('REFUSED'))
 
 
+class FrontRejects(unittest.TestCase):
+    def test_the_lowercase_case_is_always_a_malformed_code_even_for_an_all_digit_code(self):
+        class Recorder:
+            def __init__(self):
+                self.sent = []
+
+            def request(self, method, path, headers=(), body=None, read=True):
+                self.sent.append(list(headers))
+
+        for code in ('2345678923', 'CFGHJMPQRV', '9999999999'):
+            rec = Recorder()
+            kc.front_rejects(rec, code)
+            auths = [v for hdrs in rec.sent for k, v in hdrs if k == 'Authorization']
+            self.assertIn('FleetInvite c' + code[1:], auths, code)       # the lowercase case is always built from a letter
+            self.assertNotRegex('FleetInvite c' + code[1:], r'^FleetInvite [23456789CFGHJMPQRVWX]{10}$')
+
+
 class Cli(unittest.TestCase):
+    def has_secret(self, stdin, name='INVITE_PEPPER'):
+        old, sys.stdin = sys.stdin, stdin
+        try:
+            with redirect_stdout(io.StringIO()):
+                return kc.main(['has-secret', name])
+        finally:
+            sys.stdin = old
+
     def test_has_secret_exit_codes(self):
-        for text, want in (('[{"name": "INVITE_PEPPER", "type": "secret_text"}]', 0), ('[]', 1), ('garbage', 2)):
-            stdin, sys.stdin = sys.stdin, io.StringIO(text)
-            try:
-                with redirect_stdout(io.StringIO()):
-                    self.assertEqual(kc.main(['has-secret', 'INVITE_PEPPER']), want)
-            finally:
-                sys.stdin = stdin
+        for text, want in (('[{"name": "INVITE_PEPPER", "type": "secret_text"}]', 0), ('[]', kc.ABSENT), ('garbage', 2)):
+            self.assertEqual(self.has_secret(io.StringIO(text)), want)
+        self.assertEqual(kc.ABSENT, 10)
+
+    def test_a_crash_or_a_bad_input_never_reads_as_absent(self):
+        class Bytes:
+            def __init__(self, raw):
+                self.buffer = io.BytesIO(raw)
+        # invalid UTF-8 around a list that lacks the name still parses (decoded with errors=replace): absent, honestly
+        self.assertEqual(self.has_secret(Bytes(b'[]\xff')), kc.ABSENT)
+        self.assertEqual(self.has_secret(Bytes(b'[{"name": "INVITE_PEPPER"}]\xff')), 0)
+        for raw in (b'\xff\xfe', b'', b'\xff[{"name": "X"'):
+            self.assertEqual(self.has_secret(Bytes(raw)), 2, raw)
+        self.assertEqual(self.has_secret(io.StringIO('[]'), name='bad name'), 2)      # a refused name is not absence
+
+        class Boom:
+            def read(self):
+                raise RuntimeError('boom')
+        self.assertEqual(self.has_secret(Boom()), 2)
+        old, kc.secret_names = kc.secret_names, lambda text: (_ for _ in ()).throw(KeyError('x'))
+        try:
+            self.assertEqual(self.has_secret(io.StringIO('[]')), 2)
+        finally:
+            kc.secret_names = old
 
     def test_the_summary_goes_to_the_job_summary_file_and_holds_no_code(self):
         with tempfile.TemporaryDirectory() as d:
@@ -602,6 +810,100 @@ class Workflow(unittest.TestCase):
     def test_it_never_touches_the_install_workflow_or_the_floor(self):
         for name in ('KIT_FLOOR', 'KIT_DISABLED', 'KIT_HOST'):
             self.assertNotIn(name, CODE)
+
+
+def parsed_workflow():
+    """The workflow as ruby parses it (the CI runner has ruby); None when there is none."""
+    ruby = shutil.which('ruby')
+    if not ruby:
+        return None
+    r = subprocess.run([ruby, '-ryaml', '-rjson', '-e', 'puts JSON.generate(YAML.load_file(ARGV[0]))',
+                        str(ROOT / '.github/workflows/kit-deploy.yml')], capture_output=True, text=True)
+    return json.loads(r.stdout) if r.returncode == 0 else None
+
+
+class WorkflowStructure(unittest.TestCase):
+    """The properties the security claims rest on, asserted on the parsed steps (a mutation that keeps the old text
+    checks green, such as `if: always()` on the production deploy, is caught here)."""
+    DOC = parsed_workflow()
+
+    def setUp(self):
+        if self.DOC is None:
+            self.skipTest('no ruby to parse the workflow')
+        self.steps = self.DOC['jobs']['deploy']['steps']
+
+    def named(self, fragment):
+        found = [s for s in self.steps if fragment in s.get('name', '')]
+        self.assertEqual(len(found), 1, fragment)
+        return found[0]
+
+    def test_only_the_wipe_step_has_a_condition_and_nothing_continues_on_error(self):
+        self.assertEqual([s['name'] for s in self.steps if 'if' in s], [self.named('Wipe')['name']])
+        self.assertEqual(self.named('Wipe')['if'], 'always()')
+        for job in self.DOC['jobs'].values():
+            for step in job['steps']:
+                self.assertNotIn('continue-on-error', step)
+            self.assertNotIn('continue-on-error', job)
+
+    def test_the_triggers_are_a_push_to_release_and_a_manual_dispatch_only(self):
+        triggers = self.DOC.get('on', self.DOC.get('true'))
+        self.assertEqual(sorted(triggers), ['push', 'workflow_dispatch'])
+        self.assertEqual(sorted(triggers['push']), ['branches', 'paths'])
+        self.assertEqual(triggers['push']['branches'], ['release'])
+        self.assertIn(triggers['workflow_dispatch'], (None, {}))
+
+    def test_checkout_takes_no_ref_and_keeps_no_credentials(self):
+        for job in self.DOC['jobs'].values():
+            for step in job['steps']:
+                if str(step.get('uses', '')).startswith('actions/checkout@'):
+                    self.assertEqual(step['with'], {'persist-credentials': False})
+
+    def test_staging_gets_the_throwaway_pepper_and_production_neither_that_nor_the_staging_env(self):
+        staging = self.named('staging INVITE_PEPPER')['run']
+        self.assertRegex(staging, r'wrangler secret put INVITE_PEPPER --env staging\s*$')
+        for fragment in ('INVITE_PEPPER once', 'Deploy production'):
+            self.assertNotIn('--env', self.named(fragment)['run'], fragment)
+            self.assertNotIn('staging', self.named(fragment)['run'], fragment)
+        self.assertIn('--env staging', self.named('Deploy staging')['run'])
+        self.assertIn('secret put INVITE_PEPPER', self.named('INVITE_PEPPER once')['run'])
+
+    def test_the_pepper_is_made_on_the_absent_code_only(self):
+        run = self.named('INVITE_PEPPER once')['run']
+        arms = re.findall(r'(?m)^\s+(\d+|\*)\) ', run)
+        self.assertEqual(arms, ['0', '10', '*'])
+        self.assertNotRegex(run, r'(?m)^\s+1\)')
+        put_arm = run.split('10)')[1].split(';;')[0]
+        self.assertIn('secret put INVITE_PEPPER', put_arm)
+        self.assertNotIn('secret put', run.split('10)')[0])
+        self.assertIn('exit 1', run.split('*)')[1])
+
+    def test_no_run_line_can_make_a_failing_step_pass(self):
+        allowed = (r'^python3 "\$GITHUB_WORKSPACE/bin/fleet-kit-check\.py" has-secret INVITE_PEPPER < "\$RUNNER_TEMP/secret-names\.json" \|\| rc=\$\?$',
+                   r'^test -n "\$CLOUDFLARE_(?:API_TOKEN|ACCOUNT_ID)" \|\| \{ echo "REFUSED [^"]*"; exit 1; \}$')
+        for job in self.DOC['jobs'].values():
+            for step in job['steps']:
+                for line in step.get('run', '').splitlines():
+                    line = line.strip()
+                    if '||' in line:
+                        self.assertTrue(any(re.match(a, line) for a in allowed), line)
+                    self.assertNotRegex(line, r'(?:;|&&)\s*(?:true|exit 0|:)\b|\|\s*(?:true|cat)\s*$', line)
+                    self.assertNotRegex(line, r'^set [+]e|\bset [+]e\b', line)
+
+    def test_the_token_is_only_ever_tested_never_read_out_by_a_run_line(self):
+        test_n = re.compile(r'test -n "\$CLOUDFLARE_API_TOKEN"(?: \|\| \{ echo "[^"]*"; exit 1; \})?')
+        for job in self.DOC['jobs'].values():
+            for step in job['steps']:
+                for line in step.get('run', '').splitlines():
+                    self.assertNotIn('CLOUDFLARE_API_TOKEN', test_n.sub('', line), line)
+
+    def test_the_replay_hits_staging_and_the_probe_hits_production_and_neither_the_other(self):
+        replay, probe = self.named('Replay')['run'], self.named('Hostile probe')['run']
+        self.assertEqual(replay.strip(), 'python3 bin/fleet-kit-check.py replay "$STAGING_URL"')
+        self.assertEqual(probe.strip(), 'python3 bin/fleet-kit-check.py probe "$PROD_URL"')
+        for step in (self.named('Replay'), self.named('Hostile probe')):
+            self.assertNotIn('env', step)                       # no token on either
+        self.assertIn('settings fleet-kit-staging', self.named('Settings gate, staging')['run'])
+        self.assertRegex(self.named('Settings gate, production')['run'].strip(), r'settings fleet-kit$')
 
 
 if __name__ == '__main__':

@@ -6,10 +6,12 @@ plus the `openssl` binary (3.x: Ed25519 with -rawin) for the throwaway admin key
                       KIT_UP_PUB=<64 hex> and KIT_GW_PUB=<64 hex> (public halves only) for $GITHUB_ENV.
   console DIR         refuse if the Worker sources in DIR call console.* (observability is off, but a log line would still be
                       the one thing that writes an invite code somewhere; tests and test stand-ins are not scanned).
-  has-secret NAME     stdin = `wrangler secret list --format json`. Exit 0 present, 1 absent, 2 unreadable. Names only.
+  has-secret NAME     stdin = `wrangler secret list --format json`. Exit 0 present, 10 absent (the list parsed and lacks the
+                      name; nothing else ever returns 10), 2 anything else (unreadable, a crash, a bad name). Names only.
   settings WORKER     read the Worker's settings back from the Cloudflare API (token and account id from the environment)
-                      and refuse unless: observability off (nowhere on), no tail consumer, no Logpush, workers.dev on,
-                      preview URLs off.
+                      and refuse unless each of these is READ BACK, not merely not-seen: observability explicitly off
+                      (nowhere on), `tail_consumers` reported as empty, `logpush` reported as false, workers.dev on,
+                      preview URLs off. A key the API does not report is a refusal, never a pass.
   replay URL          the kit-serve vectors over HTTP against the STAGING Worker (admin keys from $KIT_GATE_DIR): identical
                       404 bytes, 429 after 30, the cap, release on a cut stream, floor, expiry, revoke, bad sha, overwrite,
                       gzip, Range, the admin rules. It makes its own invites and cleans them up.
@@ -17,7 +19,11 @@ plus the `openssl` binary (3.x: Ed25519 with -rawin) for the throwaway admin key
                       to the first apart from date and cf-ray, one of them with Accept-Encoding: gzip.
 
 Nothing here prints an invite code, a key, a token or a response body; it prints vector names, statuses and numbers.
-Exit 0 passed, 1 refused (the reason is the last line), 2 usage."""
+Exit 0 passed, 1 refused (the reason is the last line), 2 usage.
+
+Not covered, on purpose: the R2 side of the guarded surface (r2.dev public URL off, no custom domain on the bucket, no S3
+token) is not readable with the deploy token, which has no R2 permission; the owner's monthly look covers it. The replay's
+(b) isolate-restart and (d) 100000-requests-a-day measurements cannot be taken over HTTP and are printed as unmeasured."""
 from __future__ import annotations
 
 import argparse
@@ -49,7 +55,10 @@ FAILURE_BUDGET_PER_SOURCE = 30          # kit/gate-core.js LIMITS.perSource
 PROBE_MAX_FAILURES = 5                  # the hostile probe may spend at most this much of production's hourly budget
 # Worker sources that ship (everything else in kit/ is a test or a test stand-in).
 SKIP_NAME = re.compile(r'(\.test\.m?js|\.test-util\.m?js|^run-tests\.m?js|^fake-storage\.m?js)$')
-CONSOLE_RE = re.compile(r'\bconsole\s*[.\[]')
+SOURCE_SUFFIXES = frozenset({'.js', '.mjs', '.cjs', '.jsx', '.ts', '.mts', '.cts', '.tsx'})
+# `console.x`, `console?.x`, `console [x]`, `= console` (alias, destructuring), `globalThis.console`: matched on the whole
+# text, so `console` and `.log` split over two lines do not get past it.
+CONSOLE_RE = re.compile(r'\bconsole\s*(?:\?\.|\.|\[)|=\s*console\b|\.\s*console\b')
 # The staging fixtures: fixed serials and fixed bytes, so a re-run is an identical re-upload and R2 does not grow.
 S_BASE = 900000000
 
@@ -100,16 +109,24 @@ def make_keys(directory: str) -> list[str]:
 # ---- console / secrets / settings -------------------------------------------------------------------------------------
 
 def scan_console(directory: str) -> list[str]:
-    """Every `console.` or `console[` in a shipped source, as file:line. Comments count (the cheap rule is the safe one)."""
-    hits = []
+    """Every console use in a shipped source under `directory` (recursive, node_modules aside), as path:line. Comments count
+    (the cheap rule is the safe one). A shipped file that imports a skipped test file is refused: that file ships too."""
     root = Path(directory)
-    files = sorted(p for p in root.iterdir() if p.is_file() and p.suffix in ('.js', '.mjs') and not SKIP_NAME.search(p.name))
-    if not files:
+    paths = sorted(p for p in root.rglob('*') if p.is_file() and p.suffix in SOURCE_SUFFIXES
+                   and 'node_modules' not in p.relative_to(root).parts)
+    shipped = [p for p in paths if not SKIP_NAME.search(p.name)]
+    skipped = [p for p in paths if SKIP_NAME.search(p.name)]
+    if not shipped:
         raise Refused('no Worker source in %s: the scan would pass over nothing' % directory)
-    for path in files:
-        for number, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
-            if CONSOLE_RE.search(line):
-                hits.append('%s:%d' % (path.name, number))
+    hits = []
+    for path in shipped:
+        text = path.read_text(encoding='utf-8')
+        rel = path.relative_to(root).as_posix()
+        for other in skipped:
+            if re.search(r'[\'"`/]' + re.escape(other.stem) + r'(?:\.[cm]?[jt]sx?)?[\'"`]', text):
+                raise Refused('%s imports %s, a test file the scan skips' % (rel, other.name))
+        lines = {text.count('\n', 0, m.start()) + 1 for m in CONSOLE_RE.finditer(text)}
+        hits.extend('%s:%d' % (rel, n) for n in sorted(lines))
     return hits
 
 
@@ -139,10 +156,11 @@ def _enabled_anywhere(node) -> bool:
 
 def judge_settings(blobs: list[dict], subdomain: dict) -> list[str]:
     """Why these settings are refused ([] = fine). `blobs` are the `result` objects of the settings endpoints that
-    answered; every one that mentions a guarded key is held to it, and observability.enabled must be an explicit false
-    in at least one (a missing answer is not off: new Workers default to ON)."""
+    answered. Every guarded key that is reported is held to its value, and each must be reported (a positive read-back) by
+    at least one blob: observability.enabled an explicit false (a missing answer is not off: new Workers default to ON),
+    `tail_consumers` an empty list (or an explicit null), `logpush` an explicit false. Absence is never a pass."""
     bad = []
-    explicit_off = False
+    explicit_off = tail_seen = logpush_seen = False
     for blob in blobs:
         if 'observability' in blob:
             obs = blob['observability']
@@ -150,13 +168,23 @@ def judge_settings(blobs: list[dict], subdomain: dict) -> list[str]:
                 explicit_off = True
             else:
                 bad.append('observability is not off')
-        tails = blob.get('tail_consumers')
-        if tails not in (None, []):
-            bad.append('tail consumers: %s' % (len(tails) if isinstance(tails, list) else 'unreadable'))
-        if blob.get('logpush') not in (None, False):
-            bad.append('logpush is on')
+        if 'tail_consumers' in blob:
+            tails = blob['tail_consumers']
+            if tails is None or tails == []:
+                tail_seen = True
+            else:
+                bad.append('tail consumers: %s' % (len(tails) if isinstance(tails, list) else 'unreadable'))
+        if 'logpush' in blob:
+            if blob['logpush'] is False:
+                logpush_seen = True
+            elif blob['logpush'] is not None:       # null says nothing: it stays "not reported" below
+                bad.append('logpush is on')
     if not explicit_off and 'observability is not off' not in bad:
         bad.append('observability: no explicit off in the settings read back')
+    if not tail_seen and not any(b.startswith('tail consumers') for b in bad):
+        bad.append('tail_consumers: not reported')
+    if not logpush_seen and 'logpush is on' not in bad:
+        bad.append('logpush: not reported')
     if subdomain.get('enabled') is not True:
         bad.append('workers.dev is not on')
     if subdomain.get('previews_enabled') is not False:
@@ -164,13 +192,31 @@ def judge_settings(blobs: list[dict], subdomain: dict) -> list[str]:
     return sorted(set(bad))
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow nothing: urllib would re-send the Authorization header (the deploy token) to wherever a 3xx points."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_OPENER = urllib.request.build_opener(NoRedirect)
+
+
+def _open(req, timeout):
+    return _OPENER.open(req, timeout=timeout)
+
+
 def cf_get(path: str, token: str) -> dict | None:
+    url = urllib.parse.urlsplit(CF_API + path)
+    if url.scheme != 'https' or url.hostname != 'api.cloudflare.com':
+        raise Refused('settings: the API host is not api.cloudflare.com over https')
     req = urllib.request.Request(CF_API + path, headers={'Authorization': 'Bearer ' + token, 'User-Agent': UA})
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _open(req, 30) as resp:
             doc = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         say('settings: GET %s -> HTTP %d' % (path.rsplit('/', 1)[-1], e.code))
+        e.close()
         return None
     except (urllib.error.URLError, ValueError, TimeoutError) as e:
         raise Refused('settings: GET %s failed (%s)' % (path.rsplit('/', 1)[-1], type(e).__name__)) from None
@@ -374,7 +420,8 @@ def front_rejects(client: Client, good_code: str) -> list[tuple[str, Resp]]:
         ('query', 'GET', p + '?x=1', [ok_auth], None),
         ('ten digit serial', 'GET', '/v1/kit/9000000010/bundle.tar', [ok_auth], None),
         ('other file name', 'GET', '/v1/kit/900000001/other.tar', [ok_auth], None),
-        ('lowercase code', 'GET', p, [('Authorization', 'FleetInvite ' + good_code.lower())], None),
+        # a forced lowercase letter: good_code.lower() would equal good_code when the code is all digits
+        ('lowercase code', 'GET', p, [('Authorization', 'FleetInvite c' + good_code[1:])], None),
         ('short code', 'GET', p, [('Authorization', 'FleetInvite ' + good_code[:9])], None),
         ('forbidden symbol', 'GET', p, [('Authorization', 'FleetInvite 0' + good_code[1:])], None),
         ('wrong scheme', 'GET', p, [('Authorization', 'Bearer ' + good_code)], None),
@@ -614,7 +661,8 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
         '  429 after %d failures' % m['b429_after'],
         '  (a) client cuts: %d, count restored: %d' % (m['a_cuts'], m['a_restored']),
         '  (b) not measurable over HTTP (needs an isolate restart)',
-        '  (c) wrong bytes: %d, overwrite: %d, identical re-upload: %d' % (m['c_wrong_bytes'], m['c_overwrite'], m['c_identical']),
+        '  (c) wrong bytes: %d (R2 checksum), overwrite: %d (Worker head guard; the R2 onlyIf wildcard is not separately '
+        'observable), identical re-upload: %d' % (m['c_wrong_bytes'], m['c_overwrite'], m['c_identical']),
         '  (d) not measurable here (needs 100000 requests in a day)',
         '  (g) 404 answers, wall clock ms: p50 %d, max %d (not CPU time)' % (statistics.median(ms), max(ms)),
     ]
@@ -686,6 +734,29 @@ def run_probe(client: Client, *, log=say) -> list[str]:
     ]
 
 
+ABSENT = 10     # has-secret: the list parsed and does not hold the name. No crash, refusal or usage error ever exits 10.
+
+
+def read_stdin_text() -> str:
+    buf = getattr(sys.stdin, 'buffer', None)
+    return buf.read().decode('utf-8', errors='replace') if buf is not None else sys.stdin.read()
+
+
+def has_secret(name: str) -> int:
+    """0 present, ABSENT (10) absent, 2 for every other outcome. The workflow makes the production pepper on 10 only."""
+    try:
+        if not SECRET_NAME.fullmatch(name):
+            raise Refused('bad secret name')
+        present = name in secret_names(read_stdin_text())
+    except Refused as e:
+        say('REFUSED %s' % e)
+        return 2
+    except Exception as e:  # noqa: BLE001 - a crash must not read as "absent"
+        say('REFUSED has-secret failed (%s)' % type(e).__name__)
+        return 2
+    return 0 if present else ABSENT
+
+
 # ---- main --------------------------------------------------------------------------------------------------------------
 
 def main(argv: list[str]) -> int:
@@ -704,14 +775,7 @@ def main(argv: list[str]) -> int:
                 raise Refused('console call in a Worker source: %s' % ', '.join(hits))
             say('no console call in the Worker sources')
         elif args.cmd == 'has-secret':
-            if not SECRET_NAME.fullmatch(args.arg):
-                raise Refused('bad secret name')
-            try:
-                present = args.arg in secret_names(sys.stdin.read())
-            except Refused as e:
-                say('REFUSED %s' % e)
-                return 2
-            return 0 if present else 1
+            return has_secret(args.arg)
         elif args.cmd == 'settings':
             token, account = os.environ.get('CLOUDFLARE_API_TOKEN', ''), os.environ.get('CLOUDFLARE_ACCOUNT_ID', '')
             if not token or not account:
