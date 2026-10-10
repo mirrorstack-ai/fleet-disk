@@ -93,7 +93,11 @@ Free over-quota status; (g) CPU time. The unit tests use stand-ins and say nothi
 ## Shared decision vectors (G-K3-1)
 
 `vectors/kit_vectors.json` is a byte-exact copy of `tests/gw/kit_vectors.json` in mirrorstack-fleet, the file the
-Python kit-serve also runs, so the two hosts cannot drift apart unseen before K12 retires kit-serve.
+Python kit-serve also runs, so the Worker cannot drift from this pinned copy unseen before K12 retires kit-serve.
+Not built here: a vendor-sync check that the copy still equals the fleet file (a fleet-side follow-up, as for
+`manifest.py`); until it lands G-K3-1 is half closed. The Request and Headers classes normalise what the tests hand them
+(as the Workers runtime does), so `path /v1/kit/7/../floor`, `%2e%2e` and `bare-scheme-and-space` arrive normalised;
+a separate test hands the Worker a raw dot-segment URL.
 `vectors/VENDORED.sha256` pins the copy (`<sha256>  kit_vectors.json  mirrorstack-fleet@<sha> <path>`).
 `vectors.test.js` fails if the copy changed without the pin, then sends every answer, header, counter and budget
 vector as a request through the real Worker front and Gate, and compares the status and, for every 404 and 429, the

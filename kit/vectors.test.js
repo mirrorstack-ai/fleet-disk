@@ -1,7 +1,8 @@
 // The shared kit decision vectors (vectors/kit_vectors.json, vendored from mirrorstack-fleet, pinned in
 // vectors/VENDORED.sha256) run against the Worker's real front and the real Gate over fake storage. The Python
-// kit-serve runs the same file (tests/gw/test_kitserve.py, class Vectors), so the two hosts cannot drift apart
-// unseen. Format and semantics: the file's own `about`. Never asserted here: its `known_differences`.
+// kit-serve runs the same file (tests/gw/test_kitserve.py, class Vectors), so the Worker cannot drift from this pinned
+// copy unseen. (That the copy itself still equals the fleet file is a fleet-side vendor-sync check, not built here.)
+// Format and semantics: the file's own `about`. Never asserted here: its `known_differences`.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -36,10 +37,14 @@ test('the vectors are whole', () => {
   for (const s of ['answers', 'headers', 'counters', 'budgets']) {
     assert.equal(new Set(VECTORS[s].map((c) => c.name)).size, VECTORS[s].length, `${s} names are unique`);
   }
+  const answered = new Set(VECTORS.answers.map((a) => a.status));
+  assert.ok(answered.has(200) && answered.has(404), 'the answers hold both a 200 and a 404');
   assert.deepEqual([...new Set(VECTORS.answers.map((a) => a.layer))].sort(), ['front', 'gate']);
   assert.doesNotMatch(JSON.stringify(VECTORS), /[23456789CFGHJMPQRVWX]{10}/, 'no code literal in the data');
   for (const key of DIVERGES.keys()) {
-    const [section, name] = key.split(': ');
+    const i = key.indexOf(': '); // a vector name may itself hold ': '; a section name never does
+    const section = key.slice(0, i);
+    const name = key.slice(i + 2);
     assert.ok(VECTORS[section].some((c) => c.name === name), `DIVERGES names a vector that exists: ${key}`);
   }
 });
@@ -88,6 +93,10 @@ async function world(change = {}) {
 }
 
 // One request as bytes through the real front: the Authorization header is parsed by the Worker, never handed over.
+// Request and Headers normalise what they are given, as the Workers runtime does before the Worker sees it. So these
+// vectors arrive normalised, not as the raw bytes their names say: `path /v1/kit/7/../floor` and `.../%2e%2e/floor`
+// arrive as `/v1/kit/floor`, and `bare-scheme-and-space` (`FleetInvite `) as `FleetInvite`. All are 404 either way;
+// the raw-path rule itself (rawPathAndQuery decodes and normalises nothing) is pinned by the test further down.
 async function send(h, req, { at = 0, cut = false, headers = null } = {}) {
   const r = { ...DEFAULT, ...req };
   const pairs = headers ?? (CODES[r.code] === null ? [] : [['Authorization', `FleetInvite ${CODES[r.code]}`]]);
@@ -131,6 +140,9 @@ for (const c of VECTORS.answers) {
       assert.equal(status(out, c.name), c.status);
       // layer front: answered before the Gate is called (no budget spent); layer gate: the Gate decided, once
       assert.equal(h.calls.decide, c.layer === 'gate' ? 1 : 0, `${c.layer} layer`);
+      // ... and the front spends nothing: no failure written, no release, for any front answer
+      assert.equal(h.calls.reject, 0, 'reject');
+      assert.equal(h.q('SELECT COALESCE(SUM(n), 0) AS n FROM allfails')[0].n, c.layer === 'gate' && c.status === 404 ? 1 : 0, 'budget writes');
       if (c.status === 200) {
         const name = { ...DEFAULT, ...c.req }.name;
         const want = name === 'bundle.tar' ? bundleOf({ ...DEFAULT, ...c.req }.serial) : FILES[name];
@@ -153,7 +165,7 @@ for (const c of VECTORS.headers) {
 async function runSteps(c) {
   const h = await world(c.set);
   for (const [n, step] of c.steps.entries()) {
-    for (const src of step.src_each ?? [step.req.src ?? DEFAULT.src]) {
+    for (const src of step.src_each?.length ? step.src_each : [step.req.src ?? DEFAULT.src]) {
       for (let k = 0; k < (step.times ?? 1); k++) {
         const label = `${c.name}: step ${n} (${src}, #${k}) ${JSON.stringify(step)}`;
         assert.equal(status(await send(h, { ...step.req, src }, { at: step.at ?? 0, cut: step.cut ?? false }), label), step.status, label);
@@ -165,3 +177,26 @@ async function runSteps(c) {
 for (const sect of ['counters', 'budgets']) {
   for (const c of VECTORS[sect]) test(`${sect}: ${c.name}`, { skip: skipOf(sect, c.name) }, () => withClock(() => runSteps(c)));
 }
+
+// ---- what the vectors cannot say --------------------------------------------------------------------
+
+// The Worker slices the URL string and normalises nothing (rawPathAndQuery), so a dot-segment is a different, unknown
+// path. A Request would hand it over already collapsed (see send); this stand-in hands it over raw, with a valid code.
+test('a dot-segment path is the 404 and no Gate call, not the file it would normalise to', () =>
+  withClock(async () => {
+    const h = await world();
+    clk.t = ms(NOW);
+    const headers = new Headers([['Authorization', `FleetInvite ${VALID}`], ['cf-connecting-ip', DEFAULT.src]]);
+    const res = await worker.fetch({ method: 'GET', url: 'https://kit.test/v1/kit/9/../7/bundle.tar', headers }, h.env, h.ctx);
+    const out = await read(res);
+    await h.settle();
+    assert.equal(status(out, 'dot-segment'), 404);
+    assert.equal(h.calls.decide, 0);
+  }));
+
+// The pinned copy is byte-exact: no end-of-line rewrite (core.autocrlf) may touch it, or the pin test would fail
+// on a checkout where nothing changed.
+test('the vendored files are marked -text', () => {
+  const attrs = readFileSync(new URL('../.gitattributes', import.meta.url), 'utf8').split('\n');
+  assert.ok(attrs.some((l) => /^kit\/vectors\/\*\*\s+-text\s*$/.test(l)), '.gitattributes needs: kit/vectors/** -text');
+});

@@ -6,3 +6,4 @@ vendor/bundle.py -text
 vendor/VENDORED.sha256 -text
 vendor/standin-bundle.sha256 -text
 vendor/standin-bundle/** -text
+kit/vectors/** -text
