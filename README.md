@@ -43,7 +43,7 @@ signing key's public line and fingerprint, and `mode` floor runs only the floor 
 
 - **plan** (Environment `release`, read-only deploy key `FLEET_READ` on the fleet repository, held in `/dev/shm` and wiped
   by a trap on every path) reads the folder from the fleet `release` tip as git blobs, never a checkout. It refuses unless the folder is exactly the files above as plain files, the
-  serial fits the series (below), `KIT_HOST` is set, the key baked into both bootstraps has the fingerprint `KEY_SHA256`, and `install.json`'s
+  serial fits the series (below), `KIT_HOST` is a valid host, the key baked into both bootstraps has the fingerprint `KEY_SHA256`, and `install.json`'s
   `source_head` and the pin's `head` are on that branch with the pin's `tree` that commit's tree. It runs every check below
   but the signatures. The run summary shows the tree id, each file's blob id and sha256, `install.json` and
   `deploy-pin.json` verbatim, the tag to be created, the hashes of the fleet commits since the previous release's source
@@ -150,8 +150,8 @@ those imports without changing a byte of the copy. They decide how strict the co
 pins them too (one hash over the four files, in the order and form `stand_in_digest` in the script says), and the bytes
 that were hashed are the ones executed. The UTC reader is deliberately stricter than the fleet's (no fractional seconds).
 The publisher refuses a signed `bundle.size` over 90 MB (`REFUSED kit-host-size`, from `plan` on): the host takes a bundle in one
-request and its Free plan's request body is 100 MB. `KIT_HOST` stays a placeholder until the host is measured, so `plan`, `kit`
-and `publish` all refuse `kit-host` until it is set.
+request and its Free plan's request body is 100 MB. `KIT_HOST` is `fleet-kit.mirrorstack-fleet.workers.dev` (the production kit
+Worker, set 2026-10-11 by D305); `plan`, `kit` and `publish` still refuse `kit-host` for any other host or a non-DNS name.
 
 **Floor.** `mode` floor with `floor` set to a serial makes the host serve no serial below it, the break-glass for a bad
 release. It is two jobs. `floor-approve` runs in the Environment `kit-floor` (restricted to `release`, the owner as required

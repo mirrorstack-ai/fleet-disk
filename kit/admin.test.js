@@ -3,6 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { sha256Hex } from './worker-util.js';
 import {
   makeHarness, ready, get, read, bytesOf, admin, addInvite, uploadBundle, uploadGateway, jsonOf, CODE, day,
@@ -236,12 +237,23 @@ test('wrangler.jsonc: the deploy settings the K6 gate reads back, and no break-g
     assert.deepEqual(c.durable_objects.bindings, [{ name: 'GATE', class_name: 'Gate' }], name);
     assert.deepEqual(c.migrations, [{ tag: 'v1', new_sqlite_classes: ['Gate'] }], name);
     assert.deepEqual(Object.keys(c.vars).sort(), ['KIT_GW_PUB', 'KIT_UP_PUB'], name);
-    assert.deepEqual(Object.values(c.vars), ['', ''], name); // placeholders until go-live (K11)
     assert.equal(c.r2_buckets.length, 1, name);
     assert.equal(c.r2_buckets[0].binding, 'KIT', name);
   }
   assert.equal(cfg.r2_buckets[0].bucket_name, 'fleet-kit');
   assert.equal(cfg.env.staging.r2_buckets[0].bucket_name, 'fleet-kit-staging');
+});
+
+// K11a (D305): production holds the upload key's public half; the gateway's is empty until K9 first starts (G-K11-1).
+const sha256B64NoPad = (hex) => createHash('sha256').update(Buffer.from(hex, 'hex')).digest('base64').replace(/=+$/, '');
+test('wrangler.jsonc: production KIT_UP_PUB is keygen run 38040384564\'s upload key, KIT_GW_PUB is empty until G-K11-1, staging both empty', () => {
+  const text = readFileSync(new URL('./wrangler.jsonc', import.meta.url), 'utf8');
+  const cfg = JSON.parse(text.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n'));
+  assert.deepEqual(cfg.env.staging.vars, { KIT_GW_PUB: '', KIT_UP_PUB: '' }); // staging gets throwaway keys by --var
+  assert.equal(cfg.vars.KIT_GW_PUB, ''); // G-K11-1: filled when K9 first starts on mirrorstack-fleet-ctl
+  assert.match(cfg.vars.KIT_UP_PUB, /^[0-9a-f]{64}$/);
+  // the fingerprint the keygen run printed (KEYGEN-FINGERPRINT KIT_UPLOAD_KEY): a typo in the key cannot pass
+  assert.equal(sha256B64NoPad(cfg.vars.KIT_UP_PUB), 'WKjmfza1zWKDkEpz7uoc9c+Nl2e9+dxsI18chRha8rQ');
 });
 
 // ---- write-once, read-back and R2 faults ---------------------------------------------------
