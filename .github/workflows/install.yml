@@ -1,28 +1,204 @@
-# Publishes the owner-signed install set committed under release/install-<serial>/ as the release install-<serial>.
-# Inputs reach the script only through env:; the script refuses unless install.json.sig verifies against the owner's
-# public key, every file is the signed one and nothing else is in the folder. It never edits a tag. The key is not in
-# this repo (a copy here would let a merged PR swap it): the owner sets it as the variable OWNER_PIN_PUB (the whole
-# key line) of the Environment `release`, and optionally its fingerprint as OWNER_PIN_SHA256.
+# Signs and publishes the fleet's install set from the release folder of the fleet repository's `release` branch, in four
+# jobs and only on this repo's `release` branch (the Environment `release` allows no other):
+#   plan     reads release/install-<serial>/ from the fleet `release` tip as git blobs (deploy key FLEET_READ) and runs
+#            every offline check but the signatures.
+#   sign     runs no repository code and no third-party action: holds SIGN_KEY only in memory, refuses unless its
+#            fingerprint is KEY_SHA256 below, signs the three files, verifies them and wipes the key.
+#   tag      creates the tag install-<serial> on this run's commit with the deploy key TAG_KEY.
+#   publish  runs the publisher on the plan's files plus the signatures; no environment, no secret.
+# Inputs reach the scripts only through env:. Which key signs is the constant KEY_SHA256, a reviewed change to this file.
 name: install
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: sign (plan, sign, tag, publish) or pubkey (only print the signing key's public line and fingerprint)
+        type: choice
+        options: [sign, pubkey]
+        default: sign
       serial:
-        description: the install serial, the folder release/install-<serial>
-        required: true
+        description: the install serial, the folder release/install-<serial> of the fleet repository
+        required: false
       min_serial:
         description: the lowest serial this publish may carry (the previous release's serial)
-        required: true
+        required: false
 permissions:
   contents: read
 concurrency:
   group: install
+env:
+  # Filled in by hand once the key exists: the `ssh-keygen -lf` fingerprint of the key in SIGN_KEY. While it is not a
+  # fingerprint the sign job refuses.
+  KEY_SHA256: SHA256:NOT-SET-fill-in-after-keygen
+  # test: serials below 1000 (the test key); release: serials 1000 and up (the release key)
+  SERIES: test
+  # Filled in by hand: the one host install.json's signed bundle.url may name (the bootstrap sends a helper's invite code
+  # to it). While it is not a lowercase DNS name, plan and publish refuse `kit-host`.
+  KIT_HOST: NOT-SET-fill-in-the-kit-host
+  FLEET_REPO: git@github.com:mirrorstack-ai/mirrorstack-fleet.git
+  # GitHub's ssh host key (ed25519, SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU), the only one ssh will accept
+  GH_HOSTKEY: github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
 jobs:
-  publish:
-    # `if` only stops an accidental dispatch from a branch: a dispatched run uses the workflow file of ITS ref, so a
-    # writer could drop it. The boundary is the environment: `release` is restricted to main (see the README).
-    if: github.ref == 'refs/heads/main'
+  plan:
+    if: github.ref == 'refs/heads/release' && inputs.mode == 'sign'
     environment: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      serial: ${{ steps.plan.outputs.serial }}
+      install_b64: ${{ steps.plan.outputs.install_b64 }}
+      install_sha: ${{ steps.plan.outputs.install_sha }}
+      kit_b64: ${{ steps.plan.outputs.kit_b64 }}
+      kit_sha: ${{ steps.plan.outputs.kit_sha }}
+      pin_b64: ${{ steps.plan.outputs.pin_b64 }}
+      pin_sha: ${{ steps.plan.outputs.pin_sha }}
+      immutable: ${{ steps.immutable.outputs.immutable }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - env:
+          SERIAL: ${{ inputs.serial }}
+          MIN_SERIAL: ${{ inputs.min_serial }}
+        run: |
+          for v in "$SERIAL" "$MIN_SERIAL"; do
+            case "$v" in '' | *[!0-9]*) echo 'serial and min_serial are digits only'; exit 1;; esac
+          done
+      - env:
+          FLEET_READ: ${{ secrets.FLEET_READ }}
+        run: |
+          set -eu
+          umask 077
+          d=$(mktemp -d /dev/shm/fleet.XXXXXX)
+          trap 'shred -u "$d/key" 2>/dev/null || true; rm -rf "$d"' EXIT
+          printf '%s\n' "$FLEET_READ" > "$d/key"
+          printf '%s\n' "$GH_HOSTKEY" > "$d/known_hosts"
+          export GIT_SSH_COMMAND="/usr/bin/ssh -i $d/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$d/known_hosts -o GlobalKnownHostsFile=/dev/null -o HostKeyAlgorithms=ssh-ed25519"
+          git init -q "$RUNNER_TEMP/fleet"
+          git -C "$RUNNER_TEMP/fleet" fetch -q --no-tags "$FLEET_REPO" '+refs/heads/release:refs/remotes/origin/release'
+      - id: plan
+        env:
+          SERIAL: ${{ inputs.serial }}
+          MIN_SERIAL: ${{ inputs.min_serial }}
+          OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}
+          KIT_HOST: ${{ env.KIT_HOST }}
+        run: python3 bin/fleet-install-publish.py plan "$RUNNER_TEMP/fleet" --serial "$SERIAL" --min-serial "$MIN_SERIAL" --out "$RUNNER_TEMP/out"
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tip=$(git -C "$RUNNER_TEMP/fleet" rev-parse refs/remotes/origin/release)
+          last=$(git tag -l 'install-*' --sort=-v:refname | grep -E '^install-(0|[1-9][0-9]*)$' | head -n 1 || true)
+          {
+            echo; echo '## Since the last release'
+            if [ -z "$last" ]; then
+              echo 'No install tag yet, nothing to compare.'
+            else
+              echo "last release: $last. Changes to the signer code (.github, bin, vendor) since its tag:"
+              echo '```'; git diff --stat "$last" HEAD -- .github bin vendor; echo '```'
+              prev=$(/usr/bin/gh release download "$last" --repo "$GITHUB_REPOSITORY" --pattern install.json --output - | jq -r .source_head || true)
+              if printf '%s\n' "$prev" | grep -Eq '^[0-9a-f]{40}$' && commits=$(git -C "$RUNNER_TEMP/fleet" rev-list "$prev..$tip"); then
+                echo "Fleet commits (hashes only) on release since the last release's source ($prev), $(printf '%s' "$commits" | grep -c . || true) in all:"
+                echo '```'; printf '%s\n' "$commits"; echo '```'
+              else
+                echo "UNKNOWN: could not work out the fleet commits since $last's source; review EVERY commit of the fleet release branch (newest 200 of $(git -C "$RUNNER_TEMP/fleet" rev-list --count "$tip" || echo '?'), hashes only):"
+                echo '```'; git -C "$RUNNER_TEMP/fleet" rev-list "$tip" | head -n 200 || true; echo '```'
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - id: immutable
+        env:
+          CONFIRMED: ${{ vars.IMMUTABLE_RELEASES_CONFIRMED }}
+        run: if [ "$CONFIRMED" = yes ]; then echo immutable=yes >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: install-stage
+          path: ${{ runner.temp }}/out
+          include-hidden-files: true
+          retention-days: 1
+  sign:
+    needs: plan
+    if: ${{ !cancelled() && github.ref == 'refs/heads/release' && (inputs.mode == 'pubkey' || needs.plan.result == 'success') }}
+    environment: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    outputs:
+      pub: ${{ steps.sign.outputs.pub }}
+      install_sig: ${{ steps.sign.outputs.install_sig }}
+      kit_sig: ${{ steps.sign.outputs.kit_sig }}
+      pin_sig: ${{ steps.sign.outputs.pin_sig }}
+    steps:
+      - id: sign
+        env:
+          MODE: ${{ inputs.mode }}
+          SIGN_KEY: ${{ secrets.SIGN_KEY }}
+          INSTALL_B64: ${{ needs.plan.outputs.install_b64 }}
+          INSTALL_SHA: ${{ needs.plan.outputs.install_sha }}
+          KIT_B64: ${{ needs.plan.outputs.kit_b64 }}
+          KIT_SHA: ${{ needs.plan.outputs.kit_sha }}
+          PIN_B64: ${{ needs.plan.outputs.pin_b64 }}
+          PIN_SHA: ${{ needs.plan.outputs.pin_sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          d=$(mktemp -d /dev/shm/sign.XXXXXX)
+          trap 'shred -u "$d/key" 2>/dev/null || true; rm -rf "$d"' EXIT
+          printf '%s\n' "$SIGN_KEY" > "$d/key"
+          fp=$(/usr/bin/ssh-keygen -l -f "$d/key" | cut -d ' ' -f 2)
+          pub=$(/usr/bin/ssh-keygen -y -f "$d/key" | cut -d ' ' -f 1,2)
+          [ -n "$fp" ] && [ -n "$pub" ] || { echo 'REFUSED no-key'; exit 1; }
+          if [ "$MODE" = pubkey ]; then
+            { echo '## Signing key'; echo "key $fp"; echo '```'; echo "$pub"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          [ "$MODE" = sign ] || { echo 'REFUSED mode'; exit 1; }
+          printf '%s\n' "$KEY_SHA256" | grep -Eq '^SHA256:[A-Za-z0-9+/]{43}$' || { echo 'REFUSED key-not-set'; exit 1; }
+          [ "$fp" = "$KEY_SHA256" ] || { echo 'REFUSED key'; exit 1; }
+          printf 'owner namespaces="mirrorstack-fleet-install,mirrorstack-fleet-pin" %s\n' "$pub" > "$d/allowed"
+          sign() {  # file, namespace, base64 of the bytes, their sha256, output name
+            printf '%s' "$3" | base64 -d > "$d/$1"
+            [ "$(sha256sum "$d/$1" | cut -d ' ' -f 1)" = "$4" ] || { echo "REFUSED hash $1"; exit 1; }
+            /usr/bin/ssh-keygen -q -Y sign -f "$d/key" -n "$2" "$d/$1"
+            /usr/bin/ssh-keygen -Y verify -f "$d/allowed" -I owner -n "$2" -s "$d/$1.sig" < "$d/$1" > /dev/null
+            [ "$(sha256sum "$d/$1" | cut -d ' ' -f 1)" = "$4" ] || { echo "REFUSED changed $1"; exit 1; }
+            printf '%s_sig=%s\n' "$5" "$(base64 -w0 < "$d/$1.sig")" >> "$GITHUB_OUTPUT"
+          }
+          sign install.json mirrorstack-fleet-install "$INSTALL_B64" "$INSTALL_SHA" install
+          sign kit.json mirrorstack-fleet-pin "$KIT_B64" "$KIT_SHA" kit
+          sign deploy-pin.json mirrorstack-fleet-pin "$PIN_B64" "$PIN_SHA" pin
+          printf 'pub=%s\n' "$pub" >> "$GITHUB_OUTPUT"
+          echo "signed with key $fp"
+  tag:
+    needs: [plan, sign]
+    if: github.ref == 'refs/heads/release'
+    environment: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - env:
+          TAG_KEY: ${{ secrets.TAG_KEY }}
+          SERIAL: ${{ needs.plan.outputs.serial }}
+        run: |
+          set -eu
+          umask 077
+          case "$SERIAL" in '' | *[!0-9]*) echo 'serial is digits only'; exit 1;; esac
+          d=$(mktemp -d /dev/shm/tag.XXXXXX)
+          trap 'shred -u "$d/key" 2>/dev/null || true; rm -rf "$d"' EXIT
+          printf '%s\n' "$TAG_KEY" > "$d/key"
+          printf '%s\n' "$GH_HOSTKEY" > "$d/known_hosts"
+          export GIT_SSH_COMMAND="/usr/bin/ssh -i $d/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$d/known_hosts -o GlobalKnownHostsFile=/dev/null -o HostKeyAlgorithms=ssh-ed25519"
+          git init -q "$d/repo"
+          git -C "$d/repo" fetch -q --depth 1 "git@github.com:$GITHUB_REPOSITORY.git" "$GITHUB_SHA"
+          [ "$(git -C "$d/repo" rev-parse FETCH_HEAD)" = "$GITHUB_SHA" ]
+          git -C "$d/repo" push -q "git@github.com:$GITHUB_REPOSITORY.git" "$GITHUB_SHA:refs/tags/install-$SERIAL"
+  publish:
+    needs: [plan, sign, tag]
+    if: github.ref == 'refs/heads/release'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -31,13 +207,29 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
         with:
           persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: install-stage
+          path: ${{ runner.temp }}/stage
       - env:
-          OWNER_PIN_PUB: ${{ vars.OWNER_PIN_PUB }}
-        run: umask 077 && printf '%s\n' "$OWNER_PIN_PUB" > "$RUNNER_TEMP/owner-pin.pub"
+          SERIAL: ${{ needs.plan.outputs.serial }}
+          PUB: ${{ needs.sign.outputs.pub }}
+          INSTALL_SIG: ${{ needs.sign.outputs.install_sig }}
+          KIT_SIG: ${{ needs.sign.outputs.kit_sig }}
+          PIN_SIG: ${{ needs.sign.outputs.pin_sig }}
+        run: |
+          set -eu
+          umask 077
+          d="$RUNNER_TEMP/stage/release/install-$SERIAL"
+          printf '%s' "$INSTALL_SIG" | base64 -d > "$d/install.json.sig"
+          printf '%s' "$KIT_SIG" | base64 -d > "$d/kit.json.sig"
+          printf '%s' "$PIN_SIG" | base64 -d > "$d/deploy-pin.json.sig"
+          printf '%s\n' "$PUB" > "$RUNNER_TEMP/owner.pub"
       - env:
-          SERIAL: ${{ inputs.serial }}
+          SERIAL: ${{ needs.plan.outputs.serial }}
           MIN_SERIAL: ${{ inputs.min_serial }}
           GH_TOKEN: ${{ github.token }}
-          IMMUTABLE_CONFIRMED: ${{ vars.IMMUTABLE_RELEASES_CONFIRMED }}
-          OWNER_PIN_SHA256: ${{ vars.OWNER_PIN_SHA256 }}
-        run: python3 bin/fleet-install-publish.py publish "release/install-$SERIAL" --owner-pub "$RUNNER_TEMP/owner-pin.pub" --min-serial "$MIN_SERIAL"
+          IMMUTABLE_CONFIRMED: ${{ needs.plan.outputs.immutable }}
+          OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}
+          KIT_HOST: ${{ env.KIT_HOST }}
+        run: cd "$RUNNER_TEMP/stage" && python3 "$GITHUB_WORKSPACE/bin/fleet-install-publish.py" publish "release/install-$SERIAL" --owner-pub "$RUNNER_TEMP/owner.pub" --min-serial "$MIN_SERIAL"

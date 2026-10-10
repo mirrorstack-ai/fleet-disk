@@ -800,8 +800,8 @@ class Workflows(unittest.TestCase):
         self.assertIn("if: github.ref == 'refs/heads/main'", self.DISK)
         self.assertIn('timeout-minutes: 60', self.DISK)
 
-    def test_the_release_job_runs_in_the_release_environment_and_the_if_is_not_called_a_boundary(self):
-        self.assertEqual(re.findall(r'(?m)^    environment: (\S+)$', self.DISK), ['release'])
+    def test_the_disk_job_runs_in_its_own_environment_never_the_signing_one_and_the_if_is_not_called_a_boundary(self):
+        self.assertEqual(re.findall(r'(?m)^    environment: (\S+)$', self.DISK), ['disk'])
         self.assertNotIn('never runs', self.DISK)
         self.assertIn('accidental dispatch', self.DISK)
 

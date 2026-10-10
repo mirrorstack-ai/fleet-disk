@@ -1,7 +1,7 @@
 # fleet-disk
 
 Public, pinned build artifacts for the MirrorStack fleet: the converted Ubuntu noble L1 disk (a VHDX for Hyper-V, a qcow2 for Linux,
-a zstd-compressed raw arm64 disk for vfkit on macOS) and the owner-signed install set (the `install-<serial>` releases).
+a zstd-compressed raw arm64 disk for vfkit on macOS) and the CI-signed install set (the `install-<serial>` releases).
 
 ## How a build runs
 
@@ -30,24 +30,49 @@ has no `codesign`.
 
 ## How an install set is released and verified
 
-The release inputs are committed here by PR under `release/install-<serial>/`: `install.json` and `.sig`, `kit.json` and
-`.sig`, the five kit files (`carrier-check.py`, `check.ps1`, `carrier-check.sh`, `verify-archive.py`, `VERIFY.txt`),
-`deploy-pin.json` and `.sig`, `.gitattributes`, `bootstrap.ps1` and `bootstrap.sh`. The bundle is never part of a release
+The release inputs are committed in the fleet repository under `release/install-<serial>/` and reach this repo only through
+that repository's `release` branch (a main to release pull request the owner merges): `install.json`, `kit.json`, the five kit
+files (`carrier-check.py`, `check.ps1`, `carrier-check.sh`, `verify-archive.py`, `VERIFY.txt`), `deploy-pin.json`,
+`.gitattributes`, `bootstrap.ps1` and `bootstrap.sh`, and no signature: CI makes those. The bundle is never part of a release
 here: the signed `bundle.url` is the invite-gated kit host's download of this serial, and a bundle file in the folder is
-refused as unlisted. The signatures are made on signed offline by the owner; nothing here holds a private key, and nothing here holds the owner's public key either (see below).
+refused as unlisted.
 
-Actions, then `install`, then Run workflow on `main` with `serial` and `min_serial` (the lowest serial this publish may
-carry, normally the previous release's). The job runs `bin/fleet-install-publish.py publish`, which refuses (exit 1,
-`REFUSED <code>`, never a value) unless all of this holds, checked offline before gh is called:
+Actions, then `install`, then Run workflow on the `release` branch (the only ref the jobs accept) with `serial` and
+`min_serial` (the lowest serial this publish may carry, normally the previous release's); `mode` pubkey only prints the
+signing key's public line and fingerprint. Four jobs run in order:
+
+- **plan** (Environment `release`, read-only deploy key `FLEET_READ` on the fleet repository, held in `/dev/shm` and wiped
+  by a trap on every path) reads the folder from the fleet `release` tip as git blobs, never a checkout. It refuses unless the folder is exactly the files above as plain files, the
+  serial fits the series (below), `KIT_HOST` is set, the key baked into both bootstraps has the fingerprint `KEY_SHA256`, and `install.json`'s
+  `source_head` and the pin's `head` are on that branch with the pin's `tree` that commit's tree. It runs every check below
+  but the signatures. The run summary shows the tree id, each file's blob id and sha256, `install.json` and
+  `deploy-pin.json` verbatim, the tag to be created, the hashes of the fleet commits since the previous release's source
+  and a `diff --stat` of `.github`, `bin` and `vendor` since the last `install-*` tag (hashes and public files only: these
+  logs are public). When the previous release's `source_head` cannot be read or its range cannot be listed the summary says
+  `UNKNOWN` and lists the newest 200 fleet commits, never an empty list. The three files to sign leave as base64 outputs with their sha256, the folder as an artifact.
+- **sign** (Environment `release`, secret `SIGN_KEY`) runs no repository code and no third-party action. It keeps the key in
+  `/dev/shm`, refuses unless `ssh-keygen -lf` of it equals the constant `KEY_SHA256` in `install.yml` (so it refuses while
+  that is a placeholder), re-hashes the bytes against the plan's sha256, signs `install.json` (namespace
+  `mirrorstack-fleet-install`), `kit.json` and `deploy-pin.json` (`mirrorstack-fleet-pin`), verifies each and wipes the key.
+- **tag** (Environment `release`, deploy key `TAG_KEY`) pushes the lightweight tag `install-<serial>` on this run's commit.
+- **publish** (no environment, no secret) adds the signatures to the plan's files and runs
+  `bin/fleet-install-publish.py publish` with the sign job's public line as `--owner-pub`.
+
+`publish` refuses (exit 1, `REFUSED <code>`, never a value) unless all of this holds, checked offline before gh is called:
 
 - `install.json.sig` verifies with `ssh-keygen -Y verify -n mirrorstack-fleet-install -I owner` against
-  the owner's public key (one `ssh-ed25519 <base64>[ comment]` line from the `release` environment, see "The owner's
-  key" below; the log prints its `SHA256:` fingerprint), and `install.json` has exactly the signed shape
+  the signing key's public line (one `ssh-ed25519 <base64>[ comment]` line from the sign job, held to `KEY_SHA256`, see
+  "The signing key" below; the log prints its `SHA256:` fingerprint), and `install.json` has exactly the signed shape
   (the rules are `vendor/manifest.py`, a byte-identical copy of the fleet's install manifest verifier; see "The vendored
   verifier" below);
 - the signed `bundle.url` is `https://<kit-host>/v1/kit/<serial>/bundle.tar` for this very serial and the host is not
-  GitHub's (`github.com`, `githubusercontent.com` or a name below them), else `form`;
-- its `serial` is the folder's and at least `min_serial`, and `valid_until` is at least 30 days away;
+  GitHub's (`github.com`, `githubusercontent.com` or a name below them), else `form`; and the host is exactly the constant
+  `KIT_HOST` of `.github/workflows/install.yml`, else `kit-host` (the bootstrap sends a helper's invite code to that host,
+  so which host it is a reviewed change to that file, like `KEY_SHA256`; plan and publish refuse `kit-host` while `KIT_HOST`
+  is not a lowercase DNS name, and `verify` by hand holds the host only when `KIT_HOST` is set);
+- its `serial` is the folder's and at least `min_serial`, and `valid_until` is at least 30 days away and at most 90 days
+  (`SERIES=test`) or 180 days (`release`) away, else `long-validity` (the expiry is the only way a baked key stops being
+  trusted, so a merged change cannot set it far out);
 - both bootstraps are byte-exact release assets: ASCII, LF only, no CR, no BOM (`boot-bytes`), so the asset is the git
   blob and its blob id is the sha1 of the raw bytes only (no CRLF variant). The LF rule is enforced on the bootstrap
   assets themselves; `.gitattributes` stays an exact published copy of the fleet repo's own file (which sets
@@ -57,7 +82,8 @@ carry, normally the previous release's). The job runs `bin/fleet-install-publish
   variable (a differently cased, scoped, indented or later assignment, `Set-Variable`, `read`, `export` and the like are
   refused; reading the variable is fine): the key must equal (type and base64) the owner key that verified
   `install.json`, and the expiry must have `valid_until`'s shape and be at least `valid_until` and at least 30 days from now
-  (`baked`; the placeholders `ssh-ed25519 UNBAKED` and 1970 are refused);
+  (`baked`; the placeholders `ssh-ed25519 UNBAKED` and 1970 are refused) and no further out than the same 90 or 180 days
+  (`long-validity`);
 - every asset is held to a size cap no larger than the bootstraps' own downloads: `install.json` 8192 bytes, each
   signature 4096, `kit.json` 65536, each kit file 4 MiB, `carrier-check.sh` 262144 (`size`); `kit.json`'s `python_zip`
   must be a `version` of the form `N.N.N` (one or two digits each) and a lowercase 64-hex `sha256` (`form`);
@@ -70,10 +96,14 @@ carry, normally the previous release's). The job runs `bin/fleet-install-publish
   no signature); the folder is exactly `release/install-<serial>` with a canonical serial (no leading zeros);
 - every file is read once into a private temporary copy, and the checks and the upload use that copy only.
 
-Then it refuses an existing tag or release `install-<serial>` or any serial not above the newest existing `install-N`
-release (`min_serial` stays an extra floor; any check it cannot answer refuses too), requires GitHub's
+The `SERIES` constant in `install.yml` decides which serials this key may carry: `test` below 1000, `release` 1000 and up
+(`series` otherwise). Then it requires the tag `install-<serial>` to exist as a lightweight tag on this run's commit
+(`tag-missing`, `tag-moved`; the tag job made it) and refuses a release of it (`tag-exists`) or any serial not above the
+newest existing `install-N` release (`min_serial` stays an extra floor; any check it cannot answer refuses too), requires GitHub's
 **Immutable releases** setting (read through the API before the release is created), creates the release with exactly
-those assets and reads GitHub's digests back: every asset must be there with the checked sha256, and nothing else.
+those assets and reads GitHub's digests back: every asset must be there with the checked sha256, and nothing else. The
+release body and the run summary carry `key SHA256:<fingerprint>` and, for each OS, the line a helper pastes (the same text
+the fleet makes for its `check` mode, pinned to this release's bootstrap sha256); helpers take lines from the release page.
 `python3 bin/fleet-install-publish.py verify <dir> --owner-pub <key file> --min-serial N` runs the offline half
 alone (no network, no gh, no repository variable). After the create it also requires the read-back release to say `immutable: true` and
 `draft: false` (`immutable-not-set` otherwise), so the owner's variable is only an early stop.
@@ -84,24 +114,24 @@ release. The pin may also not move back: when an `install-N` release exists, the
 lower, or if that previous pin cannot be read or is not a pin (a floor that cannot be read is no floor). The PC has no pin
 floor of its own, so this is one of the bounds on a pin rollback. The previous pin is that release's own asset (immutable,
 made by this publisher after it verified the signature), so it is not verified again, which keeps a key change possible.
-Not enforced here: that the kit host is a pinned one (the host is only held to a path shape and not to be one of GitHub's
-names; the signed sha256, size and pin tree bind the bundle), and that a first release under a new owner key follows a
-published handoff from the old key. The owner's own check of a release is `VERIFY.txt`'s `ssh-keygen` line.
+Not enforced here: that a first release under a new owner key follows a
+published handoff from the old key (a new key starts a new series instead: a serial-floor jump). The owner's own check of a
+release is `VERIFY.txt`'s `ssh-keygen` line.
 
 Immutable releases: the job's token usually cannot read the setting (it needs admin). Then the run stops with
 `immutable-unreadable` until the owner records their confirmation as the Environment variable
-`IMMUTABLE_RELEASES_CONFIRMED=yes` on `release`. A setting that reads as off always stops the run.
+`IMMUTABLE_RELEASES_CONFIRMED=yes` on `release` (the plan job passes it on to publish). A setting that reads as off always stops the run.
 
-## The owner's key
+## The signing key
 
-The key that verifies a release is not in this repo: a copy here would let a merged PR swap it. The owner sets it, once,
-as the variable `OWNER_PIN_PUB` of the Environment `release` (Settings, Environments, `release`, Environment variables):
-the whole public key line, `ssh-ed25519 <base64>` with an optional comment. The workflow writes it to a temporary file
-only the job can read (mode 0600) and passes the path as `--owner-pub`. The script refuses `key` when the variable is
-missing, is not exactly one such line, or, when the owner also sets `OWNER_PIN_SHA256` (the `SHA256:...` fingerprint from
-`ssh-keygen -lf`), when the key's fingerprint differs. The run log prints the fingerprint of the key it used (`owner key
-SHA256:...`): the owner compares it with their own key's. The bootstraps carry their own baked copy of the key; this
-variable is only what the publisher checks the release against. `--owner-pub PATH` stays for running `verify` locally.
+The key is a secret of the Environment `release` (`SIGN_KEY`, an unencrypted ssh-ed25519 private key), read by the sign job
+only. Its fingerprint is the constant `KEY_SHA256` in `.github/workflows/install.yml`, so which key signs is a reviewed
+change to a file on the `release` branch, never a setting; the sign job refuses `key-not-set` while it is not an `SHA256:`
+fingerprint and `key` when the secret's differs. The public key is not in this repo: the sign job prints it (`mode` pubkey,
+or the output `pub`) and the publisher takes it as `--owner-pub PATH`, refusing `key` unless the file is exactly one such
+line whose fingerprint equals `OWNER_PIN_SHA256` (the workflow sets it from the constant; `verify` may run without it).
+The run log prints the fingerprint of the key it used (`owner key SHA256:...`). The bootstraps carry their own baked copy
+of the key, which the plan job holds to the same constant.
 
 ## The vendored verifier
 
@@ -129,12 +159,13 @@ repository's `bin/fleet-install.py vendor-sync <this checkout>` says `OK vendor-
 
 ## One-time repo settings
 
-The workflow's `if: github.ref == 'refs/heads/main'` is an accident guard, not a boundary (a dispatched run uses its own
+The workflows' `if: github.ref == ...` lines are an accident guard, not a boundary (a dispatched run uses its own
 ref's workflow file). The real boundary is set in the repo, not in code:
 
-- Create the Environment `release` first (Settings, Environments), restricted to the `main` branch, with required
-  reviewers if wanted. If it does not exist, GitHub creates it on the first run with no restriction. Put the owner's key
-  in it (`OWNER_PIN_PUB`, see "The owner's key").
+- Create the Environment `release` first (Settings, Environments), restricted to the `release` branch with admins unable to
+  bypass, and put `SIGN_KEY`, `TAG_KEY` and `FLEET_READ` in it. The disk build has its own Environment `disk`
+  (restricted to `main`), so nothing about `release` gates or reaches it.
+- Rulesets: `release` takes pull requests from `main` only; the tags `install-*` only the `TAG_KEY` deploy key may create.
 - A ruleset on `main` that requires pull requests.
 - Settings, Releases, **Immutable releases** on.
 
