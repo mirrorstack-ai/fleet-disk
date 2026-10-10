@@ -1,0 +1,13 @@
+{
+  "name": "fleet-kit",
+  "private": true,
+  "type": "module",
+  "description": "Serverless kit host: Worker front + Gate Durable Object. No dependencies.",
+  "main": "run-tests.js",
+  "scripts": {
+    "test": "node --test run-tests.js"
+  },
+  "engines": {
+    "node": ">=22.15"
+  }
+}
