@@ -8,8 +8,11 @@
 # reaches a log, a summary, an artifact or the job's output, and is shredded when the step ends.
 #
 # The job has no token (permissions: {}), no environment, no secret and no third-party action. The dispatcher reads the
-# environment's public key (a read) and passes it in; `bin/fleet-keygen-put.py` then moves the printed sealed values into
-# the environment as secrets. The public lines go to the deploy-key settings (S4). Dispatch:
+# environment's public key (a read) and passes it in. The key is a free input, so the run proves nothing by itself: the log
+# also prints a recipient line (key_id and key, both public) and `bin/fleet-keygen-put.py --run <id> --sha <commit>` accepts
+# the run only if it is this workflow, dispatched on main at the reviewed commit, and sealed to the environment's CURRENT
+# key. It then PUTs the sealed values as secrets and prints the verified public lines for the deploy-key settings (S4).
+# Dispatch:
 #   gh api repos/mirrorstack-ai/fleet-disk/environments/release/secrets/public-key      (key_id and key)
 #   gh workflow run keygen.yml --ref main -f public_key=<key> -f key_id=<key_id>
 name: keygen
@@ -89,6 +92,7 @@ jobs:
           key_id = os.environ['KEY_ID']
           if not re.fullmatch(r'[0-9]{1,32}', key_id):
               sys.exit('refused: key_id is not digits')
+          emit('RECIPIENT', key_id, base64.b64encode(public).decode('ascii'))  # public; the helper compares it to the environment
           box = SealedBox(PublicKey(public))
           for name in NAMES:
               path = os.path.join(os.environ['KEYDIR'], name)
