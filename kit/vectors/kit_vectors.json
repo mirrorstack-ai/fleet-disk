@@ -1,0 +1,79 @@
+{
+  "format": "kit-vectors-v1",
+  "about": [
+    "Shared decision vectors for the kit host (H3, H10, H10b): the Python kit-serve (tests/gw/test_kitserve.py) and the kit Worker's Gate and front (fleet-disk kit/*.test.js) must give the same answer to each one. Not yet vendored: K4, K5 and K7 merged without a copy, so today the Worker's own tests (kit/gate-core.test.js, kit/worker.test.js) and the K6 staging replay hold these rules by hand, and nothing runs this file against the Worker. Gap G-K3-1 is the fleet-disk slice that vendors it with a sha256 pin line, a test that fails when the file changes without it and a vendor-sync check, as manifest.py has in fleet/install/VENDORED.sha256.",
+    "A vector holds no code literal. 'code' is a kind, built at run time by whoever runs it: valid = the code the invite called valid holds; other = the code of the second invite; unknown = a well-formed code no invite holds; none = no Authorization header; short = 'abc'; long = the valid code plus 'X'; lower = the valid code lower-cased (a runner must make sure the valid code holds a letter: digits only are the same lower-cased, and that request would be a valid one).",
+    "base is the world every answer starts from (times are seconds; the Gate counts milliseconds, multiply by 1000). invites.<id> holds tier, lo and hi (the install serials it opens), ttl (seconds from now to expiry) and cap (bundle.tar downloads). 'set' changes the world for one vector: floor, bundles (the serials that have a bundle.tar and the gateway pair) and invites.<id> fields, merged one level deep.",
+    "req defaults to {method GET, serial 7, name bundle.tar, src 192.0.2.1, code valid}; 'target' replaces the path, verbatim. layer 'front' is the part the Worker answers before it calls the Gate (no budget is spent there, D1; kit-serve spends one); layer 'gate' is the Gate's own decision, taking a well-formed code. status is the HTTP status. A runner sends the request as bytes through the real front or handler, so the Authorization header is really parsed: no vector may call the decision function with a ready-made code.",
+    "headers is the one shape the invite may have: each case holds raw [name, value] header pairs, values with {valid} and {other} placeholders filled in at run time. Exactly one `Authorization: FleetInvite <code>` header (the scheme in that case, one space) opens a file; the old X-Fleet-Invite header, Bearer, a missing, doubled or tab space, another case, a bare scheme, a doubled Authorization header (same code or two) and one comma-joined value are all the 404. A Worker that reads headers.get('authorization') gets duplicates comma-joined, so a lenient parse is the natural bug these pin.",
+    "counters and budgets are sequences against ONE world: a step is a req (plus at: seconds after base.now, cut: the client drops the connection after the head and the first bytes, times: repeat, src_each: repeat for each source) and the status it must get; a cut download answers its decision (200) and gives its count back. Budgets are the real numbers: 30 failed guesses an hour per source, 600 in all. A runner compares the whole answer, not only the status: every 404 is the same bytes (headers and body) as every other 404, in answers, counters and budgets alike, and every 429 the same as every other 429 (a valid code from a spent source included).",
+    "known_differences lists what the two hosts do NOT share, so nobody adds a vector for it."
+  ],
+  "base": {"now": 1000000, "floor": 5, "bundles": [7, 8], "invites": {"valid": {"tier": "install", "lo": 5, "hi": 7, "ttl": 3600, "cap": 10}, "other": {"tier": "install", "lo": 5, "hi": 7, "ttl": 3600, "cap": 10}}},
+  "answers": [
+    {"name": "valid-bundle.tar", "layer": "gate", "req": {"name": "bundle.tar"}, "status": 200},
+    {"name": "valid-gateway.json", "layer": "gate", "req": {"name": "gateway.json"}, "status": 200},
+    {"name": "valid-gateway.json.sig", "layer": "gate", "req": {"name": "gateway.json.sig"}, "status": 200},
+    {"name": "second-invite", "layer": "gate", "req": {"code": "other"}, "status": 200},
+    {"name": "update-tier-opens-the-same-files", "layer": "gate", "set": {"invites": {"valid": {"tier": "update"}}}, "req": {}, "status": 200},
+    {"name": "last-serial-of-the-range", "layer": "gate", "req": {"serial": 7}, "status": 200},
+    {"name": "first-serial-of-the-range", "layer": "gate", "set": {"bundles": [5, 7, 8]}, "req": {"serial": 5}, "status": 200},
+    {"name": "at-the-floor", "layer": "gate", "set": {"floor": 7}, "req": {}, "status": 200},
+    {"name": "unknown-code", "layer": "gate", "req": {"code": "unknown"}, "status": 404},
+    {"name": "expired", "layer": "gate", "set": {"invites": {"valid": {"ttl": 0}}}, "req": {}, "status": 404},
+    {"name": "one-second-left", "layer": "gate", "set": {"invites": {"valid": {"ttl": 1}}}, "req": {}, "status": 200},
+    {"name": "below-floor", "layer": "gate", "set": {"floor": 8}, "req": {}, "status": 404},
+    {"name": "above-the-range", "layer": "gate", "req": {"serial": 8}, "status": 404},
+    {"name": "below-the-range", "layer": "gate", "set": {"bundles": [4, 7, 8], "floor": 4}, "req": {"serial": 4}, "status": 404},
+    {"name": "serial-without-a-bundle", "layer": "gate", "set": {"invites": {"valid": {"hi": 9}}}, "req": {"serial": 9}, "status": 404},
+    {"name": "no-header", "layer": "front", "req": {"code": "none"}, "status": 404},
+    {"name": "short-code", "layer": "front", "req": {"code": "short"}, "status": 404},
+    {"name": "long-code", "layer": "front", "req": {"code": "long"}, "status": 404},
+    {"name": "lower-case-code", "layer": "front", "req": {"code": "lower"}, "status": 404},
+    {"name": "post", "layer": "front", "req": {"method": "POST"}, "status": 404},
+    {"name": "head", "layer": "front", "req": {"method": "HEAD"}, "status": 404},
+    {"name": "junk-path", "layer": "front", "req": {"target": "/x"}, "status": 404},
+    {"name": "path /v1/kit/7/../floor", "layer": "front", "req": {"target": "/v1/kit/7/../floor"}, "status": 404},
+    {"name": "path /v1/kit/7/serve.json", "layer": "front", "req": {"target": "/v1/kit/7/serve.json"}, "status": 404},
+    {"name": "path /v1/kit/7/invites.json", "layer": "front", "req": {"target": "/v1/kit/7/invites.json"}, "status": 404},
+    {"name": "path /v1/kit/7/%2e%2e/floor", "layer": "front", "req": {"target": "/v1/kit/7/%2e%2e/floor"}, "status": 404},
+    {"name": "path /v1/kit/07/bundle.tar/", "layer": "front", "req": {"target": "/v1/kit/07/bundle.tar/"}, "status": 404},
+    {"name": "path /v1/kit/7/bundle.tar?x=1", "layer": "front", "req": {"target": "/v1/kit/7/bundle.tar?x=1"}, "status": 404}
+  ],
+  "headers": [
+    {"name": "exactly-one-header", "headers": [["Authorization", "FleetInvite {valid}"]], "status": 200},
+    {"name": "old-X-Fleet-Invite-header", "headers": [["X-Fleet-Invite", "{valid}"]], "status": 404},
+    {"name": "bearer-scheme", "headers": [["Authorization", "Bearer {valid}"]], "status": 404},
+    {"name": "no-space", "headers": [["Authorization", "FleetInvite{valid}"]], "status": 404},
+    {"name": "two-spaces", "headers": [["Authorization", "FleetInvite  {valid}"]], "status": 404},
+    {"name": "tab-for-the-space", "headers": [["Authorization", "FleetInvite\t{valid}"]], "status": 404},
+    {"name": "lower-case-scheme", "headers": [["Authorization", "fleetinvite {valid}"]], "status": 404},
+    {"name": "upper-case-scheme", "headers": [["Authorization", "FLEETINVITE {valid}"]], "status": 404},
+    {"name": "bare-scheme", "headers": [["Authorization", "FleetInvite"]], "status": 404},
+    {"name": "bare-scheme-and-space", "headers": [["Authorization", "FleetInvite "]], "status": 404},
+    {"name": "doubled-header-same-code", "headers": [["Authorization", "FleetInvite {valid}"], ["Authorization", "FleetInvite {valid}"]], "status": 404},
+    {"name": "doubled-header-two-codes", "headers": [["Authorization", "FleetInvite {valid}"], ["Authorization", "FleetInvite {other}"]], "status": 404},
+    {"name": "doubled-header-bad-then-valid", "headers": [["Authorization", "Bearer x"], ["Authorization", "FleetInvite {valid}"]], "status": 404},
+    {"name": "comma-joined-same-code", "headers": [["Authorization", "FleetInvite {valid}, FleetInvite {valid}"]], "status": 404},
+    {"name": "comma-joined-two-codes", "headers": [["Authorization", "FleetInvite {other}, FleetInvite {valid}"]], "status": 404},
+    {"name": "code-then-trailing-text", "headers": [["Authorization", "FleetInvite {valid}, x"]], "status": 404}
+  ],
+  "counters": [
+    {"name": "the cap counts bundle.tar only", "set": {"invites": {"valid": {"cap": 2}}}, "steps": [{"req": {"name": "gateway.json"}, "times": 3, "status": 200}, {"req": {"name": "gateway.json.sig"}, "times": 3, "status": 200}, {"req": {}, "times": 2, "status": 200}, {"req": {}, "status": 404}]},
+    {"name": "the tenth download is the last", "steps": [{"req": {}, "times": 10, "status": 200}, {"req": {}, "status": 404}, {"req": {"code": "other"}, "status": 200}]},
+    {"name": "spent is spent: after the cap the bundle is the same 404, and another invite still opens", "set": {"invites": {"valid": {"cap": 1}}}, "steps": [{"req": {}, "status": 200}, {"req": {}, "status": 404}, {"req": {"code": "other"}, "status": 200}]},
+    {"name": "a cut download is given back", "set": {"invites": {"valid": {"cap": 1}}}, "steps": [{"req": {}, "cut": true, "times": 2, "status": 200}, {"req": {}, "status": 200}, {"req": {}, "status": 404}]}
+  ],
+  "budgets": [
+    {"name": "30 failures from one source spend its budget, a valid code from it is the same 429, another source is unaffected", "steps": [{"req": {"code": "unknown"}, "times": 30, "status": 404}, {"req": {}, "status": 429}, {"req": {"code": "unknown"}, "status": 429}, {"req": {"src": "192.0.2.9"}, "status": 200}]},
+    {"name": "600 failures in all are a 429 for everyone", "steps": [{"req": {"code": "unknown"}, "src_each": ["198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4", "198.51.100.5", "198.51.100.6", "198.51.100.7", "198.51.100.8", "198.51.100.9", "198.51.100.10", "198.51.100.11", "198.51.100.12", "198.51.100.13", "198.51.100.14", "198.51.100.15", "198.51.100.16", "198.51.100.17", "198.51.100.18", "198.51.100.19", "198.51.100.20"], "times": 29, "status": 404}, {"req": {"code": "unknown", "src": "198.51.100.200"}, "times": 20, "status": 404}, {"req": {"src": "203.0.113.7"}, "status": 429}, {"req": {"src": "192.0.2.1"}, "status": 429}]},
+    {"name": "the budget is an hour: spent at 50 minutes, free after two hours", "set": {"invites": {"valid": {"ttl": 100000}}}, "steps": [{"req": {"code": "unknown"}, "times": 30, "status": 404}, {"req": {}, "at": 3000, "status": 429}, {"req": {}, "at": 7200, "status": 200}]}
+  ],
+  "known_differences": [
+    "kit-serve spends one failure on a malformed request; the Worker front answers it with no Gate call and no budget (H10b D1).",
+    "kit-serve gives back any number of cut downloads; the Gate at most 3 per invite. The Gate's ceilings (16 open invites, 72 h, 10 downloads) are not kit-serve's.",
+    "kit-serve budgets by exact second and IPv4 address; the Gate by 10-minute buckets and a /32 or /64 source key (D3, D4). A vector may not sit on a bucket edge.",
+    "the serial of a gateway pair: kit-serve lists one pair per install serial; the Gate holds one active pair by its own gateway serial.",
+    "a spent invite's gateway pair: kit-serve answers the 404 once the cap is spent; the Gate serves the pair until the invite expires or is revoked, because the cap counts bundle.tar only (spec: the gateway files never count against the cap; fleet-disk kit/gate-core.js and the K6 staging replay hold it). kit-serve is retired at K12, so the Gate's rule is the one that stays."
+  ]
+}
