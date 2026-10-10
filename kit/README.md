@@ -89,3 +89,19 @@ budget. Once the signature is good, replies are JSON and may say why (400 bad-re
 
 (a) a real client cut fires the release; (c) R2 refuses wrong bytes and overwrites (a second put of different bytes to an existing key returns null on real R2, and the wildcard `etagDoesNotMatch: '*'` is honoured); (d) the
 Free over-quota status; (g) CPU time. The unit tests use stand-ins and say nothing about these.
+
+## Shared decision vectors (G-K3-1)
+
+`vectors/kit_vectors.json` is a byte-exact copy of `tests/gw/kit_vectors.json` in mirrorstack-fleet, the file the
+Python kit-serve also runs, so the Worker cannot drift from this pinned copy unseen before K12 retires kit-serve.
+The other half of the sync is in the fleet repo: `tests/gw/test_kitserve.py` holds its file to the same sha256
+(`VENDORED_SHA256`), so a change there fails until this copy, its pin line and that constant move together. The Request and Headers classes normalise what the tests hand them
+(as the Workers runtime does), so `path /v1/kit/7/../floor`, `%2e%2e` and `bare-scheme-and-space` arrive normalised;
+a separate test hands the Worker a raw dot-segment URL.
+`vectors/VENDORED.sha256` pins the copy (`<sha256>  kit_vectors.json  mirrorstack-fleet@<sha> <path>`).
+`vectors.test.js` fails if the copy changed without the pin, then sends every answer, header, counter and budget
+vector as a request through the real Worker front and Gate, and compares the status and, for every 404 and 429, the
+exact headers and bytes. Its `DIVERGES` list holds any vector the Worker answers differently (skipped with the reason,
+never weakened); what the hosts do not share is the file's `known_differences`, never asserted. To update: copy the
+new file over `vectors/kit_vectors.json`, write the new pin line (`shasum -a 256`, the fleet commit, the path), and
+run `node --test kit/`.
