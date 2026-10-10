@@ -169,6 +169,22 @@ ref's workflow file). The real boundary is set in the repo, not in code:
 - A ruleset on `main` that requires pull requests.
 - Settings, Releases, **Immutable releases** on.
 
+## Test-phase keys (keygen)
+
+`.github/workflows/keygen.yml` is test-grade and is never used for R, the real release key. One dispatch on `main` makes three
+ed25519 keys inside a GitHub-hosted job, in tmpfs: `SIGN_KEY` (T, the test signing key), `TAG_KEY` (the test-phase `install-*`
+tag deploy key) and `FLEET_READ` (the read-only deploy key on mirrorstack-fleet). Each private half is sealed to the public key
+of the Environment `release` (libsodium sealed box, PyNaCl installed with `--require-hashes`) and the job prints only the sealed
+values, the public lines and the fingerprints (`KEYGEN-SEALED`, `KEYGEN-PUBLIC`, `KEYGEN-FINGERPRINT`). The plaintext never
+leaves the runner, and the job has no token, no environment and no secret.
+
+1. Read the environment's public key: `gh api repos/mirrorstack-ai/fleet-disk/environments/release/secrets/public-key`.
+2. Dispatch: `gh workflow run keygen.yml --ref main -f public_key=<key> -f key_id=<key_id>`.
+3. `gh run view <id> --log | bin/fleet-keygen-put.py --dry-run`, then again without `--dry-run`. The helper only moves
+   already-sealed values: it refuses anything that is not exactly three sealed boxes of the right length, or a stale `key_id`.
+
+The public lines go to the deploy-key settings and the fingerprint into `install.yml` later.
+
 ## Tests
 
 `python3 -m unittest discover -s tests` (stdlib only, no network, no qemu, no real gh; the signature tests use a throwaway
