@@ -1,7 +1,7 @@
 // The shared kit decision vectors (vectors/kit_vectors.json, vendored from mirrorstack-fleet, pinned in
 // vectors/VENDORED.sha256) run against the Worker's real front and the real Gate over fake storage. The Python
 // kit-serve runs the same file (tests/gw/test_kitserve.py, class Vectors), so the Worker cannot drift from this pinned
-// copy unseen. (That the copy itself still equals the fleet file is a fleet-side vendor-sync check, not built here.)
+// copy unseen; the fleet's test_kitserve.py holds its file to the same pin (VENDORED_SHA256), the other half of the sync.
 // Format and semantics: the file's own `about`. Never asserted here: its `known_differences`.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

@@ -94,8 +94,8 @@ Free over-quota status; (g) CPU time. The unit tests use stand-ins and say nothi
 
 `vectors/kit_vectors.json` is a byte-exact copy of `tests/gw/kit_vectors.json` in mirrorstack-fleet, the file the
 Python kit-serve also runs, so the Worker cannot drift from this pinned copy unseen before K12 retires kit-serve.
-Not built here: a vendor-sync check that the copy still equals the fleet file (a fleet-side follow-up, as for
-`manifest.py`); until it lands G-K3-1 is half closed. The Request and Headers classes normalise what the tests hand them
+The other half of the sync is in the fleet repo: `tests/gw/test_kitserve.py` holds its file to the same sha256
+(`VENDORED_SHA256`), so a change there fails until this copy, its pin line and that constant move together. The Request and Headers classes normalise what the tests hand them
 (as the Workers runtime does), so `path /v1/kit/7/../floor`, `%2e%2e` and `bare-scheme-and-space` arrive normalised;
 a separate test hands the Worker a raw dot-segment URL.
 `vectors/VENDORED.sha256` pins the copy (`<sha256>  kit_vectors.json  mirrorstack-fleet@<sha> <path>`).
