@@ -1,0 +1,115 @@
+# TEST-GRADE keys, made inside GitHub so the private halves never exist on a person's machine. NEVER used for R, the real
+# release key: R is made by the owner on the phone only after the identity split (spec ci-signing-2026-10-10, G0).
+#
+# One dispatch makes three ed25519 keys on a GitHub-hosted runner, in tmpfs: SIGN_KEY (T, the test signing key), TAG_KEY
+# (the test-phase install-* tag deploy key) and FLEET_READ (the read-only deploy key on mirrorstack-fleet). Each private
+# half is sealed (libsodium sealed box) to the public key of this repo's Environment `release`, whose private half only
+# GitHub holds, and only the sealed values, the public key lines and the fingerprints are printed. The plaintext never
+# reaches a log, a summary, an artifact or the job's output, and is shredded when the step ends.
+#
+# The job has no token (permissions: {}), no environment, no secret and no third-party action. The dispatcher reads the
+# environment's public key (a read) and passes it in. The key is a free input, so the run proves nothing by itself: the log
+# also prints a recipient line (key_id and key, both public) and `bin/fleet-keygen-put.py --run <id> --sha <commit>` accepts
+# the run only if it is this workflow, dispatched on main at the reviewed commit, and sealed to the environment's CURRENT
+# key. It then PUTs the sealed values as secrets and prints the verified public lines for the deploy-key settings (S4).
+# Dispatch:
+#   gh api repos/mirrorstack-ai/fleet-disk/environments/release/secrets/public-key      (key_id and key)
+#   gh workflow run keygen.yml --ref main -f public_key=<key> -f key_id=<key_id>
+name: keygen
+on:
+  workflow_dispatch:
+    inputs:
+      public_key:
+        description: the Environment release's secrets public key (the `key` field, base64 of 32 bytes)
+        required: true
+      key_id:
+        description: the matching `key_id` (digits)
+        required: true
+permissions: {}
+concurrency:
+  group: keygen
+jobs:
+  keygen:
+    # `if` only stops an accidental dispatch from a branch; it is not a boundary (a run uses its own ref's workflow file).
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Install PyNaCl from pinned hashes
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/venv"
+          cat > "$RUNNER_TEMP/requirements.txt" <<'REQ'
+          pynacl==1.6.2 \
+              --hash=sha256:22de65bb9010a725b0dac248f353bb072969c94fa8d6b1f34b87d7953cf7bbe4 \
+              --hash=sha256:8a66d6fb6ae7661c58995f9c6435bda2b1e68b54b598a6a10247bfcdadac996c \
+              --hash=sha256:c8a231e36ec2cab018c4ad4358c386e36eede0319a0c41fed24f840b1dac59f6
+          cffi==2.1.1 \
+              --hash=sha256:c1453022f490d2459a11819d83ad1d586e9ff65a12ac3e705ffebd46d3685dcf \
+              --hash=sha256:a931079504ecc49efed7744c476a5c343a92fabf66dec2db95edb1b2fdc770e2
+          pycparser==3.11 \
+              --hash=sha256:51d5a8ba2be0bbe440b99d2112604c95bbbc3c2748a64260186c541e1729cd80
+          REQ
+          "$RUNNER_TEMP/venv/bin/pip" install --disable-pip-version-check --require-hashes --only-binary=:all: --no-deps -r "$RUNNER_TEMP/requirements.txt"
+      - name: Make the keys, seal them and print only the sealed values
+        env:
+          PUBLIC_KEY: ${{ inputs.public_key }}
+          KEY_ID: ${{ inputs.key_id }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KEYDIR=$(mktemp -d /dev/shm/keygen.XXXXXX)
+          export KEYDIR
+          trap 'find "$KEYDIR" -type f -exec shred -u {} +; rm -rf "$KEYDIR"' EXIT
+          test "$(stat -f -c %T "$KEYDIR")" = tmpfs
+          for name in SIGN_KEY TAG_KEY FLEET_READ; do
+            ssh-keygen -q -t ed25519 -N '' -C '' -f "$KEYDIR/$name"
+          done
+          "$RUNNER_TEMP/venv/bin/python" - <<'PY'
+          import base64
+          import os
+          import re
+          import subprocess
+          import sys
+
+          from nacl.public import PublicKey, SealedBox
+
+          NAMES = ('SIGN_KEY', 'TAG_KEY', 'FLEET_READ')
+          PLAIN_LEN = 387  # an unencrypted, comment-less OpenSSH ed25519 private key file; anything else is refused
+          lines = []
+
+
+          def emit(kind, name, value):
+              lines.append('KEYGEN-%s %s %s' % (kind, name, value))
+
+
+          try:
+              public = base64.b64decode(os.environ['PUBLIC_KEY'], validate=True)
+          except ValueError:
+              sys.exit('refused: public_key is not base64')
+          if len(public) != 32:
+              sys.exit('refused: public_key is not 32 bytes')
+          key_id = os.environ['KEY_ID']
+          if not re.fullmatch(r'[0-9]{1,32}', key_id):
+              sys.exit('refused: key_id is not digits')
+          emit('RECIPIENT', key_id, base64.b64encode(public).decode('ascii'))  # public; the helper compares it to the environment
+          box = SealedBox(PublicKey(public))
+          for name in NAMES:
+              path = os.path.join(os.environ['KEYDIR'], name)
+              with open(path, 'rb') as handle:
+                  secret = handle.read()
+              if len(secret) != PLAIN_LEN or not secret.startswith(b'-----BEGIN OPENSSH PRIVATE KEY-----\n'):
+                  sys.exit('refused: %s is not the expected private key file' % name)
+              sealed = box.encrypt(secret)
+              if len(sealed) != PLAIN_LEN + 48:
+                  sys.exit('refused: %s did not seal to the expected length' % name)
+              emit('SEALED', name, '%s %s' % (key_id, base64.b64encode(sealed).decode('ascii')))
+              with open(path + '.pub', encoding='ascii') as handle:
+                  emit('PUBLIC', name, ' '.join(handle.read().split()[:2]))
+              shown = subprocess.run(['ssh-keygen', '-lf', path + '.pub'], check=True, capture_output=True, text=True)
+              emit('FINGERPRINT', name, shown.stdout.split()[1])
+          print('\n'.join(lines))
+          PY
+      - name: Shred anything left in tmpfs
+        if: always()
+        run: find /dev/shm -maxdepth 2 -path '/dev/shm/keygen.*' -type f -exec shred -u {} + || true

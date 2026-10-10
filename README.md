@@ -169,6 +169,29 @@ ref's workflow file). The real boundary is set in the repo, not in code:
 - A ruleset on `main` that requires pull requests.
 - Settings, Releases, **Immutable releases** on.
 
+## Test-phase keys (keygen)
+
+`.github/workflows/keygen.yml` is test-grade and is never used for R, the real release key. One dispatch on `main` makes three
+ed25519 keys inside a GitHub-hosted job, in tmpfs: `SIGN_KEY` (T, the test signing key), `TAG_KEY` (the test-phase `install-*`
+tag deploy key) and `FLEET_READ` (the read-only deploy key on mirrorstack-fleet). Each private half is sealed to the public key
+of the Environment `release` (libsodium sealed box, PyNaCl installed with `--require-hashes`) and the job prints only the sealed
+values, the public lines and the fingerprints (`KEYGEN-SEALED`, `KEYGEN-PUBLIC`, `KEYGEN-FINGERPRINT`) and the recipient
+key it sealed to (`KEYGEN-RECIPIENT`, public). The plaintext never
+leaves the runner, and the job has no token, no environment and no secret.
+
+1. Read the environment's public key: `gh api repos/mirrorstack-ai/fleet-disk/environments/release/secrets/public-key`.
+2. Dispatch: `gh workflow run keygen.yml --ref main -f public_key=<key> -f key_id=<key_id>`, and note the run id and the
+   commit of `keygen.yml` that was reviewed.
+3. `bin/fleet-keygen-put.py --run <id> --sha <commit> --dry-run`, then again without `--dry-run`. The public key is a free
+   input of the workflow, so the helper does not trust the run: it fetches the log itself and refuses unless the run is
+   `keygen.yml`, a `workflow_dispatch` on `main`, successful, at exactly `<commit>`, and its `KEYGEN-RECIPIENT` line (key_id
+   and key) equals what the environment's public-key endpoint returns now. It also refuses anything that is not exactly three
+   sealed boxes of the right length. Racing a `gh run list` is therefore safe: a wrong run is refused, not used.
+4. The helper prints the verified `KEYGEN-PUBLIC` and `KEYGEN-FINGERPRINT` lines; the deploy-key settings and the bake step
+   take the public halves from that output, never from a separate look at the log.
+
+The verified public lines go to the deploy-key settings and the fingerprint into `install.yml` later.
+
 ## Tests
 
 `python3 -m unittest discover -s tests` (stdlib only, no network, no qemu, no real gh; the signature tests use a throwaway
