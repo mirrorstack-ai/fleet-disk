@@ -2380,7 +2380,7 @@ class Workflow(unittest.TestCase):
     def test_the_key_fingerprint_series_and_host_key_are_constants_of_the_file(self):
         env = dict(re.findall(r'(?m)^  ([A-Z_0-9]+): (.*)$', self.TEXT.split('\njobs:\n', 1)[0].split('\nenv:\n', 1)[1]))
         self.assertEqual(set(env), {'KEY_SHA256', 'SERIES', 'KIT_HOST', 'FLEET_REPO', 'GH_HOSTKEY'})
-        self.assertIsNone(fp.FPR.fullmatch(env['KEY_SHA256']))  # still the placeholder: the sign job refuses it
+        self.assertIsNotNone(fp.FPR.fullmatch(env['KEY_SHA256']))  # the test key T (keygen run 38032458890)
         with self.assertRaises(fp.Refused):  # and so is the kit host: plan and publish refuse `kit-host` until it is set
             fp.check_kit_host(env['KIT_HOST'])
         self.assertEqual(self.TEXT.count('KIT_HOST: ${{ env.KIT_HOST }}'), 4)  # handed to plan, kit, publish and floor as env

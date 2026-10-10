@@ -41,9 +41,9 @@ concurrency:
   # a floor run (the break-glass for a bad serial) never queues behind, or replaces, a release run, and a newer dispatch never cancels a running one
   group: ${{ inputs.mode == 'floor' && 'install-floor' || 'install' }}
 env:
-  # Filled in by hand once the key exists: the `ssh-keygen -lf` fingerprint of the key in SIGN_KEY. While it is not a
-  # fingerprint the sign job refuses.
-  KEY_SHA256: SHA256:NOT-SET-fill-in-after-keygen
+  # The `ssh-keygen -lf` fingerprint of the key in SIGN_KEY: the test key T, made inside GitHub by the keygen run
+  # 38032458890 (2026-10-10, its line KEYGEN-FINGERPRINT SIGN_KEY). The release key replaces it by a reviewed change.
+  KEY_SHA256: SHA256:16jB0ih9afmAW7rFmgTJVtarDgEv4w/DHA8LKufWhKM
   # test: serials below 1000 (the test key); release: serials 1000 and up (the release key)
   SERIES: test
   # Filled in by hand: the one host install.json's signed bundle.url may name (the bootstrap sends a helper's invite code
