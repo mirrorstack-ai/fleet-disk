@@ -1,0 +1,148 @@
+# Deploys the serverless kit host (kit/: the Worker front and the Gate Durable Object) to the Cloudflare account
+# mirrorstack-fleet: first to the staging twin fleet-kit-staging, where the kit-serve vectors are replayed over HTTP, then to
+# fleet-kit, where a hostile probe checks that every refusal is the same bytes. Runs only on this repo's `release` branch.
+#
+#   verify   no environment, no secret: the kit's own tests, the console.* scan, this workflow's script tests.
+#   deploy   in the Environment `kit-deploy` (release branch only, the owner approves, admins cannot bypass). That Environment
+#            holds the only Cloudflare credential there is: an account token that edits the two kit Workers and nothing else
+#            (the secret CLOUDFLARE_API_TOKEN, the variable CLOUDFLARE_ACCOUNT_ID). It is the one credential that could read the
+#            bundle or log invite codes, so it is on exactly the steps that call Cloudflare and never on the install, the
+#            replay or the probe.
+#
+# Order, and why: the staging deploy uses throwaway Ed25519 admin keys and a throwaway pepper made in this job (nothing of
+# production's is on staging); the replay and the settings read-back must pass BEFORE production is touched; the real
+# INVITE_PEPPER is made once, only if `wrangler secret list` lacks it, straight from openssl into `wrangler secret put` (never
+# a file, never echoed, never on a Mac). The phone break-glass variables (KIT_DISABLED, KIT_FLOOR) are never set here and the
+# config keeps them across deploys. Inputs: none. Hosts: the two workers.dev names (no route, no custom domain).
+#
+# Left to the owner's monthly look, on purpose: the R2 side of the guarded surface (r2.dev public URL off, no custom domain on
+# the bucket, no S3 token). The deploy token has no R2 permission, so the settings gate cannot read them. The replay's
+# measurements (b) isolate restart and (d) 100000 requests a day cannot be taken over HTTP and are printed as unmeasured.
+# The pepper is made only on exit 10 of has-secret ("the list parsed and lacks the name"); every other code refuses.
+name: kit-deploy
+on:
+  push:
+    branches: [release]
+    paths: ["kit/**", "bin/fleet-kit-check.py", ".github/workflows/kit-deploy.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: kit-deploy
+  cancel-in-progress: false
+env:
+  STAGING_URL: https://fleet-kit-staging.mirrorstack-fleet.workers.dev
+  PROD_URL: https://fleet-kit.mirrorstack-fleet.workers.dev
+  CI: "true"
+  WRANGLER_SEND_METRICS: "false"
+  NO_UPDATE_NOTIFIER: "1"
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "22"
+      - run: node --test kit/
+      - run: python3 bin/fleet-kit-check.py console kit
+      - run: python3 -m unittest discover -s tests -p 'test_kit_deploy.py'
+  deploy:
+    # `if` only stops an accidental dispatch from another branch; the boundary is the Environment (release branch only).
+    if: github.ref == 'refs/heads/release'
+    needs: verify
+    environment: kit-deploy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "22"
+      # Pinned by kit/package-lock.json; lifecycle scripts never run. No Cloudflare credential is in this step.
+      - name: Install wrangler from the lockfile
+        working-directory: kit
+        run: npm ci --ignore-scripts
+      - name: Check the environment
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo "REFUSED the kit-deploy Environment has no CLOUDFLARE_API_TOKEN"; exit 1; }
+          test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo "REFUSED the kit-deploy Environment has no CLOUDFLARE_ACCOUNT_ID"; exit 1; }
+      # Two Ed25519 keys (upload, gateway) that exist only in this job. Their public halves are public values.
+      - name: Make the throwaway admin keys
+        run: |
+          set -euo pipefail
+          KIT_GATE_DIR="$RUNNER_TEMP/kitgate"
+          { echo "KIT_GATE_DIR=$KIT_GATE_DIR"; python3 bin/fleet-kit-check.py keys "$KIT_GATE_DIR"; } >> "$GITHUB_ENV"
+      - name: Deploy staging
+        working-directory: kit
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --no-install wrangler deploy --env staging --var "KIT_GW_PUB:$KIT_GW_PUB" --var "KIT_UP_PUB:$KIT_UP_PUB"
+      - name: Set the staging INVITE_PEPPER (throwaway, new every run)
+        working-directory: kit
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          openssl rand -hex 32 | npx --no-install wrangler secret put INVITE_PEPPER --env staging
+      - name: Settings gate, staging
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: python3 bin/fleet-kit-check.py settings fleet-kit-staging
+      - name: Replay the kit-serve vectors on staging
+        run: python3 bin/fleet-kit-check.py replay "$STAGING_URL"
+      - name: INVITE_PEPPER once, production
+        working-directory: kit
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npx --no-install wrangler secret list --format json > "$RUNNER_TEMP/secret-names.json"
+          rc=0
+          python3 "$GITHUB_WORKSPACE/bin/fleet-kit-check.py" has-secret INVITE_PEPPER < "$RUNNER_TEMP/secret-names.json" || rc=$?
+          rm -f "$RUNNER_TEMP/secret-names.json"
+          case "$rc" in
+            0) echo "INVITE_PEPPER is already set" ;;
+            10) echo "INVITE_PEPPER is missing: making it once"
+                openssl rand -hex 32 | npx --no-install wrangler secret put INVITE_PEPPER ;;
+            *) echo "REFUSED the secret list could not be read (exit $rc)"; exit 1 ;;
+          esac
+      - name: Deploy production
+        working-directory: kit
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --no-install wrangler deploy
+      - name: Settings gate, production
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: python3 bin/fleet-kit-check.py settings fleet-kit
+      - name: Hostile probe on production
+        run: python3 bin/fleet-kit-check.py probe "$PROD_URL"
+      - name: Record measurement (f)
+        run: |
+          set -euo pipefail
+          echo "(f) scoped token: staging and production deploy, DO migration, R2 binding and secret all applied" >> "$GITHUB_STEP_SUMMARY"
+      - name: Wipe the throwaway keys
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -d "$RUNNER_TEMP/kitgate" ]; then
+            find "$RUNNER_TEMP/kitgate" -type f -exec shred -u {} +
+            rm -rf "$RUNNER_TEMP/kitgate"
+          fi
