@@ -17,14 +17,17 @@
   "workers_dev": true,
   "preview_urls": false,
   // Logging off: tail would show request headers (the invite).
-  "observability": { "enabled": false },
+  // Every flag is set off explicitly; the settings gate refuses any `enabled: true` under observability
+  // (refusal 2026-10-10, run 38076806590, cause not yet read back).
+  "observability": { "enabled": false, "issues": { "enabled": false }, "logs": { "enabled": false, "invocation_logs": false, "persist": false }, "traces": { "enabled": false, "persist": false } },
   "logpush": false,
   "keep_vars": true,
   "durable_objects": { "bindings": [{ "name": "GATE", "class_name": "Gate" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Gate"] }],
   "r2_buckets": [{ "binding": "KIT", "bucket_name": "fleet-kit" }],
-  // Admin public keys (64 hex, raw Ed25519). Empty switches that role off. K11 fills them.
-  "vars": { "KIT_GW_PUB": "", "KIT_UP_PUB": "" },
+  // Admin public keys (64 hex, raw Ed25519). Empty switches that role off. KIT_UP_PUB is keygen run 38040384564's
+  // KIT_UPLOAD_KEY (fingerprint SHA256:WKjm...8rQ); KIT_GW_PUB is filled when K9 first starts on mirrorstack-fleet-ctl (G-K11-1).
+  "vars": { "KIT_GW_PUB": "", "KIT_UP_PUB": "0d6b9620504b2f167dcb3a170d9484341bfb3cf4b1d1b41d6a0fc209d7c0bd7f" },
   "env": {
     "staging": {
       "name": "fleet-kit-staging",
@@ -32,7 +35,9 @@
       "compatibility_date": "2026-09-01",
       "workers_dev": true,
       "preview_urls": false,
-      "observability": { "enabled": false },
+      // Every flag is set off explicitly; the settings gate refuses any `enabled: true` under observability
+      // (refusal 2026-10-10, run 38076806590, cause not yet read back).
+      "observability": { "enabled": false, "issues": { "enabled": false }, "logs": { "enabled": false, "invocation_logs": false, "persist": false }, "traces": { "enabled": false, "persist": false } },
       "logpush": false,
       "keep_vars": true,
       "durable_objects": { "bindings": [{ "name": "GATE", "class_name": "Gate" }] },

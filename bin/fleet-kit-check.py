@@ -10,8 +10,9 @@ plus the `openssl` binary (3.x: Ed25519 with -rawin) for the throwaway admin key
                       name; nothing else ever returns 10), 2 anything else (unreadable, a crash, a bad name). Names only.
   settings WORKER     read the Worker's settings back from the Cloudflare API (token and account id from the environment)
                       and refuse unless each of these is READ BACK, not merely not-seen: observability explicitly off
-                      (nowhere on), `tail_consumers` reported as empty, `logpush` reported as false, workers.dev on,
-                      preview URLs off. A key the API does not report is a refusal, never a pass.
+                      (nowhere on; a refusal names which keys are on), `tail_consumers` reported as empty, `logpush`
+                      reported as false, workers.dev on, preview URLs off. A key the API does not report is a refusal,
+                      never a pass.
   replay URL          the kit-serve vectors over HTTP against the STAGING Worker (admin keys from $KIT_GATE_DIR): identical
                       404 bytes, 429 after 30, the cap, release on a cut stream, floor, expiry, revoke, bad sha, overwrite,
                       gzip, Range, the admin rules. It makes its own invites and cleans them up.
@@ -146,18 +147,44 @@ def secret_names(text: str) -> set[str]:
 
 
 def _enabled_anywhere(node) -> bool:
-    """True if an `enabled: true` sits anywhere under node (observability.logs, .traces, ...)."""
+    """True if an `enabled: true` sits anywhere under node (observability.logs, .traces, ...). One walker decides."""
+    return bool(_enabled_paths(node))
+
+
+def _enabled_paths(node, prefix='') -> list[str]:
+    """Dotted key paths under node whose `enabled` is true ('enabled', 'logs.enabled', ...). Key names only, no values."""
+    found = []
     if isinstance(node, dict):
-        return any((k == 'enabled' and v is True) or _enabled_anywhere(v) for k, v in node.items())
-    if isinstance(node, list):
-        return any(_enabled_anywhere(v) for v in node)
-    return False
+        for k, v in node.items():
+            path = prefix + ascii(str(k))[1:-1]       # escaped: a key never injects a newline or a log command
+            if k == 'enabled' and v is True:
+                found.append(path)
+            else:
+                found += _enabled_paths(v, path + '.')
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            found += _enabled_paths(v, '%s[%d].' % (prefix[:-1], i))
+    return found
+
+
+def _why_observability_on(obs) -> str:
+    """The one detail line that follows `observability is not off`: key paths and fixed words, never a value."""
+    if obs is None:
+        return 'observability: null'
+    if not isinstance(obs, dict):
+        return 'observability: not an object (%s)' % type(obs).__name__
+    on = _enabled_paths(obs)
+    if on:
+        shown = ', '.join(p if len(p) <= 80 else p[:77] + '...' for p in on[:8])
+        return 'observability on: ' + shown + (' (+%d more)' % (len(on) - 8) if len(on) > 8 else '')
+    return 'observability.enabled: missing' if 'enabled' not in obs else 'observability.enabled: not false'
 
 
 def judge_settings(blobs: list[dict], subdomain: dict) -> list[str]:
     """Why these settings are refused ([] = fine). `blobs` are the `result` objects of the settings endpoints that
     answered. Every guarded key that is reported is held to its value, and each must be reported (a positive read-back) by
-    at least one blob: observability.enabled an explicit false (a missing answer is not off: new Workers default to ON),
+    at least one blob: observability.enabled an explicit false and no `enabled: true` under it (a missing answer is not off:
+    new Workers default to ON; a refusal also names the key paths that are on, never their values),
     `tail_consumers` an empty list (or an explicit null), `logpush` an explicit false. Absence is never a pass."""
     bad = []
     explicit_off = tail_seen = logpush_seen = False
@@ -168,6 +195,7 @@ def judge_settings(blobs: list[dict], subdomain: dict) -> list[str]:
                 explicit_off = True
             else:
                 bad.append('observability is not off')
+                bad.append(_why_observability_on(obs))
         if 'tail_consumers' in blob:
             tails = blob['tail_consumers']
             if tails is None or tails == []:

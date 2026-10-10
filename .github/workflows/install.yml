@@ -46,9 +46,9 @@ env:
   KEY_SHA256: SHA256:16jB0ih9afmAW7rFmgTJVtarDgEv4w/DHA8LKufWhKM
   # test: serials below 1000 (the test key); release: serials 1000 and up (the release key)
   SERIES: test
-  # Filled in by hand: the one host install.json's signed bundle.url may name (the bootstrap sends a helper's invite code
-  # to it). While it is not a lowercase DNS name, plan and publish refuse `kit-host`.
-  KIT_HOST: NOT-SET-fill-in-the-kit-host
+  # The one host install.json's signed bundle.url may name (the bootstrap sends a helper's invite code to it): the production
+  # kit Worker fleet-kit, set 2026-10-11 by D305. Plan and publish refuse `kit-host` unless it is a lowercase DNS name.
+  KIT_HOST: fleet-kit.mirrorstack-fleet.workers.dev
   FLEET_REPO: git@github.com:mirrorstack-ai/mirrorstack-fleet.git
   # GitHub's ssh host key (ed25519, SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU), the only one ssh will accept
   GH_HOSTKEY: github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
