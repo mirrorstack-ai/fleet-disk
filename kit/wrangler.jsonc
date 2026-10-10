@@ -17,7 +17,9 @@
   "workers_dev": true,
   "preview_urls": false,
   // Logging off: tail would show request headers (the invite).
-  "observability": { "enabled": false },
+  // Every flag is set off explicitly because new Workers default the nested ones on, and the settings gate refuses
+  // any `enabled: true` under observability (refusal 2026-10-10, run 38076806590).
+  "observability": { "enabled": false, "issues": { "enabled": false }, "logs": { "enabled": false, "invocation_logs": false, "persist": false }, "traces": { "enabled": false, "persist": false } },
   "logpush": false,
   "keep_vars": true,
   "durable_objects": { "bindings": [{ "name": "GATE", "class_name": "Gate" }] },
@@ -33,7 +35,9 @@
       "compatibility_date": "2026-09-01",
       "workers_dev": true,
       "preview_urls": false,
-      "observability": { "enabled": false },
+      // Every flag is set off explicitly because new Workers default the nested ones on, and the settings gate refuses
+      // any `enabled: true` under observability (refusal 2026-10-10, run 38076806590).
+      "observability": { "enabled": false, "issues": { "enabled": false }, "logs": { "enabled": false, "invocation_logs": false, "persist": false }, "traces": { "enabled": false, "persist": false } },
       "logpush": false,
       "keep_vars": true,
       "durable_objects": { "bindings": [{ "name": "GATE", "class_name": "Gate" }] },

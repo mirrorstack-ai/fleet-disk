@@ -353,6 +353,51 @@ class Judges(unittest.TestCase):
         self.assertIn('preview URLs are not off', bad(sub={'previews_enabled': True}))
         self.assertIn('preview URLs are not off', kc.judge_settings([self.GOOD], {'enabled': True}))  # unknown is not off
 
+    def test_a_refused_observability_names_what_is_on_and_nothing_else(self):
+        def why(obs):
+            out = kc.judge_settings([dict(self.GOOD, observability=obs)], self.SUB)
+            self.assertEqual(out[0], 'observability is not off')       # the old element, byte-identical, first
+            self.assertEqual(len(out), 2, out)                         # plus exactly one detail
+            return out[1]
+        self.assertEqual(why({'enabled': True}), 'observability on: enabled')
+        self.assertEqual(why({'enabled': False, 'issues': {'enabled': True}, 'logs': {'enabled': True, 'persist': True},
+                              'traces': {'enabled': False}}), 'observability on: issues.enabled, logs.enabled')
+        self.assertEqual(why({'enabled': True, 'logs': {'enabled': True}}), 'observability on: enabled, logs.enabled')
+        self.assertEqual(why({'enabled': False, 'logs': {'destinations': [{'enabled': True}]}}),
+                         'observability on: logs.destinations[0].enabled')
+        self.assertEqual(why({}), 'observability.enabled: missing')
+        self.assertEqual(why({'logs': {'enabled': False}}), 'observability.enabled: missing')
+        self.assertEqual(why({'enabled': None}), 'observability.enabled: not false')
+        self.assertEqual(why({'enabled': 'false', 'head_sampling_rate': 1}), 'observability.enabled: not false')
+        self.assertEqual(why(None), 'observability: null')
+        self.assertEqual(why([]), 'observability: not an object (list)')
+        self.assertEqual(why('on'), 'observability: not an object (str)')
+
+    def test_the_detail_never_carries_a_value_from_the_read_back(self):
+        out = kc.judge_settings([dict(self.GOOD, observability={'enabled': False, 'head_sampling_rate': 0.4242,
+                                                                 'logs': {'enabled': True, 'destinations': ['acct-SECRET']}})],
+                                self.SUB)
+        self.assertEqual(out, ['observability is not off', 'observability on: logs.enabled'])
+        self.assertEqual(kc.judge_settings([dict(self.GOOD, observability='acct-SECRET')], self.SUB),
+                         ['observability is not off', 'observability: not an object (str)'])
+
+    def test_a_passing_observability_adds_no_detail_and_old_verdicts_hold(self):
+        full_off = {'enabled': False, 'issues': {'enabled': False},
+                    'logs': {'enabled': False, 'invocation_logs': False, 'persist': False},
+                    'traces': {'enabled': False, 'persist': False}}
+        self.assertEqual(kc.judge_settings([dict(self.GOOD, observability=full_off)], self.SUB), [])
+        # a refusal elsewhere adds nothing observability-shaped
+        self.assertEqual(kc.judge_settings([dict(self.GOOD, logpush=True)], self.SUB), ['logpush is on'])
+        # a missing answer keeps its single old element (no "not off" detail: nothing was read back)
+        self.assertEqual(kc.judge_settings([{'logpush': False, 'tail_consumers': []}], self.SUB),
+                         ['observability: no explicit off in the settings read back'])
+        # same refused/passed verdict as before for the old cases
+        for obs, refused in [({'enabled': False}, False), ({'enabled': True}, True), ({}, True), (None, True), ([], True),
+                             ({'enabled': False, 'logs': {'enabled': True}}, True), ({'enabled': 0}, True),
+                             ({'enabled': False, 'logs': {'enabled': False}}, False)]:
+            out = kc.judge_settings([dict(self.GOOD, observability=obs)], self.SUB)
+            self.assertEqual('observability is not off' in out, refused, obs)
+
     def test_a_missing_observability_answer_is_not_off(self):
         self.assertEqual(kc.judge_settings([{'logpush': False, 'tail_consumers': []}], self.SUB),
                          ['observability: no explicit off in the settings read back'])
