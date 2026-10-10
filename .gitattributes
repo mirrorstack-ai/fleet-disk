@@ -2,3 +2,7 @@ vendor/manifest.py -text
 vendor/manifest.sha256 -text
 vendor/standin.sha256 -text
 vendor/standin/** -text
+vendor/bundle.py -text
+vendor/VENDORED.sha256 -text
+vendor/standin-bundle.sha256 -text
+vendor/standin-bundle/** -text
