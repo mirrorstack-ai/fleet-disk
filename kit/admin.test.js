@@ -228,7 +228,12 @@ test('wrangler.jsonc: the deploy settings the K6 gate reads back, and no break-g
   for (const [name, c] of Object.entries(envs)) {
     assert.equal(c.workers_dev, true, name);
     assert.equal(c.preview_urls, false, name);
-    assert.deepEqual(c.observability, { enabled: false }, name);
+    assert.deepEqual(c.observability, {
+      enabled: false,
+      issues: { enabled: false },
+      logs: { enabled: false, invocation_logs: false, persist: false },
+      traces: { enabled: false, persist: false },
+    }, name);
     assert.equal(c.logpush, false, name);
     assert.equal(c.keep_vars, true, name);
     assert.equal(c.tail_consumers, undefined, name);
