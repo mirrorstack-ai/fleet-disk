@@ -6,6 +6,7 @@ unittest, stdlib only."""
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -23,6 +24,18 @@ ROOT = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location('fleet_keygen_put', ROOT / 'bin/fleet-keygen-put.py')
 kp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(kp)
+
+def find_openssl() -> str:
+    """An openssl that makes Ed25519 keys (the runner's does); '' when there is none."""
+    for exe in (shutil.which('openssl') or '', '/usr/bin/openssl'):
+        if exe and subprocess.run([exe, 'genpkey', '-algorithm', 'ed25519', '-out', os.devnull],
+                                  capture_output=True).returncode == 0:
+            return exe
+    return ''
+
+
+OPENSSL = find_openssl()
+
 
 WF = (ROOT / '.github/workflows/keygen.yml').read_text(encoding='utf-8')
 NAMES = ('SIGN_KEY', 'TAG_KEY', 'FLEET_READ')
@@ -57,6 +70,20 @@ def log(values: dict, key_id: str = KEY_ID, prefix: str = '', recipient: str = E
 
 
 GOOD = {name: blob(i) for i, name in enumerate(NAMES)}
+UP = 'KIT_UPLOAD_KEY'
+UP_RAW = bytes(range(10, 42))      # a public key's 32 bytes (any, here)
+UP_PUB = 'ed25519 ' + UP_RAW.hex()
+UP_FP = 'SHA256:' + base64.b64encode(hashlib.sha256(UP_RAW).digest()).decode().rstrip('=')
+UP_GOOD = {UP: blob(40, kp.PEM_LEN + 48)}
+
+
+def up_log(values: dict = None, pub: str = UP_PUB, fpr: str = UP_FP, prefix: str = '') -> str:
+    """What keygen.yml prints for `keys: kit-upload`: the recipient, then the one sealed value, public line and fingerprint."""
+    lines = ['%sKEYGEN-RECIPIENT %s %s' % (prefix, KEY_ID, ENV_KEY)]
+    for n, v in (UP_GOOD if values is None else values).items():
+        lines += ['%sKEYGEN-SEALED %s %s %s' % (prefix, n, KEY_ID, v), '%sKEYGEN-PUBLIC %s %s' % (prefix, n, pub),
+                  '%sKEYGEN-FINGERPRINT %s %s' % (prefix, n, fpr)]
+    return '\n'.join(lines + [''])
 
 
 class Sealed(unittest.TestCase):
@@ -142,6 +169,44 @@ class Sealed(unittest.TestCase):
     def test_a_malformed_marker_line_refuses_the_batch(self):
         self.refused(log(GOOD) + 'KEYGEN-SEALED SIGN_KEY ' + KEY_ID + '\n', '3 fields')
         self.refused(log(GOOD) + 'KEYGEN-SEALED SIGN_KEY ' + KEY_ID + ' a b\n', '3 fields')
+
+
+class UploadSealed(unittest.TestCase):
+    """`--keys kit-upload`: one Ed25519 PEM, sealed to 167 bytes, with the raw public key as its public line."""
+
+    def refused(self, text: str, fragment: str = '', keys: str = 'kit-upload') -> None:
+        with self.assertRaises(kp.Refused) as why:
+            kp.parse(text, keys)
+        self.assertIn(fragment, str(why.exception))
+
+    def test_the_one_good_value_parses(self):
+        got = kp.parse(up_log(), 'kit-upload')
+        self.assertEqual((got['key_id'], got['recipient'], got['sealed']), (KEY_ID, ENV_KEY, UP_GOOD))
+        self.assertEqual((got['public'], got['fingerprint']), ({UP: UP_PUB}, {UP: UP_FP}))
+        self.assertEqual(kp.parse(up_log(prefix=GH_PREFIX) + up_log(prefix=GH_PREFIX), 'kit-upload')['sealed'], UP_GOOD)
+
+    def test_the_length_is_the_pem_plus_the_sealed_box_overhead(self):
+        self.assertEqual(kp.PEM_LEN, 119)
+        for size in (kp.PEM_LEN + 47, kp.PEM_LEN + 49, kp.SEALED_LEN, kp.PEM_LEN, 32):
+            self.refused(up_log({UP: blob(41, size)}), UP)
+        pem = b'-----BEGIN PRIVATE KEY-----\n' + b'A' * 64 + b'\n-----END PRIVATE KEY-----\n'
+        self.assertEqual(len(pem), kp.PEM_LEN)
+        self.refused(up_log({UP: base64.b64encode(pem).decode()}), UP)   # the key itself, base64: wrong length
+        self.refused(up_log({UP: base64.b64encode(pem + b'\n' * 48).decode()}), 'plaintext')  # padded to the sealed length
+
+    def test_the_set_is_exactly_the_one_name_and_never_the_test_set(self):
+        self.refused(up_log(dict(UP_GOOD, SIGN_KEY=blob(42, kp.PEM_LEN + 48))), 'unknown secret name')
+        self.refused(log(GOOD), 'unknown secret name')                        # a test run is not an upload-key run
+        self.refused(up_log(), 'unknown secret name', keys='test')            # and the other way round
+        self.refused(up_log({}), 'need exactly')
+
+    def test_the_public_line_is_the_raw_key_and_the_fingerprint_is_its_hash(self):
+        for bad in ('ed25519 ' + 'A' * 64, 'ed25519 ' + '0' * 63, 'ed25519 ' + '0' * 65, 'ssh-ed25519 ' + 'A' * 68):
+            self.refused(up_log(pub=bad), 'malformed public line')
+        self.refused(up_log(pub='0' * 64), '3 fields')
+        self.refused(up_log(fpr='SHA256:' + 'a' * 43), 'not that of the public key')
+        self.refused(up_log(pub='ed25519 ' + 'ab' * 32), 'not that of the public key')
+        self.refused(up_log() + 'KEYGEN-PUBLIC %s ed25519 %s\n' % (UP, 'cd' * 32), 'two different public')
 
 
 FAKE_GH = """#!/bin/sh
@@ -290,6 +355,30 @@ class Put(unittest.TestCase):
             self.assertEqual(code, 2, bad)
         self.assertEqual(self.gh_calls(), [])
 
+    def test_keys_kit_upload_puts_the_one_secret_and_prints_the_raw_public_line(self):
+        self.logfile.write_text(up_log(prefix=GH_PREFIX))
+        code, out, err = self.run_main('--run', '4242', '--sha', SHA, '--keys', 'kit-upload')
+        self.assertEqual((code, err), (0, ''))
+        self.assertEqual(self.gh_calls(), [RUN_CALL, LOG_CALL, KEY_CALL, 'api -X PUT %s/%s --input -' % (BASE, UP)])
+        self.assertEqual([json.loads(b) for b in self.bodies.read_text().split('\n') if b],
+                         [{'encrypted_value': UP_GOOD[UP], 'key_id': KEY_ID}])
+        self.assertIn('KEYGEN-PUBLIC %s %s\n' % (UP, UP_PUB), out)
+        self.assertIn('KEYGEN-FINGERPRINT %s %s\n' % (UP, UP_FP), out)
+        self.assertNotIn(UP_GOOD[UP], out + err + '\n'.join(self.gh_calls()))
+        self.assertEqual(out.count('PUT release/'), 1)
+        for other in NAMES:
+            self.assertNotIn(other, out)
+
+    def test_a_test_run_is_not_taken_for_an_upload_key_run_and_the_other_way_round(self):
+        code, _, err = self.run_main('--run', '4242', '--sha', SHA, '--keys', 'kit-upload')   # the log is the test set's
+        self.assertEqual(code, 2)
+        self.assertIn('unknown secret name', err)
+        self.assertEqual(self.gh_calls(), [RUN_CALL, LOG_CALL])
+        self.logfile.write_text(up_log())
+        self.assertEqual(self.run_main()[0], 2)    # default --keys test
+        self.assertEqual(self.bodies.read_text(), '')
+        self.assertEqual(self.run_main('--run', '4242', '--sha', SHA, '--keys', 'other')[0], 2)   # argparse refuses
+
     def test_it_reads_a_log_that_is_not_utf8_without_crashing(self):
         self.logfile.write_bytes(b'\xff\xfe junk\n' + log(GOOD).encode())
         self.assertEqual(self.run_main()[0], 0)
@@ -349,9 +438,10 @@ class Workflow(unittest.TestCase):
         self.assertTrue(self.RUNS)
         for body in self.RUNS:
             self.assertNotIn('${{', body)
-        self.assertEqual(len(re.findall(r'(?m)^\s+(?:PUBLIC_KEY|KEY_ID): \$\{\{ inputs\.\w+ \}\}$', WF)), 2)
-        self.assertEqual(sorted(re.findall(r'\$\{\{ ([^}]+) \}\}', WF)), ['inputs.key_id', 'inputs.public_key'])
-        self.assertEqual(WF.count('${{'), 2)
+        self.assertEqual(len(re.findall(r'(?m)^\s+(?:PUBLIC_KEY|KEY_ID|KEYS): \$\{\{ inputs\.\w+ \}\}$', WF)), 3)
+        self.assertEqual(sorted(re.findall(r'\$\{\{ ([^}]+) \}\}', WF)), ['inputs.key_id', 'inputs.keys', 'inputs.public_key'])
+        self.assertEqual(WF.count('${{'), 3)
+        self.assertRegex(WF, r'(?m)^      keys:\n(?:        .*\n)*?        type: choice\n        options: \[test, kit-upload\]\n        default: test\n')
 
     def test_pynacl_comes_from_pinned_hashes_only(self):
         script = self.RUNS[0]
@@ -385,7 +475,8 @@ class Workflow(unittest.TestCase):
         allowed = [r'KEYDIR=\$\(mktemp -d /dev/shm/keygen\.XXXXXX\)$', r'export KEYDIR$',
                    r"trap 'find \"\$KEYDIR\" -type f -exec shred -u \{\} \+; rm -rf \"\$KEYDIR\"' EXIT$",
                    r'test "\$\(stat -f -c %T "\$KEYDIR"\)" = tmpfs$',
-                   r"ssh-keygen -q -t ed25519 -N '' -C '' -f \"\$KEYDIR/\$name\"$"]
+                   r"ssh-keygen -q -t ed25519 -N '' -C '' -f \"\$KEYDIR/\$name\"$",
+                   r'openssl genpkey -algorithm ed25519 -out "\$KEYDIR/KIT_UPLOAD_KEY";;$']
         for line in self.SHELL.splitlines():
             if 'KEYDIR' in line:
                 self.assertTrue(any(re.fullmatch(a, line.strip()) for a in allowed), line)
@@ -396,6 +487,9 @@ class Workflow(unittest.TestCase):
         self.assertIn('= tmpfs', self.SHELL)
         self.assertIn('for name in SIGN_KEY TAG_KEY FLEET_READ; do', self.SHELL)
         self.assertEqual(self.SHELL.count("ssh-keygen -q -t ed25519 -N '' -C ''"), 1)
+        self.assertEqual(self.SHELL.count('openssl genpkey -algorithm ed25519 -out'), 1)   # no passphrase option: unencrypted
+        self.assertNotIn('-aes', self.SHELL)
+        self.assertRegex(self.SHELL, r'(?s)case "\$KEYS" in\n\s+test\)\n.*kit-upload\)\n.*\*\)\n\s+echo .refused: keys is test or kit-upload.; exit 1;;\n\s*esac')
         self.assertIn('shred -u', self.SHELL)
         self.assertRegex(WF, r"(?m)^        if: always\(\)\n        run: find /dev/shm .*shred -u")
 
@@ -414,12 +508,13 @@ class Workflow(unittest.TestCase):
             self.assertNotIn('secret', expr)
         for line in self.PY.splitlines():
             if re.search(r'\bsecret\b', line):
-                self.assertTrue(re.search(r'secret = handle\.read\(\)|len\(secret\)|secret\.startswith|box\.encrypt\(secret\)', line), line)
+                self.assertTrue(re.search(r'secret = handle\.read\(\)|len\(secret\)|secret\.startswith|box\.encrypt\(secret\)|b\'\'\.join\(secret\.splitlines\(\)\[1:-1\]\)', line), line)
         exits = re.findall(r'(?m)^.*sys\.exit\(.*$', self.PY)
-        self.assertEqual(len(exits), 5)
+        self.assertEqual(len(exits), 7)
         for line in exits:  # a refusal says a fixed sentence, at most with the key's NAME, never a value
             self.assertRegex(line, r"^\s*sys\.exit\('(?:[^'%]|%s)*'(?: % name)?\)$")
-        self.assertEqual(re.findall(r"sys\.exit\('([^']*)'", self.PY)[0:2], ['refused: public_key is not base64',
+        self.assertEqual(re.findall(r"sys\.exit\('([^']*)'", self.PY)[0:3], ['refused: keys is not test or kit-upload',
+                                                                          'refused: public_key is not base64',
                                                                           'refused: public_key is not 32 bytes'])
 
     def test_the_secrets_are_sealed_to_exactly_the_key_that_was_checked_and_printed(self):
@@ -435,11 +530,22 @@ class Workflow(unittest.TestCase):
 
     def test_the_plain_length_matches_the_helper_and_what_ssh_keygen_makes(self):
         self.assertEqual(int(re.search(r'PLAIN_LEN = (\d+)', self.PY).group(1)), kp.PLAIN_LEN)
+        self.assertEqual(int(re.search(r'PEM_LEN = (\d+)', self.PY).group(1)), kp.PEM_LEN)
         if not shutil.which('ssh-keygen'):
             self.skipTest('ssh-keygen missing')
         with tempfile.TemporaryDirectory() as d:
             subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', '', '-f', d + '/k'], check=True)
             self.assertEqual(len((Path(d) / 'k').read_bytes()), kp.PLAIN_LEN)
+
+    @unittest.skipUnless(OPENSSL, 'openssl with Ed25519 is missing')
+    def test_the_pem_length_and_header_match_what_openssl_makes(self):
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run([OPENSSL, 'genpkey', '-algorithm', 'ed25519', '-out', d + '/k'], check=True, capture_output=True)
+            pem = (Path(d) / 'k').read_bytes()
+            self.assertEqual(len(pem), kp.PEM_LEN)
+            self.assertTrue(pem.startswith(b'-----BEGIN PRIVATE KEY-----\n'))
+            der = base64.b64decode(b''.join(pem.splitlines()[1:-1]))
+            self.assertEqual((len(der), der[:16].hex()), (48, '302e020100300506032b657004220420'))
 
 
 def nacl_python() -> str:
@@ -465,8 +571,8 @@ class SealingRuns(unittest.TestCase):
         self.sk, self.pk = [bytes.fromhex(x) for x in probe.stdout.split()]
         (self.tmp / 'seal.py').write_text(Workflow.PY)
 
-    def run_seal(self, public: bytes = b'', key_id: str = KEY_ID):
-        env = {'PATH': os.environ['PATH'], 'KEYDIR': str(self.tmp), 'KEY_ID': key_id,
+    def run_seal(self, public: bytes = b'', key_id: str = KEY_ID, keys: str = 'test'):
+        env = {'PATH': os.environ['PATH'], 'KEYDIR': str(self.tmp), 'KEY_ID': key_id, 'KEYS': keys,
                'PUBLIC_KEY': base64.b64encode(public or self.pk).decode()}
         return subprocess.run([self.py, str(self.tmp / 'seal.py')], env=env, capture_output=True, text=True)
 
@@ -501,10 +607,51 @@ class SealingRuns(unittest.TestCase):
             self.assertNotEqual(done.returncode, 0)
             self.assertEqual(done.stdout, '')
             self.assertNotIn(KEY_ID, done.stderr)
-        env = {'PATH': os.environ['PATH'], 'KEYDIR': str(self.tmp), 'KEY_ID': KEY_ID, 'PUBLIC_KEY': 'not*base64'}
+        env = {'PATH': os.environ['PATH'], 'KEYDIR': str(self.tmp), 'KEY_ID': KEY_ID, 'KEYS': 'test', 'PUBLIC_KEY': 'not*base64'}
         done = subprocess.run([self.py, str(self.tmp / 'seal.py')], env=env, capture_output=True, text=True)
         self.assertNotEqual(done.returncode, 0)
         self.assertEqual(done.stdout, '')
+
+    def test_an_unknown_set_prints_nothing(self):
+        for keys in ('', 'all', 'Test', 'test kit-upload'):
+            done = self.run_seal(keys=keys)
+            self.assertNotEqual(done.returncode, 0, keys)
+            self.assertEqual(done.stdout, '')
+            self.assertIn('keys is not test or kit-upload', done.stderr)
+
+    @unittest.skipUnless(OPENSSL, 'openssl with Ed25519 is missing')
+    def test_the_upload_key_is_sealed_whole_and_its_public_half_is_the_one_openssl_derives(self):
+        (self.tmp / UP).unlink(missing_ok=True)
+        subprocess.run([OPENSSL, 'genpkey', '-algorithm', 'ed25519', '-out', str(self.tmp / UP)], check=True, capture_output=True)
+        done = self.run_seal(keys='kit-upload')
+        self.assertEqual((done.returncode, done.stderr), (0, ''))
+        found = kp.parse(done.stdout, 'kit-upload')
+        self.assertEqual([line.split()[0] for line in done.stdout.splitlines()],
+                         ['KEYGEN-RECIPIENT', 'KEYGEN-SEALED', 'KEYGEN-PUBLIC', 'KEYGEN-FINGERPRINT'])
+        opener = subprocess.run([self.py, '-c', 'import sys,base64;from nacl.public import PrivateKey,SealedBox;'
+                                 'sk=PrivateKey(bytes.fromhex(sys.argv[1]));print(SealedBox(sk).decrypt(base64.b64decode(sys.argv[2])).hex())',
+                                 self.sk.hex(), found['sealed'][UP]], capture_output=True, text=True, check=True)
+        pem = (self.tmp / UP).read_bytes()
+        self.assertEqual(bytes.fromhex(opener.stdout.strip()), pem)
+        spki = subprocess.run([OPENSSL, 'pkey', '-in', str(self.tmp / UP), '-pubout', '-outform', 'DER'], check=True,
+                              capture_output=True).stdout
+        self.assertEqual((len(spki), spki[:12].hex()), (44, '302a300506032b6570032100'))
+        self.assertEqual(found['public'][UP], 'ed25519 ' + spki[12:].hex())
+        self.assertEqual(found['fingerprint'][UP], 'SHA256:' + base64.b64encode(hashlib.sha256(spki[12:]).digest()).decode().rstrip('='))
+        body = b''.join(pem.splitlines()[1:-1]).decode()
+        self.assertNotIn(body[:40], done.stdout)
+        self.assertNotIn('PRIVATE KEY', done.stdout)
+
+    def test_an_upload_key_file_of_the_wrong_shape_prints_nothing(self):
+        for what in (b'x' * kp.PEM_LEN, b'-----BEGIN PRIVATE KEY-----\n' + b'A' * 64 + b'\n-----END PRIVATE KEY-----\n',
+                     (self.tmp / 'SIGN_KEY').read_bytes()):   # junk, a PEM that is no Ed25519 key, an ssh key
+            for name in NAMES:
+                (self.tmp / name).unlink(missing_ok=True)
+            (self.tmp / UP).write_bytes(what)
+            done = self.run_seal(keys='kit-upload')
+            self.assertNotEqual(done.returncode, 0)
+            self.assertEqual(done.stdout, '')
+            self.assertIn(UP, done.stderr)
 
     def test_a_key_file_of_the_wrong_shape_prints_nothing(self):
         (self.tmp / 'TAG_KEY').write_bytes(b'x' * kp.PLAIN_LEN)

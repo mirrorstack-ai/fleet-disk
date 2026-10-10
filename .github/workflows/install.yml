@@ -1,20 +1,30 @@
-# Signs and publishes the fleet's install set from the release folder of the fleet repository's `release` branch, in four
+# Signs and publishes the fleet's install set from the release folder of the fleet repository's `release` branch, in five
 # jobs and only on this repo's `release` branch (the Environment `release` allows no other):
 #   plan     reads release/install-<serial>/ from the fleet `release` tip as git blobs (deploy key FLEET_READ) and runs
 #            every offline check but the signatures.
 #   sign     runs no repository code and no third-party action: holds SIGN_KEY only in memory, refuses unless its
 #            fingerprint is KEY_SHA256 below, signs the three files, verifies them and wipes the key.
+#   kit      puts the bundle and the gateway record on the kit host. It holds only FLEET_READ and KIT_UPLOAD_KEY (the Ed25519
+#            key whose signature the host takes; it has no Cloudflare power at all). It rebuilds the bundle from the fleet
+#            commit install.json names, with the vendored packer, refuses unless size, sha256, head and tree equal the signed
+#            install.json, and uploads it; then it reads the gateway record and its signature from the release tip, checks
+#            the owner's signature and uploads the pair. Neither goes through the plan's files, an artifact, a cache or a log.
 #   tag      creates the tag install-<serial> on this run's commit with the deploy key TAG_KEY.
 #   publish  runs the publisher on the plan's files plus the signatures; no environment, no secret.
+# Tag and publish both need kit, so no install tag or release page exists for a bundle the host cannot serve; a failed
+# upload is a re-run. The mode `floor` is two jobs that set the host's floor (it serves no serial below it): `floor-approve`
+# waits in the Environment `kit-floor` (the owner is its required reviewer, it holds no secret) and prints the value to
+# approve; `floor` needs it and holds KIT_UPLOAD_KEY in `release`. The approval covers raising, lowering and 0. While the
+# Environment `kit-floor` has no required reviewer (README, One-time repo settings) nothing stops a floor run: do not rely on it.
 # Inputs reach the scripts only through env:. Which key signs is the constant KEY_SHA256, a reviewed change to this file.
 name: install
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: sign (plan, sign, tag, publish) or pubkey (only print the signing key's public line and fingerprint)
+        description: sign (plan, sign, kit, tag, publish), pubkey (only print the signing key's public line and fingerprint) or floor (set the kit host's floor)
         type: choice
-        options: [sign, pubkey]
+        options: [sign, pubkey, floor]
         default: sign
       serial:
         description: the install serial, the folder release/install-<serial> of the fleet repository
@@ -22,10 +32,14 @@ on:
       min_serial:
         description: the lowest serial this publish may carry (the previous release's serial)
         required: false
+      floor:
+        description: mode floor only, digits - the kit host serves no serial below it (0 lifts the floor)
+        required: false
 permissions:
   contents: read
 concurrency:
-  group: install
+  # a floor run (the break-glass for a bad serial) never queues behind, or replaces, a release run, and a newer dispatch never cancels a running one
+  group: ${{ inputs.mode == 'floor' && 'install-floor' || 'install' }}
 env:
   # Filled in by hand once the key exists: the `ssh-keygen -lf` fingerprint of the key in SIGN_KEY. While it is not a
   # fingerprint the sign job refuses.
@@ -172,8 +186,45 @@ jobs:
           sign deploy-pin.json mirrorstack-fleet-pin "$PIN_B64" "$PIN_SHA" pin
           printf 'pub=%s\n' "$pub" >> "$GITHUB_OUTPUT"
           echo "signed with key $fp"
-  tag:
+  kit:
     needs: [plan, sign]
+    if: github.ref == 'refs/heads/release'
+    environment: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
+        with:
+          persist-credentials: false
+      - env:
+          INSTALL_B64: ${{ needs.plan.outputs.install_b64 }}
+          INSTALL_SHA: ${{ needs.plan.outputs.install_sha }}
+          INSTALL_SIG: ${{ needs.sign.outputs.install_sig }}
+          PUB: ${{ needs.sign.outputs.pub }}
+          OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}
+          KIT_HOST: ${{ env.KIT_HOST }}
+          FLEET_READ: ${{ secrets.FLEET_READ }}
+          KIT_UPLOAD_KEY: ${{ secrets.KIT_UPLOAD_KEY }}
+        run: |
+          set -eu
+          umask 077
+          d=$(mktemp -d /dev/shm/kit.XXXXXX)
+          trap 'shred -u "$d/key" 2>/dev/null || true; rm -rf "$d"' EXIT
+          mkdir "$d/install"
+          printf '%s' "$INSTALL_B64" | base64 -d > "$d/install/install.json"
+          [ "$(sha256sum "$d/install/install.json" | cut -d ' ' -f 1)" = "$INSTALL_SHA" ] || { echo 'REFUSED hash install.json'; exit 1; }
+          printf '%s' "$INSTALL_SIG" | base64 -d > "$d/install/install.json.sig"
+          printf '%s\n' "$PUB" > "$d/owner.pub"
+          printf '%s\n' "$FLEET_READ" > "$d/key"
+          unset FLEET_READ
+          printf '%s\n' "$GH_HOSTKEY" > "$d/known_hosts"
+          export GIT_SSH_COMMAND="/usr/bin/ssh -i $d/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$d/known_hosts -o GlobalKnownHostsFile=/dev/null -o HostKeyAlgorithms=ssh-ed25519"
+          python3 bin/fleet-kit-upload.py bundle "$d/install" --owner-pub "$d/owner.pub"
+          python3 bin/fleet-kit-upload.py gateway --owner-pub "$d/owner.pub"
+  tag:
+    needs: [plan, sign, kit]
     if: github.ref == 'refs/heads/release'
     environment: release
     runs-on: ubuntu-24.04
@@ -197,7 +248,7 @@ jobs:
           [ "$(git -C "$d/repo" rev-parse FETCH_HEAD)" = "$GITHUB_SHA" ]
           git -C "$d/repo" push -q "git@github.com:$GITHUB_REPOSITORY.git" "$GITHUB_SHA:refs/tags/install-$SERIAL"
   publish:
-    needs: [plan, sign, tag]
+    needs: [plan, sign, kit, tag]
     if: github.ref == 'refs/heads/release'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -233,3 +284,36 @@ jobs:
           OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}
           KIT_HOST: ${{ env.KIT_HOST }}
         run: cd "$RUNNER_TEMP/stage" && python3 "$GITHUB_WORKSPACE/bin/fleet-install-publish.py" publish "release/install-$SERIAL" --owner-pub "$RUNNER_TEMP/owner.pub" --min-serial "$MIN_SERIAL"
+  floor-approve:
+    if: github.ref == 'refs/heads/release' && inputs.mode == 'floor'
+    environment: kit-floor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - env:
+          FLOOR: ${{ inputs.floor }}
+        run: |
+          set -eu
+          case "$FLOOR" in '' | *[!0-9]*) echo 'floor is digits only'; exit 1;; esac
+          echo "approved floor value: $FLOOR"
+  floor:
+    if: github.ref == 'refs/heads/release' && inputs.mode == 'floor'
+    needs: floor-approve
+    environment: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
+        with:
+          persist-credentials: false
+      - env:
+          FLOOR: ${{ inputs.floor }}
+          KIT_HOST: ${{ env.KIT_HOST }}
+          KIT_UPLOAD_KEY: ${{ secrets.KIT_UPLOAD_KEY }}
+        run: |
+          set -eu
+          case "$FLOOR" in '' | *[!0-9]*) echo 'floor is digits only'; exit 1;; esac
+          python3 bin/fleet-kit-upload.py floor "$FLOOR"

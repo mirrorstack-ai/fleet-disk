@@ -1,6 +1,6 @@
 """Put a release's bundle and the gateway record on the kit host, signed by CI: `fleet-kit-upload.py bundle <dir> --owner-pub P`
 and `fleet-kit-upload.py gateway --owner-pub P`, run by the kit job of .github/workflows/install.yml on a GitHub-hosted
-runner. There is no Cloudflare key here: the host takes a request only when it carries an Ed25519 signature of the upload
+runner, and `fleet-kit-upload.py floor N`, run by its floor job, which needs floor-approve (Environment `kit-floor`, where the owner is the required reviewer once that Environment is set up). There is no Cloudflare key here: the host takes a request only when it carries an Ed25519 signature of the upload
 role (KIT_UPLOAD_KEY), made with `openssl pkeyutl -rawin` over `kit-admin-v1\\n<role>\\n<ts_ms>\\n<METHOD>\\n<path>\\n<sha256hex(body)>`.
 
 `bundle <dir>`: <dir> holds the signed install.json and install.json.sig. The script checks the signature and the shape (the
@@ -13,6 +13,9 @@ says it stored.
 `gateway`: reads fleet/core/gateway.json and fleet/core/gateway.json.sig from the tip of the fleet `release` branch, checks
 the owner's signature under the pin's namespace (ssh-keygen -Y verify) and the shape of the record, and PUTs the pair as one
 request, so the host flips to it whole or not at all. These two files are not part of the public release folder and never pass through an artifact.
+
+`floor N`: PUT /_k/floor {"floor": N}, the host's break-glass for a bad serial (it serves nothing below N), and reads the floor
+back. It needs only KIT_HOST and the upload key: no fleet repository, no owner key.
 
 This repository is public, so nothing here prints what it built: the build's own output goes to a file in RUNNER_TEMP that is
 never printed, the log shows only a size and a sha256, and an error names the rule, never a value. No stack dump is
@@ -129,7 +132,7 @@ HOST_WORDS = ('bad-request', 'expired', 'stale', 'forbidden', 'checksum', 'too-l
               'unavailable', 'ceiling-life', 'ceiling-downloads', 'ceiling-open')  # shown after the status, never any other word
 ROLE = 'upload'
 MESSAGE_TAG = 'kit-admin-v1'
-MAX_UPLOAD = 90 * 1000 * 1000  # bytes: the Free plan's request body is 100 MB, and the host's own cap sits under it
+MAX_UPLOAD = fp.MAX_KIT_BUNDLE  # bytes: the publisher's cap (kit-host-size), which plan enforces first; kept here as the last line
 MAX_CLOSURE = 65536  # closure.txt, a list of a few dozen paths
 MAX_CLOSURE_PATHS = 2000
 MAX_INSTALL = 8192  # install.json (the verifier's own cap)
@@ -137,6 +140,8 @@ MAX_SIG = 4096
 MAX_GATEWAY_JSON, MAX_GATEWAY_SIG = 65536, 4096  # what the host accepts of each file of the pair
 MAX_SERIAL = 999999999  # the host's range for a bundle serial
 MAX_GATEWAY_SERIAL = MAX_SERIAL  # the host's route takes one to nine digits
+MAX_FLOOR = 2 ** 31  # the host's range for a floor (kit/gate-core.js, LIMITS.maxSerial)
+FLOOR_RX = re.compile(r'0|[1-9][0-9]{0,9}', re.ASCII)  # canonical decimal
 GATEWAY_KEYS = ('serial', 'address', 'cert_sha256', 'manifest_key', 'session_key')  # a gateway record has all of these;
 # kit.json and deploy-pin.json, signed under the same namespace by the same key, do not
 MAX_ANSWER = 65536  # the most of an answer that is read
@@ -149,7 +154,8 @@ SHM = '/dev/shm'  # where the key lives for the length of the run
 KEY_PEM = re.compile(r'-----BEGIN PRIVATE KEY-----\n[A-Za-z0-9+/=\n]{1,400}-----END PRIVATE KEY-----\n?', re.ASCII)
 GIT_TIMEOUT, SIGN_TIMEOUT, NET_TIMEOUT = 600, 60, 900
 USAGE_TEXT = ('usage: fleet-kit-upload.py bundle <dir> --owner-pub <path>\n'
-              '       fleet-kit-upload.py gateway --owner-pub <path>\n')
+              '       fleet-kit-upload.py gateway --owner-pub <path>\n'
+              '       fleet-kit-upload.py floor <N>\n')
 
 
 class Net(Protocol):
@@ -453,18 +459,30 @@ def upload_gateway(owner_pub: bytes, environ: dict[str, str], net: Net, signer: 
     return f'OK gateway serial={serial} json={sha256_hex(text)} sig={sha256_hex(sig)}'
 
 
-def parse_args(argv: list[str]) -> tuple[str, Path | None, str] | None:
-    """(verb, dir or None, owner-pub path) from `bundle <dir> --owner-pub P` or `gateway --owner-pub P`, or None."""
+def upload_floor(floor: int, environ: dict[str, str], net: Net, signer: Signer) -> str:
+    host = fp.check_kit_host(environ.get('KIT_HOST', ''))
+    body = json.dumps({'floor': floor}, separators=(',', ':')).encode('ascii')
+    answer = answer_json(call(net, signer, host, 'PUT', '/_k/floor', body))
+    if answer.get('ok') is not True or type(answer.get('floor')) is not int or answer['floor'] != floor:
+        raise Refused('readback')
+    return f'OK floor={floor}'
+
+
+def parse_args(argv: list[str]) -> tuple[str, Path | int | None, str] | None:
+    """(verb, dir or floor or None, owner-pub path) from `bundle <dir> --owner-pub P`, `gateway --owner-pub P` or `floor N`
+    (N canonical decimal, at most MAX_FLOOR), or None."""
     if len(argv) == 5 and argv[1] == 'bundle' and argv[3] == '--owner-pub':
         return 'bundle', Path(argv[2]), argv[4]
     if len(argv) == 4 and argv[1] == 'gateway' and argv[2] == '--owner-pub':
         return 'gateway', None, argv[3]
+    if len(argv) == 3 and argv[1] == 'floor' and FLOOR_RX.fullmatch(argv[2]) and int(argv[2]) <= MAX_FLOOR:
+        return 'floor', int(argv[2]), ''
     return None
 
 
 def main(argv: list[str], environ: dict[str, str], net: Net | None = None) -> int:
     """0 done, 1 refused, 2 usage. The environment: KIT_HOST (the workflow's constant), KIT_UPLOAD_KEY (the Ed25519 key, PEM),
-    FLEET_REPO (the private repository's address), RUNNER_TEMP, OWNER_PIN_SHA256 (the owner key's fingerprint: it is what
+    FLEET_REPO (the private repository's address; `floor` does not need it), RUNNER_TEMP, OWNER_PIN_SHA256 (the owner key's fingerprint: it is what
     ties --owner-pub to the key the owner pinned, so a run without it is `REFUSED key`) and GIT_SSH_COMMAND (the read
     key's ssh command, optional). KIT_UPLOAD_KEY is taken out of this process's own environment at once, so no child
     process (git, ssh-keygen, openssl) inherits it."""
@@ -476,17 +494,21 @@ def main(argv: list[str], environ: dict[str, str], net: Net | None = None) -> in
     os.environ.pop('KIT_UPLOAD_KEY', None)
     work = signer = None
     try:
-        if not all(environ.get(k) for k in ('KIT_HOST', 'KIT_UPLOAD_KEY', 'FLEET_REPO', 'RUNNER_TEMP')) \
-                or not os.path.isdir(environ['RUNNER_TEMP']):
+        needed = ('KIT_HOST', 'KIT_UPLOAD_KEY', 'RUNNER_TEMP') + (() if verb == 'floor' else ('FLEET_REPO',))
+        if not all(environ.get(k) for k in needed) or not os.path.isdir(environ['RUNNER_TEMP']):
             raise Refused('env')
-        if not environ.get('OWNER_PIN_SHA256'):
-            raise Refused('key')
-        owner_pub = fp.owner_key(pub_path, environ['OWNER_PIN_SHA256'], fp.run_argv)
-        work = Path(tempfile.mkdtemp(prefix='kit-', dir=environ['RUNNER_TEMP']))
-        signer = Signer(environ['KIT_UPLOAD_KEY'])
-        net = net or Real()
-        line = (upload_bundle(folder, owner_pub, environ, net, signer, work) if verb == 'bundle'
-                else upload_gateway(owner_pub, environ, net, signer, work))
+        if verb == 'floor':  # the upload key and the host, nothing of the fleet repository or the owner key
+            signer = Signer(environ['KIT_UPLOAD_KEY'])
+            line = upload_floor(folder, environ, net or Real(), signer)
+        else:
+            if not environ.get('OWNER_PIN_SHA256'):
+                raise Refused('key')
+            owner_pub = fp.owner_key(pub_path, environ['OWNER_PIN_SHA256'], fp.run_argv)
+            work = Path(tempfile.mkdtemp(prefix='kit-', dir=environ['RUNNER_TEMP']))
+            signer = Signer(environ['KIT_UPLOAD_KEY'])
+            net = net or Real()
+            line = (upload_bundle(folder, owner_pub, environ, net, signer, work) if verb == 'bundle'
+                    else upload_gateway(owner_pub, environ, net, signer, work))
     except Refused as why:
         sys.stderr.write(f'fleet-kit-upload: refused {why.code.split()[0]}\n')
         print(f'REFUSED {why.code}')

@@ -89,6 +89,8 @@ class FakeNet:
         if path.startswith('/_k/file/'):
             return 200, json.dumps({'ok': True, 'created': True, 'sha256': sha(body), 'size': len(body)}).encode()
         doc = json.loads(body)
+        if path == '/_k/floor':
+            return 200, json.dumps({'ok': True, 'floor': doc['floor']}).encode()
         text, sig = base64.b64decode(doc['json']), base64.b64decode(doc['sig'])
         return 200, json.dumps({'ok': True, 'created': True, 'gserial': int(path.rsplit('/', 1)[1]),
                                 'json': {'sha256': sha(text), 'size': len(text)},
@@ -544,6 +546,46 @@ class TestGateway(Fixture):
             net = FakeNet(self.up_pub, lambda c, a=answer: (200, json.dumps(a).encode()))
             self.assertEqual(self.gateway(net=net)[:2], (1, 'REFUSED readback\n'), answer)
 
+    # the floor verb: the break-glass for a bad serial, signed by the upload key and nothing else
+
+    def floor(self, n: str = '7', **kw):
+        return self.invoke('floor', n, **kw)
+
+    def test_the_floor_is_one_signed_put_and_nothing_of_the_fleet_is_needed(self):
+        env = self.env(FLEET_REPO=None, OWNER_PIN_SHA256=None)  # no fleet repository and no owner key for a floor
+        code, out, err = self.floor('7', env=env)
+        self.assertEqual((code, out, err), (0, 'OK floor=7\n', ''))
+        (call,) = self.net.calls
+        self.assertEqual((call['method'], call['host'], call['path'], call['body']), ('PUT', HOST, '/_k/floor', b'{"floor":7}'))
+        self.assertTrue(self.net.signature_ok(call))
+        self.assertEqual(self.floor('0', env=env, net=FakeNet(self.up_pub))[:2], (0, 'OK floor=0\n'))
+
+    def test_the_floor_reads_the_host_s_answer_back(self):
+        for answer in ({'ok': True, 'floor': 8}, {'ok': True}, {'floor': 7}, {'ok': True, 'floor': '7'}, {'ok': True, 'floor': True},
+                       {'ok': False, 'floor': 7}, []):
+            net = FakeNet(self.up_pub, lambda c, a=answer: (200, json.dumps(a).encode()))
+            self.assertEqual(self.floor('7', net=net)[:2], (1, 'REFUSED readback\n'), answer)
+        for status, body, line in HOST_CASES:
+            net = FakeNet(self.up_pub, lambda call, s=status, b=body: (s, b))
+            self.assertEqual(self.floor('7', net=net)[:2], (1, line + '\n'), (status, body))
+
+    def test_the_floor_range_is_the_hosts(self):
+        self.assertEqual(fk.MAX_FLOOR, 2 ** 31)
+        self.assertEqual(fk.parse_args(['x', 'floor', '0']), ('floor', 0, ''))
+        self.assertEqual(fk.parse_args(['x', 'floor', str(2 ** 31)]), ('floor', 2 ** 31, ''))
+        for bad in ('', '-1', '+1', '007', '01', '1.0', '1e3', 'x', '1 ', '\u0661\u0662', str(2 ** 31 + 1), '99999999999'):
+            self.assertIsNone(fk.parse_args(['x', 'floor', bad]), bad)
+        self.assertIsNone(fk.parse_args(['x', 'floor']))
+        self.assertIsNone(fk.parse_args(['x', 'floor', '7', '8']))
+        self.assertIsNone(fk.parse_args(['x', 'floor', '7', '--owner-pub', 'p']))
+
+    def test_a_floor_without_the_key_the_host_or_a_runner_folder_is_refused_env_and_makes_no_request(self):
+        for gone in ('KIT_UPLOAD_KEY', 'KIT_HOST', 'RUNNER_TEMP'):
+            self.assertEqual(self.floor('7', env=self.env(**{gone: None}))[:2], (1, 'REFUSED env\n'), gone)
+        self.assertEqual(self.floor('7', env=self.env(KIT_HOST='NOT-SET-fill-in-the-kit-host'))[:2], (1, 'REFUSED kit-host\n'))
+        self.assertEqual(self.net.calls, [])
+        self.assertEqual(list(self.shm.iterdir()), [])  # the key file is gone
+
     def test_the_output_shows_no_address(self):
         _, out, err = self.gateway()
         self.assertNotIn('203.0.113', out + err)
@@ -735,6 +777,9 @@ class TestScript(unittest.TestCase):
             self.assertTrue(err.getvalue().startswith('usage: fleet-kit-upload.py'))
         self.assertEqual(fk.parse_args(['x', 'bundle', 'd', '--owner-pub', 'p']), ('bundle', Path('d'), 'p'))
         self.assertEqual(fk.parse_args(['x', 'gateway', '--owner-pub', 'p']), ('gateway', None, 'p'))
+        for argv in (['floor'], ['floor', 'x'], ['floor', '-1'], ['floor', '1', '2']):
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(fk.main(['x', *argv], {}), 2, argv)
 
     def test_a_bare_environment_is_refused_env_before_anything_runs(self):
         done = subprocess.run([sys.executable, str(ROOT / 'bin/fleet-kit-upload.py'), 'gateway', '--owner-pub', '/nonexistent'],
