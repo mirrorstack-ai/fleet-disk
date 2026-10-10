@@ -10,12 +10,16 @@
 //
 // Nothing in here logs, and nothing stores a raw address or a plain invite
 // code: invites are keyed by an HMAC tag the Worker front computes, sources by
-// a 16-hex HMAC key (see keys.js).
+// a 16-hex HMAC key (both computed by the Worker front, K5).
 //
 // Deviations from kit-serve (spec H10b): D1 only well-formed guesses spend
 // budget (the front never calls decide() for anything else; decide() itself
 // refuses malformed input without touching the budget), D2 HMAC tags, D3 IPv6
-// per /64 (keys.js), D4 budgets live in SQLite and survive restarts.
+// per /64 (the front), D4 budgets live in SQLite and survive restarts.
+//
+// Units: every timestamp here (admin ts, invite exp, made) is epoch
+// MILLISECONDS. kit-serve and the gateway ledger use epoch seconds; the pusher
+// (K9) converts.
 
 export const BUNDLE = 'bundle.tar';
 export const GATEWAY_JSON = 'gateway.json';
@@ -45,13 +49,13 @@ export const LIMITS = Object.freeze({
 // Which admin operation each role may call (spec: "Each role can call only its own routes").
 export const ROLE_OPS = Object.freeze({
   upload: Object.freeze(['putBundle', 'setGateway', 'setFloor']),
-  gateway: Object.freeze(['addInvite', 'revokeInvite', 'health', 'invites']),
+  gateway: Object.freeze(['addInvite', 'revokeInvite', 'health']),
 });
 
 const HEX64 = /^[0-9a-f]{64}$/;
 const SRC = /^[0-9a-f]{16}$/;
 const REF = /^[A-Za-z0-9_-]{8,64}$/;
-const TIER = /^[A-Za-z0-9_.-]{1,32}$/;
+const TIERS = Object.freeze(['install', 'update']); // the two kit-serve opens
 
 const isInt = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
 const fail = (error) => ({ ok: false, error });
@@ -74,8 +78,12 @@ export class GateCore {
     return this.sql.exec(query, ...bindings).toArray();
   }
 
+  // rowsWritten is "so far" until the cursor is consumed (Cloudflare docs), so
+  // drain it before reading the count.
   #run(query, ...bindings) {
-    return this.sql.exec(query, ...bindings).rowsWritten;
+    const cursor = this.sql.exec(query, ...bindings);
+    cursor.toArray();
+    return cursor.rowsWritten;
   }
 
   #migrate() {
@@ -117,11 +125,22 @@ export class GateCore {
     this.#run('INSERT INTO meta(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v', k, v);
   }
 
+  // The dashboard KIT_FLOOR is the phone break-glass that stops serving a bad
+  // serial, so a value that is set but unreadable FAILS CLOSED (like kit-serve:
+  // no readable floor, no service): an infinite floor, every request a 404.
+  // Unset (undefined, null, '') is 0. Anything else must be a non-negative
+  // integer (a number, or a string of digits).
+  #envFloor() {
+    const raw = this.envFloor();
+    if (raw === undefined || raw === null || raw === '') return { value: 0, bad: false };
+    if (typeof raw === 'number' && Number.isSafeInteger(raw) && raw >= 0) return { value: raw, bad: false };
+    if (typeof raw === 'string' && /^\d{1,15}$/.test(raw.trim())) return { value: Number(raw.trim()), bad: false };
+    return { value: Infinity, bad: true };
+  }
+
   #effectiveFloor() {
     const stored = Number(this.#meta('floor') || 0);
-    const raw = Number(this.envFloor());
-    const env = Number.isInteger(raw) && raw > 0 ? raw : 0;
-    return Math.max(stored, env);
+    return Math.max(stored, this.#envFloor().value);
   }
 
   // ---- budgets ----------------------------------------------------------
@@ -189,6 +208,10 @@ export class GateCore {
       !!inv && serial >= inv.lo && serial <= inv.hi,
       serial >= floor,
       !!inv && now < inv.exp,
+      // The cap is for bundle.tar only: the gateway pair never counts against
+      // it (it reads behind a live invite until it expires, and the bootstrap
+      // may fetch it after the bundle). The atomic guard is the reservation
+      // UPDATE below.
       !!inv && (!isBundle || inv.used < inv.cap),
       !!file,
     ];
@@ -212,7 +235,7 @@ export class GateCore {
       status: 200,
       serial,
       name,
-      key: isBundle ? bundleKey(serial) : gatewayKey(file.gserial, name),
+      key: file.key,
       size: file.size,
       sha256: file.sha256,
       rid,
@@ -287,7 +310,7 @@ export class GateCore {
       this.#setMeta(k, ts);
       out = this[`_${op}`](args || {}, now);
     });
-    if (out.ok && op !== 'health' && op !== 'invites') await this.storage.sync();
+    if (out.ok && op !== 'health') await this.storage.sync();
     return out;
   }
 
@@ -295,8 +318,9 @@ export class GateCore {
     const { ref, tag, tier, lo, hi, exp, cap } = a;
     if (typeof ref !== 'string' || !REF.test(ref)) return fail('bad-request');
     if (typeof tag !== 'string' || !HEX64.test(tag)) return fail('bad-request');
-    if (typeof tier !== 'string' || !TIER.test(tier)) return fail('bad-request');
+    if (!TIERS.includes(tier)) return fail('bad-request');
     if (!isInt(lo, 1, LIMITS.maxSerial) || !isInt(hi, 1, LIMITS.maxSerial) || lo > hi) return fail('bad-request');
+    // exp is epoch milliseconds (see the header).
     if (!Number.isSafeInteger(exp) || !Number.isSafeInteger(cap)) return fail('bad-request');
 
     const byRef = this.#rows('SELECT * FROM invites WHERE ref = ?', ref)[0];
@@ -395,18 +419,11 @@ export class GateCore {
       now,
       floor: Number(this.#meta('floor') || 0),
       effectiveFloor: this.#effectiveFloor(),
+      floorError: this.#envFloor().bad, // KIT_FLOOR is set but unreadable: everything is a 404
       gateway: gs === undefined ? null : gs,
       openInvites: this.#rows('SELECT COUNT(*) AS n FROM invites WHERE revoked = 0 AND exp > ?', now)[0].n,
       bundles: this.#rows('SELECT COUNT(*) AS n FROM files')[0].n,
       failuresLastHour: this.#rows('SELECT COALESCE(SUM(n), 0) AS n FROM allfails WHERE bucket >= ?', min)[0].n,
-    };
-  }
-
-  // By ref only: no tag, no code.
-  _invites() {
-    return {
-      ok: true,
-      invites: this.#rows('SELECT ref, tier, lo, hi, exp, cap, used, refunds, revoked FROM invites ORDER BY made, ref'),
     };
   }
 }

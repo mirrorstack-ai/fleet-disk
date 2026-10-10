@@ -21,7 +21,7 @@ export function make({ env = {}, storage = fakeStorage(), clk = clock() } = {}) 
 }
 
 export const invite = (clk, o = {}) => ({
-  ref: 'ref-00000001', tag: TAG, tier: 'helper', lo: 1, hi: 100, exp: clk.t + 24 * H, cap: 10, ...o,
+  ref: 'ref-00000001', tag: TAG, tier: 'install', lo: 1, hi: 100, exp: clk.t + 24 * H, cap: 10, ...o,
 });
 
 // Run an admin op as an always-fresh timestamp.

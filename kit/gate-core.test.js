@@ -342,7 +342,7 @@ test('revoke leaves a tombstone: no resurrection, known or unknown ref', async (
 test('invite fields are validated', async () => {
   const ctx = make();
   const bad = [
-    { ref: 'short' }, { ref: 'has space 1' }, { tag: 'zz' }, { tag: TAG.toUpperCase() }, { tier: '' }, { tier: 'a b' },
+    { ref: 'short' }, { ref: 'has space 1' }, { tag: 'zz' }, { tag: TAG.toUpperCase() }, { tier: '' }, { tier: 'a b' }, { tier: 'helper' }, { tier: 'Install' },
     { lo: 0 }, { hi: 0 }, { lo: 50, hi: 10 }, { lo: 1.5 }, { hi: 2 ** 31 + 1 }, { exp: 'soon' }, { cap: 1.5 },
   ];
   for (const o of bad) assert.deepEqual(await addInvite(ctx, o), { ok: false, error: 'bad-request' }, JSON.stringify(o));
@@ -416,8 +416,6 @@ test('floor: max of the stored floor and KIT_FLOOR; below it is the 404', async 
   assert.equal((await dec(ctx)).status, 200, 'serial == floor is served');
   ctx.env.KIT_FLOOR = '9';
   assert.equal((await dec(ctx)).status, 404);
-  ctx.env.KIT_FLOOR = 'garbage';
-  assert.equal((await dec(ctx)).status, 200);
   ctx.env.KIT_FLOOR = undefined;
   await adm(ctx, 'upload', 'setFloor', { floor: 6 });
   assert.equal((await dec(ctx)).status, 404);
@@ -429,18 +427,18 @@ test('floor: max of the stored floor and KIT_FLOOR; below it is the 404', async 
 
 // ---- what admin can read ----------------------------------------------------
 
-test('health and invites expose no tag, no code, no source', async () => {
+test('health exposes no tag, no code, no source', async () => {
   const ctx = await ready();
   await dec(ctx, { tag: TAG2 });
   const h = await adm(ctx, 'gateway', 'health', {});
   assert.deepEqual(h, {
-    ok: true, now: ctx.clk.t, floor: 0, effectiveFloor: 0, gateway: 1, openInvites: 1, bundles: 1, failuresLastHour: 1,
+    ok: true, now: ctx.clk.t, floor: 0, effectiveFloor: 0, floorError: false, gateway: 1, openInvites: 1, bundles: 1, failuresLastHour: 1,
   });
-  const inv = await adm(ctx, 'gateway', 'invites', {});
-  assert.equal(inv.invites.length, 1);
-  assert.equal(inv.invites[0].ref, 'ref-00000001');
-  const text = JSON.stringify([h, inv]);
+  const text = JSON.stringify(h);
   assert.ok(!text.includes(TAG) && !text.includes(SRC));
+  // The spec gives the gateway role add, revoke and health only: no listing op.
+  assert.deepEqual(await adm(ctx, 'gateway', 'invites', {}), { ok: false, error: 'forbidden' });
+  assert.deepEqual(await adm(ctx, 'upload', 'invites', {}), { ok: false, error: 'forbidden' });
 });
 
 test('the tables hold no plain code and no raw address: only tags and 16-hex source keys', async () => {
@@ -461,4 +459,117 @@ test('limits match the spec', () => {
   assert.equal(LIMITS.bucketMs, 600000);
   assert.equal(LIMITS.keepMs, 2 * H);
   assert.equal(T0 % 600000, 0);
+});
+
+// ---- review fixes ----------------------------------------------------------
+
+test('KIT_FLOOR set but unreadable fails closed (every request a 404), unset is no floor', async () => {
+  const ctx = await ready();
+  let n = 0;
+  for (const bad of ['garbage', '12abc', 'O12', '1O', '1,000', '10.5', '-1', 'Infinity', 'true', 12.5, -1, NaN, Infinity, true, {}, '  ']) {
+    ctx.env.KIT_FLOOR = bad;
+    const src = String(++n).padStart(16, '0'); // a fresh source each time: stay under the budget
+    assert.deepEqual(await dec(ctx, { src }), { status: 404 }, `bundle with ${JSON.stringify(bad)}`);
+    assert.deepEqual(await dec(ctx, { src, name: 'gateway.json' }), { status: 404 }, `gateway with ${JSON.stringify(bad)}`);
+    const h = await adm(ctx, 'gateway', 'health', {});
+    assert.equal(h.floorError, true, String(bad));
+  }
+  for (const good of [undefined, null, '', '0', 0, '5', ' 5 ', 5]) {
+    ctx.env.KIT_FLOOR = good;
+    assert.equal((await dec(ctx, { name: 'gateway.json' })).status, 200, `with ${JSON.stringify(good)}`);
+    assert.equal((await adm(ctx, 'gateway', 'health', {})).floorError, false);
+  }
+  ctx.env.KIT_FLOOR = '6';
+  assert.equal((await dec(ctx)).status, 404);
+  assert.equal((await adm(ctx, 'gateway', 'health', {})).effectiveFloor, 6);
+});
+
+test('an exhausted invite still reads the gateway pair: the exemption is deliberate and writes nothing', async () => {
+  const ctx = make();
+  await addInvite(ctx, { cap: 1 });
+  await putBundle(ctx);
+  await setGateway(ctx);
+  assert.equal((await dec(ctx)).status, 200);
+  assert.deepEqual(await dec(ctx), { status: 404 });
+  const before = count(ctx.storage, 'allfails') && ctx.storage.db.prepare('SELECT SUM(n) AS n FROM allfails').get().n;
+  const execs = ctx.storage.stats.execs.length;
+  for (const name of ['gateway.json', 'gateway.json.sig']) {
+    const r = await dec(ctx, { name });
+    assert.equal(r.status, 200);
+    assert.equal(r.rid, null);
+  }
+  assert.equal(ctx.storage.db.prepare('SELECT SUM(n) AS n FROM allfails').get().n, before);
+  assert.equal(used(ctx.storage), 1);
+  assert.ok(execs < ctx.storage.stats.execs.length);
+  assert.equal(writes(ctx.storage.stats.execs.slice(execs)).length, 0);
+});
+
+test('a tombstone for an unknown ref outlives the longest invite, even after other adds prune the table', async () => {
+  const ctx = make();
+  assert.deepEqual(await adm(ctx, 'gateway', 'revokeInvite', { ref: 'ref-late0000' }), { ok: true, existed: false });
+  ctx.clk.add(71 * H);
+  // A different add runs the prune of expired rows; the tombstone must survive it.
+  assert.equal((await addInvite(ctx, { ref: 'ref-00000002', tag: TAG2 })).created, true);
+  assert.deepEqual(await addInvite(ctx, { ref: 'ref-late0000', tag: TAG }), { ok: false, error: 'revoked' });
+  assert.deepEqual(await dec(ctx, { tag: TAG }), { status: 404 });
+});
+
+test('serial range and expiry boundaries are inclusive for the range and exclusive for exp', async () => {
+  const ctx = make();
+  await addInvite(ctx, { lo: 3, hi: 5, exp: T0 + 10 * H });
+  for (const s of [2, 3, 4, 5, 6]) await putBundle(ctx, s);
+  const results = [];
+  for (const s of [2, 3, 4, 5, 6]) results.push((await dec(ctx, { serial: s })).status);
+  assert.deepEqual(results, [404, 200, 200, 200, 404]);
+  ctx.clk.t = T0 + 10 * H - 1;
+  assert.equal((await dec(ctx, { serial: 4 })).status, 200, 'one ms before exp');
+  ctx.clk.t = T0 + 10 * H;
+  assert.equal((await dec(ctx, { serial: 4 })).status, 404, 'at exp it is expired');
+});
+
+test('reservations older than an hour are pruned', async () => {
+  const ctx = await ready();
+  assert.equal((await dec(ctx)).status, 200);
+  assert.equal(count(ctx.storage, 'reservations'), 1);
+  ctx.clk.add(H + 1);
+  assert.equal((await dec(ctx)).status, 200);
+  assert.equal(count(ctx.storage, 'reservations'), 1, 'only the new one is left');
+  assert.deepEqual(await ctx.core.release({ rid: 1 }), { released: false }, 'the pruned one can no longer be released');
+});
+
+test('release, reject and every admin write wait for storage.sync(); reads and no-ops do not', async () => {
+  const ctx = await ready();
+  const a = await dec(ctx);
+  const syncs = () => ctx.storage.stats.syncs;
+  let s = syncs();
+  await ctx.core.release({ rid: a.rid });
+  assert.equal(syncs(), s + 1, 'release');
+  s = syncs();
+  await ctx.core.release({ rid: a.rid });
+  assert.equal(syncs(), s, 'a second release is a no-op');
+  const b = await dec(ctx);
+  s = syncs();
+  await ctx.core.reject({ src: SRC, rid: b.rid });
+  assert.equal(syncs(), s + 1, 'reject');
+  s = syncs();
+  await ctx.core.reject({ src: SRC, rid: null });
+  assert.equal(syncs(), s, 'reject without a reservation');
+  s = syncs();
+  await adm(ctx, 'upload', 'setFloor', { floor: 1 });
+  assert.equal(syncs(), s + 1, 'admin write');
+  s = syncs();
+  await adm(ctx, 'gateway', 'health', {});
+  assert.equal(syncs(), s, 'health');
+});
+
+test('a write is judged only after its cursor is drained (rowsWritten is final then)', async () => {
+  const ctx = await ready();
+  // The fake reports 0 until toArray(); these all branch on the count.
+  assert.deepEqual(await adm(ctx, 'gateway', 'revokeInvite', { ref: 'ref-00000001' }), { ok: true, existed: true });
+  assert.equal(ctx.storage.db.prepare('SELECT revoked FROM invites').get().revoked, 1);
+  const ctx2 = await ready();
+  const a = await dec(ctx2);
+  assert.equal(a.status, 200);
+  assert.deepEqual(await ctx2.core.release({ rid: a.rid }), { released: true });
+  assert.equal(used(ctx2.storage), 0);
 });

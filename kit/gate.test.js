@@ -34,7 +34,7 @@ test('Gate end to end over the fake storage, KIT_FLOOR read from env at each cal
   const env = {};
   const g = new Gate(ctxOf(fakeStorage()), env);
   const t = Date.now();
-  const inv = { ref: 'ref-00000001', tag: TAG, tier: 'helper', lo: 1, hi: 100, exp: t + 3600000, cap: 2 };
+  const inv = { ref: 'ref-00000001', tag: TAG, tier: 'install', lo: 1, hi: 100, exp: t + 3600000, cap: 2 };
   assert.equal((await g.admin('gateway', t, 'addInvite', inv)).ok, true);
   assert.equal((await g.admin('upload', t, 'putBundle', { serial: 5, sha256: SHA, size: 10 })).ok, true);
   const a = await g.decide({ src: SRC, tag: TAG, serial: 5, name: 'bundle.tar' });
@@ -49,7 +49,7 @@ test('Gate end to end over the fake storage, KIT_FLOOR read from env at each cal
 
 test('no console.* anywhere in the shipped kit source (the deploy gate greps for it)', () => {
   const files = readdirSync(new URL('.', import.meta.url)).filter((f) => f.endsWith('.js') && !f.includes('test'));
-  assert.ok(files.includes('gate.js') && files.includes('gate-core.js') && files.includes('keys.js'));
+  assert.ok(files.includes('gate.js') && files.includes('gate-core.js'));
   for (const f of files) {
     assert.ok(!/\bconsole\s*\./.test(readFileSync(new URL(f, import.meta.url), 'utf8')), f);
   }

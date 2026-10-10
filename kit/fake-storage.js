@@ -23,7 +23,13 @@ export function fakeStorage(path = ':memory:') {
           return { toArray: () => rows, rowsRead: rows.length, rowsWritten: 0 };
         }
         const r = stmt.run(...bindings);
-        return { toArray: () => [], rowsRead: 0, rowsWritten: Number(r.changes) };
+        // Like the real cursor, rowsWritten is "so far" (0) until it is consumed.
+        let consumed = false;
+        return {
+          toArray: () => { consumed = true; return []; },
+          rowsRead: 0,
+          get rowsWritten() { return consumed ? Number(r.changes) : 0; },
+        };
       },
     },
     transactionSync(fn) {
