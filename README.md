@@ -154,9 +154,14 @@ request and its Free plan's request body is 100 MB. `KIT_HOST` stays a placehold
 and `publish` all refuse `kit-host` until it is set.
 
 **Floor.** `mode` floor with `floor` set to a serial makes the host serve no serial below it, the break-glass for a bad
-release. It is its own job in the Environment `release` with `KIT_UPLOAD_KEY`, and it runs the `floor` verb of the uploader,
-which needs no fleet repository and no owner key. Like every job here it waits for the Environment's approval, so each floor
-change is approved by the owner when it is run; `floor` 0 lifts it.
+release. It is two jobs. `floor-approve` runs in the Environment `kit-floor` (restricted to `release`, the owner as required
+reviewer, admins unable to bypass, no secret), checks the value is digits and prints it; the owner approves that run, whether it
+raises the floor, lowers it or sets 0 (which lifts it). `floor` needs it, runs in the Environment `release` with `KIT_UPLOAD_KEY`
+(a sealed secret cannot move between Environments, so the key stays) and runs the `floor` verb of the uploader, which needs no fleet
+repository and no owner key. The approval exists only once `kit-floor` is made with that reviewer (One-time repo settings): until
+then a dispatch on `release` runs unattended, and the `release` Environment itself has no reviewer (the plan, sign, kit and tag jobs
+would otherwise each wait for one). A floor run shares no concurrency group with the release runs, so it never waits behind one;
+the dashboard variable `KIT_FLOOR` stays the fastest break-glass.
 
 `.gitattributes` marks the vendored files `-text` so no checkout rewrites their line endings.
 A change to the verifier ships as the same two files in both repositories, in the same step: the fleet
@@ -218,8 +223,11 @@ The workflows' `if: github.ref == ...` lines are an accident guard, not a bounda
 ref's workflow file). The real boundary is set in the repo, not in code:
 
 - Create the Environment `release` first (Settings, Environments), restricted to the `release` branch with admins unable to
-  bypass, and put `SIGN_KEY`, `TAG_KEY` and `FLEET_READ` in it. The disk build has its own Environment `disk`
+  bypass, and put `SIGN_KEY`, `TAG_KEY`, `FLEET_READ` and `KIT_UPLOAD_KEY` in it. The disk build has its own Environment `disk`
   (restricted to `main`), so nothing about `release` gates or reaches it.
+- Create the Environment `kit-floor`, restricted to the `release` branch, with the owner (or the team `security`) as required
+  reviewer and admins unable to bypass, and no secret. It is the only gate on a floor run (`floor-approve`); `release` has no
+  reviewer, so a release run is unattended during the test phase.
 - Rulesets: `release` takes pull requests from `main` only; the tags `install-*` only the `TAG_KEY` deploy key may create.
 - A ruleset on `main` that requires pull requests.
 - Settings, Releases, **Immutable releases** on.

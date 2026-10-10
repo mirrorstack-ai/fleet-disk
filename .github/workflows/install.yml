@@ -12,8 +12,10 @@
 #   tag      creates the tag install-<serial> on this run's commit with the deploy key TAG_KEY.
 #   publish  runs the publisher on the plan's files plus the signatures; no environment, no secret.
 # Tag and publish both need kit, so no install tag or release page exists for a bundle the host cannot serve; a failed
-# upload is a re-run. The mode `floor` is a separate job: it sets the host's floor (it serves no serial below it), and like
-# every job here it waits in the Environment `release`, so each floor run is approved when it is run.
+# upload is a re-run. The mode `floor` is two jobs that set the host's floor (it serves no serial below it): `floor-approve`
+# waits in the Environment `kit-floor` (the owner is its required reviewer, it holds no secret) and prints the value to
+# approve; `floor` needs it and holds KIT_UPLOAD_KEY in `release`. The approval covers raising, lowering and 0. While the
+# Environment `kit-floor` has no required reviewer (README, One-time repo settings) nothing stops a floor run: do not rely on it.
 # Inputs reach the scripts only through env:. Which key signs is the constant KEY_SHA256, a reviewed change to this file.
 name: install
 on:
@@ -36,7 +38,8 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: install
+  # a floor run (the break-glass for a bad serial) never queues behind, or replaces, a release run, and a newer dispatch never cancels a running one
+  group: ${{ inputs.mode == 'floor' && 'install-floor' || 'install' }}
 env:
   # Filled in by hand once the key exists: the `ssh-keygen -lf` fingerprint of the key in SIGN_KEY. While it is not a
   # fingerprint the sign job refuses.
@@ -281,8 +284,22 @@ jobs:
           OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}
           KIT_HOST: ${{ env.KIT_HOST }}
         run: cd "$RUNNER_TEMP/stage" && python3 "$GITHUB_WORKSPACE/bin/fleet-install-publish.py" publish "release/install-$SERIAL" --owner-pub "$RUNNER_TEMP/owner.pub" --min-serial "$MIN_SERIAL"
+  floor-approve:
+    if: github.ref == 'refs/heads/release' && inputs.mode == 'floor'
+    environment: kit-floor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - env:
+          FLOOR: ${{ inputs.floor }}
+        run: |
+          set -eu
+          case "$FLOOR" in '' | *[!0-9]*) echo 'floor is digits only'; exit 1;; esac
+          echo "approved floor value: $FLOOR"
   floor:
     if: github.ref == 'refs/heads/release' && inputs.mode == 'floor'
+    needs: floor-approve
     environment: release
     runs-on: ubuntu-24.04
     timeout-minutes: 10

@@ -2333,7 +2333,7 @@ class Readme(unittest.TestCase):
 class Workflow(unittest.TestCase):
     TEXT = (ROOT / '.github/workflows/install.yml').read_text(encoding='utf-8')
     DISK = (ROOT / '.github/workflows/disk.yml').read_text(encoding='utf-8')
-    JOBS = {m[1]: m[2] for m in re.finditer(r'(?ms)^  (plan|sign|kit|tag|publish|floor):\n(.*?)(?=^  \w+:\n|\Z)',
+    JOBS = {m[1]: m[2] for m in re.finditer(r'(?ms)^  (plan|sign|kit|tag|publish|floor-approve|floor):\n(.*?)(?=^  [\w-]+:\n|\Z)',
                                             TEXT.split('\njobs:\n', 1)[1])}
 
     def test_it_is_a_release_branch_dispatch_of_five_jobs_and_a_floor_job(self):
@@ -2341,15 +2341,15 @@ class Workflow(unittest.TestCase):
         self.assertEqual(re.findall(r'(?m)^      (\w+):\n        (?:description|required)', self.TEXT),
                          ['mode', 'serial', 'min_serial', 'floor'])
         self.assertRegex(self.TEXT, r'(?m)^        options: \[sign, pubkey, floor\]\n        default: sign\n')
-        self.assertEqual(list(self.JOBS), ['plan', 'sign', 'kit', 'tag', 'publish', 'floor'])
-        self.assertEqual(re.findall(r'(?m)^  (\w+):$', self.TEXT.split('\njobs:\n', 1)[1]), list(self.JOBS))  # and no other job
+        self.assertEqual(list(self.JOBS), ['plan', 'sign', 'kit', 'tag', 'publish', 'floor-approve', 'floor'])
+        self.assertEqual(re.findall(r'(?m)^  ([\w-]+):$', self.TEXT.split('\njobs:\n', 1)[1]), list(self.JOBS))  # and no other job
         for bad in ('pull_request', 'push:', 'self-hosted', 'refs/heads/main', 'actions/cache'):
             self.assertNotIn(bad, self.TEXT)
         for name, job in self.JOBS.items():
             self.assertIn("github.ref == 'refs/heads/release'", job.split('steps:')[0], name)
-        self.assertEqual(re.findall(r'runs-on: (\S+)', self.TEXT), ['ubuntu-24.04'] * 6)
+        self.assertEqual(re.findall(r'runs-on: (\S+)', self.TEXT), ['ubuntu-24.04'] * 7)
         self.assertEqual([re.findall(r'(?m)^    environment: (\S+)$', j) for j in self.JOBS.values()],
-                         [['release'], ['release'], ['release'], ['release'], [], ['release']])  # publish has none: no secret, no variable of release
+                         [['release'], ['release'], ['release'], ['release'], [], ['kit-floor'], ['release']])  # publish has none: no secret, no variable of release
 
     def test_only_publish_writes_and_only_contents_and_sign_and_tag_hold_no_token(self):
         self.assertRegex(self.TEXT, r'(?m)^permissions:\n  contents: read\n')
@@ -2446,7 +2446,7 @@ class Workflow(unittest.TestCase):
     def test_each_job_needs_exactly_the_jobs_before_it(self):
         needs = {name: re.findall(r'(?m)^    needs: (.*)$', job) for name, job in self.JOBS.items()}
         self.assertEqual(needs, {'plan': [], 'sign': ['plan'], 'kit': ['[plan, sign]'], 'tag': ['[plan, sign, kit]'],
-                                 'publish': ['[plan, sign, kit, tag]'], 'floor': []})
+                                 'publish': ['[plan, sign, kit, tag]'], 'floor-approve': [], 'floor': ['floor-approve']})
 
     def declared_outputs(self, name: str) -> dict[str, tuple[str, str]]:
         """{output: (step id, step output)} from the job's `outputs:` block."""
@@ -2545,8 +2545,18 @@ class Workflow(unittest.TestCase):
     def test_the_floor_job_is_only_the_floor_mode_in_the_release_environment_with_the_upload_key(self):
         floor = self.JOBS['floor']
         self.assertIn("inputs.mode == 'floor'", floor.split('steps:')[0])
-        self.assertNotIn('needs:', floor)
-        self.assertIn('    environment: release\n', floor)   # the Environment's approval is the owner's, per run
+        self.assertIn('    needs: floor-approve\n', floor)   # the owner's approval is the kit-floor Environment's, per run
+        self.assertIn('    environment: release\n', floor)   # the key stays where it is sealed
+        approve = self.JOBS['floor-approve']
+        self.assertIn("inputs.mode == 'floor'", approve.split('steps:')[0])
+        self.assertIn('    environment: kit-floor\n', approve)
+        self.assertIn('    permissions: {}\n', approve)
+        self.assertNotIn('secrets.', approve)
+        self.assertNotIn('inputs.', self.run_body('floor-approve'))   # only through env:
+        self.assertIn('FLOOR: ${{ inputs.floor }}', approve)
+        # a floor run has a group of its own, so it never waits behind (or replaces) a release run
+        self.assertIn("group: ${{ inputs.mode == 'floor' && 'install-floor' || 'install' }}", self.TEXT)
+        self.assertNotIn('cancel-in-progress', self.TEXT)
         self.assertEqual(re.findall(r'secrets\.(\w+)', floor), ['KIT_UPLOAD_KEY'])
         self.assertIn('FLOOR: ${{ inputs.floor }}', floor)
         self.assertNotIn('inputs.', self.run_body('floor'))

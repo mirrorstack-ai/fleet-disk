@@ -1,6 +1,6 @@
 """Put a release's bundle and the gateway record on the kit host, signed by CI: `fleet-kit-upload.py bundle <dir> --owner-pub P`
 and `fleet-kit-upload.py gateway --owner-pub P`, run by the kit job of .github/workflows/install.yml on a GitHub-hosted
-runner, and `fleet-kit-upload.py floor N`, run by its floor job once the owner approves that run. There is no Cloudflare key here: the host takes a request only when it carries an Ed25519 signature of the upload
+runner, and `fleet-kit-upload.py floor N`, run by its floor job, which needs floor-approve (Environment `kit-floor`, where the owner is the required reviewer once that Environment is set up). There is no Cloudflare key here: the host takes a request only when it carries an Ed25519 signature of the upload
 role (KIT_UPLOAD_KEY), made with `openssl pkeyutl -rawin` over `kit-admin-v1\\n<role>\\n<ts_ms>\\n<METHOD>\\n<path>\\n<sha256hex(body)>`.
 
 `bundle <dir>`: <dir> holds the signed install.json and install.json.sig. The script checks the signature and the shape (the
