@@ -1,0 +1,44 @@
+// The kit Worker (K5). Public, so nothing secret: the only secret, INVITE_PEPPER,
+// is a write-only Worker secret (the deploy job makes it once, K6). KIT_DISABLED
+// and KIT_FLOOR (the phone break-glass) are dashboard variables and are NEVER
+// written here; keep_vars keeps them across deploys.
+//
+// Keys per https://developers.cloudflare.com/workers/wrangler/configuration/ :
+// bindings, vars and migrations are not inherited by an environment, so the
+// staging environment repeats them; scalar keys are repeated so the K6 settings
+// gate reads the same thing on both Workers.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "fleet-kit",
+  "main": "worker.js",
+  // Pinned. Durable Object RPC needs 2024-04-03 or later.
+  "compatibility_date": "2026-09-01",
+  // The host is fleet-kit.mirrorstack-fleet.workers.dev; no route, no custom domain.
+  "workers_dev": true,
+  "preview_urls": false,
+  // Logging off: tail would show request headers (the invite).
+  "observability": { "enabled": false },
+  "logpush": false,
+  "keep_vars": true,
+  "durable_objects": { "bindings": [{ "name": "GATE", "class_name": "Gate" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Gate"] }],
+  "r2_buckets": [{ "binding": "KIT", "bucket_name": "fleet-kit" }],
+  // Admin public keys (64 hex, raw Ed25519). Empty switches that role off. K11 fills them.
+  "vars": { "KIT_GW_PUB": "", "KIT_UP_PUB": "" },
+  "env": {
+    "staging": {
+      "name": "fleet-kit-staging",
+      "main": "worker.js",
+      "compatibility_date": "2026-09-01",
+      "workers_dev": true,
+      "preview_urls": false,
+      "observability": { "enabled": false },
+      "logpush": false,
+      "keep_vars": true,
+      "durable_objects": { "bindings": [{ "name": "GATE", "class_name": "Gate" }] },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Gate"] }],
+      "r2_buckets": [{ "binding": "KIT", "bucket_name": "fleet-kit-staging" }],
+      "vars": { "KIT_GW_PUB": "", "KIT_UP_PUB": "" }
+    }
+  }
+}

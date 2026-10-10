@@ -1,9 +1,11 @@
 # TEST-GRADE keys, made inside GitHub so the private halves never exist on a person's machine. NEVER used for R, the real
 # release key: R is made by the owner on the phone only after the identity split (spec ci-signing-2026-10-10, G0).
 #
-# One dispatch makes three ed25519 keys on a GitHub-hosted runner, in tmpfs: SIGN_KEY (T, the test signing key), TAG_KEY
-# (the test-phase install-* tag deploy key) and FLEET_READ (the read-only deploy key on mirrorstack-fleet). Each private
-# half is sealed (libsodium sealed box) to the public key of this repo's Environment `release`, whose private half only
+# One dispatch makes a set of ed25519 keys on a GitHub-hosted runner, in tmpfs. `keys: test` (the default) makes three:
+# SIGN_KEY (T, the test signing key), TAG_KEY (the test-phase install-* tag deploy key) and FLEET_READ (the read-only
+# deploy key on mirrorstack-fleet). `keys: kit-upload` makes one, KIT_UPLOAD_KEY, the Ed25519 key (PKCS8 PEM) whose
+# signature the kit host takes for a bundle upload; it has no power over Cloudflare, and its public half is printed as
+# `ed25519 <64 hex>` (the host's KIT_UP_PUB). Each private half is sealed (libsodium sealed box) to the public key of this repo's Environment `release`, whose private half only
 # GitHub holds, and only the sealed values, the public key lines and the fingerprints are printed. The plaintext never
 # reaches a log, a summary, an artifact or the job's output, and is shredded when the step ends.
 #
@@ -14,7 +16,8 @@
 # key. It then PUTs the sealed values as secrets and prints the verified public lines for the deploy-key settings (S4).
 # Dispatch:
 #   gh api repos/mirrorstack-ai/fleet-disk/environments/release/secrets/public-key      (key_id and key)
-#   gh workflow run keygen.yml --ref main -f public_key=<key> -f key_id=<key_id>
+#   gh workflow run keygen.yml --ref main -f public_key=<key> -f key_id=<key_id> [-f keys=kit-upload]
+# and, for the kit upload key, `bin/fleet-keygen-put.py --run <id> --sha <commit> --keys kit-upload`.
 name: keygen
 on:
   workflow_dispatch:
@@ -25,6 +28,11 @@ on:
       key_id:
         description: the matching `key_id` (digits)
         required: true
+      keys:
+        description: test (SIGN_KEY, TAG_KEY, FLEET_READ) or kit-upload (KIT_UPLOAD_KEY, the key that signs uploads to the kit host)
+        type: choice
+        options: [test, kit-upload]
+        default: test
 permissions: {}
 concurrency:
   group: keygen
@@ -55,6 +63,7 @@ jobs:
         env:
           PUBLIC_KEY: ${{ inputs.public_key }}
           KEY_ID: ${{ inputs.key_id }}
+          KEYS: ${{ inputs.keys }}
         run: |
           set -euo pipefail
           umask 077
@@ -62,20 +71,35 @@ jobs:
           export KEYDIR
           trap 'find "$KEYDIR" -type f -exec shred -u {} +; rm -rf "$KEYDIR"' EXIT
           test "$(stat -f -c %T "$KEYDIR")" = tmpfs
-          for name in SIGN_KEY TAG_KEY FLEET_READ; do
-            ssh-keygen -q -t ed25519 -N '' -C '' -f "$KEYDIR/$name"
-          done
+          case "$KEYS" in
+            test)
+              for name in SIGN_KEY TAG_KEY FLEET_READ; do
+                ssh-keygen -q -t ed25519 -N '' -C '' -f "$KEYDIR/$name"
+              done;;
+            kit-upload)
+              openssl genpkey -algorithm ed25519 -out "$KEYDIR/KIT_UPLOAD_KEY";;
+            *)
+              echo 'refused: keys is test or kit-upload'; exit 1;;
+          esac
           "$RUNNER_TEMP/venv/bin/python" - <<'PY'
           import base64
+          import hashlib
           import os
           import re
           import subprocess
           import sys
 
           from nacl.public import PublicKey, SealedBox
+          from nacl.signing import SigningKey
 
-          NAMES = ('SIGN_KEY', 'TAG_KEY', 'FLEET_READ')
+          KEYS = os.environ['KEYS']
+          SETS = {'test': ('SIGN_KEY', 'TAG_KEY', 'FLEET_READ'), 'kit-upload': ('KIT_UPLOAD_KEY',)}
+          if KEYS not in SETS:
+              sys.exit('refused: keys is not test or kit-upload')
+          NAMES = SETS[KEYS]
           PLAIN_LEN = 387  # an unencrypted, comment-less OpenSSH ed25519 private key file; anything else is refused
+          PEM_LEN = 119  # an unencrypted Ed25519 PKCS8 PEM from openssl genpkey: header, one 64-character line, footer
+          PKCS8_HEAD = bytes.fromhex('302e020100300506032b657004220420')  # then the 32-byte seed
           lines = []
 
 
@@ -98,16 +122,30 @@ jobs:
               path = os.path.join(os.environ['KEYDIR'], name)
               with open(path, 'rb') as handle:
                   secret = handle.read()
-              if len(secret) != PLAIN_LEN or not secret.startswith(b'-----BEGIN OPENSSH PRIVATE KEY-----\n'):
+              if KEYS == 'test':
+                  size, head = PLAIN_LEN, b'-----BEGIN OPENSSH PRIVATE KEY-----\n'
+              else:
+                  size, head = PEM_LEN, b'-----BEGIN PRIVATE KEY-----\n'
+              if len(secret) != size or not secret.startswith(head):
                   sys.exit('refused: %s is not the expected private key file' % name)
               sealed = box.encrypt(secret)
-              if len(sealed) != PLAIN_LEN + 48:
+              if len(sealed) != size + 48:
                   sys.exit('refused: %s did not seal to the expected length' % name)
+              if KEYS == 'test':
+                  with open(path + '.pub', encoding='ascii') as handle:
+                      shown_line = ' '.join(handle.read().split()[:2])
+                  shown = subprocess.run(['ssh-keygen', '-lf', path + '.pub'], check=True, capture_output=True, text=True)
+                  shown_fpr = shown.stdout.split()[1]
+              else:  # the public half is derived from the very bytes that are sealed
+                  der = base64.b64decode(b''.join(secret.splitlines()[1:-1]))
+                  if len(der) != 48 or not der.startswith(PKCS8_HEAD):
+                      sys.exit('refused: %s is not an Ed25519 private key' % name)
+                  raw_public = SigningKey(der[16:]).verify_key.encode()
+                  shown_line = 'ed25519 ' + raw_public.hex()
+                  shown_fpr = 'SHA256:' + base64.b64encode(hashlib.sha256(raw_public).digest()).decode('ascii').rstrip('=')
               emit('SEALED', name, '%s %s' % (key_id, base64.b64encode(sealed).decode('ascii')))
-              with open(path + '.pub', encoding='ascii') as handle:
-                  emit('PUBLIC', name, ' '.join(handle.read().split()[:2]))
-              shown = subprocess.run(['ssh-keygen', '-lf', path + '.pub'], check=True, capture_output=True, text=True)
-              emit('FINGERPRINT', name, shown.stdout.split()[1])
+              emit('PUBLIC', name, shown_line)
+              emit('FINGERPRINT', name, shown_fpr)
           print('\n'.join(lines))
           PY
       - name: Shred anything left in tmpfs

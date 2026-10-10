@@ -1,0 +1,16 @@
+{
+  "name": "fleet-kit",
+  "private": true,
+  "type": "module",
+  "description": "Serverless kit host: Worker front + Gate Durable Object. No runtime dependencies; wrangler is pinned for the deploy job only.",
+  "main": "run-tests.js",
+  "scripts": {
+    "test": "node --test run-tests.js"
+  },
+  "engines": {
+    "node": ">=22.15"
+  },
+  "devDependencies": {
+    "wrangler": "4.149.0"
+  }
+}

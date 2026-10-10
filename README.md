@@ -39,7 +39,7 @@ refused as unlisted.
 
 Actions, then `install`, then Run workflow on the `release` branch (the only ref the jobs accept) with `serial` and
 `min_serial` (the lowest serial this publish may carry, normally the previous release's); `mode` pubkey only prints the
-signing key's public line and fingerprint. Four jobs run in order:
+signing key's public line and fingerprint, and `mode` floor runs only the floor job (below). Five jobs run in order:
 
 - **plan** (Environment `release`, read-only deploy key `FLEET_READ` on the fleet repository, held in `/dev/shm` and wiped
   by a trap on every path) reads the folder from the fleet `release` tip as git blobs, never a checkout. It refuses unless the folder is exactly the files above as plain files, the
@@ -54,7 +54,14 @@ signing key's public line and fingerprint. Four jobs run in order:
   `/dev/shm`, refuses unless `ssh-keygen -lf` of it equals the constant `KEY_SHA256` in `install.yml` (so it refuses while
   that is a placeholder), re-hashes the bytes against the plan's sha256, signs `install.json` (namespace
   `mirrorstack-fleet-install`), `kit.json` and `deploy-pin.json` (`mirrorstack-fleet-pin`), verifies each and wipes the key.
-- **tag** (Environment `release`, deploy key `TAG_KEY`) pushes the lightweight tag `install-<serial>` on this run's commit.
+- **kit** (Environment `release`, secrets `FLEET_READ` and `KIT_UPLOAD_KEY` and nothing else) runs `bin/fleet-kit-upload.py`
+  twice: `bundle` rebuilds the tar from the fleet commit `install.json` names and uploads it, `gateway` reads the gateway record
+  and its signature from the fleet `release` tip, checks the owner's signature and uploads the pair. The install.json it works
+  from is the plan's output re-hashed against the plan's sha256, with the sign job's signature, so nothing here is downloaded.
+  The job uploads no artifact, uses no cache and writes no step summary; the log shows a size and a sha256 only. The gateway pair
+  is never in the plan's folder, which becomes a public artifact and public release assets.
+- **tag** (Environment `release`, deploy key `TAG_KEY`) pushes the lightweight tag `install-<serial>` on this run's commit. It
+  needs kit, and so does publish: no tag or release page can exist for a bundle the host cannot serve. A failed upload is a re-run.
 - **publish** (no environment, no secret) adds the signatures to the plan's files and runs
   `bin/fleet-install-publish.py publish` with the sign job's public line as `--owner-pub`.
 
@@ -142,9 +149,62 @@ a second implementation. The copy imports two helpers (a strict JSON reader and 
 those imports without changing a byte of the copy. They decide how strict the copy's rules are, so `vendor/standin.sha256`
 pins them too (one hash over the four files, in the order and form `stand_in_digest` in the script says), and the bytes
 that were hashed are the ones executed. The UTC reader is deliberately stricter than the fleet's (no fractional seconds).
+The publisher refuses a signed `bundle.size` over 90 MB (`REFUSED kit-host-size`, from `plan` on): the host takes a bundle in one
+request and its Free plan's request body is 100 MB. `KIT_HOST` stays a placeholder until the host is measured, so `plan`, `kit`
+and `publish` all refuse `kit-host` until it is set.
+
+**Floor.** `mode` floor with `floor` set to a serial makes the host serve no serial below it, the break-glass for a bad
+release. It is two jobs. `floor-approve` runs in the Environment `kit-floor` (restricted to `release`, the owner as required
+reviewer, admins unable to bypass, no secret), checks the value is digits and prints it; the owner approves that run, whether it
+raises the floor, lowers it or sets 0 (which lifts it). `floor` needs it, runs in the Environment `release` with `KIT_UPLOAD_KEY`
+(a sealed secret cannot move between Environments, so the key stays) and runs the `floor` verb of the uploader, which needs no fleet
+repository and no owner key. The approval exists only once `kit-floor` is made with that reviewer (One-time repo settings): until
+then a dispatch on `release` runs unattended, and the `release` Environment itself has no reviewer (the plan, sign, kit and tag jobs
+would otherwise each wait for one). A floor run shares no concurrency group with the release runs, so it never waits behind one;
+the dashboard variable `KIT_FLOOR` stays the fastest break-glass.
+
 `.gitattributes` marks the vendored files `-text` so no checkout rewrites their line endings.
 A change to the verifier ships as the same two files in both repositories, in the same step: the fleet
 repository's `bin/fleet-install.py vendor-sync <this checkout>` says `OK vendor-sync` when the copy and both pins agree.
+
+## The vendored packer and the kit uploader
+
+The install bundle (a deterministic tar of the listed files at the signed head, never part of a release here) is served by the
+invite-gated kit host, so something has to put it there. `bin/fleet-kit-upload.py` does, from the kit job of `install.yml`, and
+holds no Cloudflare key: the host takes a request only when it carries an Ed25519 signature of the *upload* role, made with
+`openssl pkeyutl -rawin` over `kit-admin-v1\n<role>\n<ts_ms>\n<METHOD>\n<path>\n<sha256hex(body)>` (header
+`Authorization: KitAdmin upload <ts_ms> <128 lower-case hex of the signature>`, plus `X-Kit-Sha256` with the body's hash; the
+host's own README, "Admin calls", is the contract). `KIT_UPLOAD_KEY` lives in a 0600 file on tmpfs for the length of the run and
+is overwritten and removed at the end; it is taken out of the process environment at the start, so git, ssh-keygen and openssl
+never inherit it. `OWNER_PIN_SHA256` is required for both verbs (`REFUSED key` without it). The third verb, `floor N` (`PUT /_k/floor`, read back, `REFUSED readback` unless the host says that floor), needs neither of them.
+
+- `fleet-kit-upload.py bundle <dir> --owner-pub P` checks `<dir>/install.json` (the vendored verifier, the owner's signature,
+  the bundle url is this host's for this serial), shallow-fetches the commit `bundle.head` with the runner's read-only deploy
+  key, reads `fleet/install/closure.txt` at that commit (a list of paths: data, so no code of the other repository runs here),
+  builds the tar with the vendored packer and refuses unless its size, sha256, head and tree equal install.json
+  (`REFUSED bundle-hash <field>`). Only then it does `PUT /_k/file/<serial>/bundle.tar` and requires the host's answer
+  (`{"sha256", "size"}`, as R2 holds them) to equal what it sent. An identical re-run is a 200; different bytes for the same serial
+  are a 409 `conflict`. The other 409s keep their own word (`REFUSED replay`, `rollback`, `revoked`), and another known error
+  word of the host follows the status (`REFUSED upload 401 stale`).
+- `fleet-kit-upload.py gateway --owner-pub P` reads `fleet/core/gateway.json` and `.sig` from the tip of the fleet `release`
+  branch, checks the owner's signature under namespace `mirrorstack-fleet-pin` and that the record has the gateway record's keys
+  (`serial`, `address`, `cert_sha256`, `manifest_key`, `session_key`: the other files signed under the same namespace do not),
+  and `PUT /_k/gateway/<serial>` (one to nine digits) with both files in one request, so the host flips to the pair whole or
+  not at all. The answer must carry `gserial` and the `{sha256, size}` of both files. These two files never enter the release folder.
+- This repository is public, so nothing a build holds is printed: git's stderr and the build's output go to a file in
+  `RUNNER_TEMP`, an error names the rule and never a value, and there is no stack dump. The log shows a size and a sha256 only.
+
+`vendor/bundle.py` is the fleet repository's `fleet/install/bundle.py` byte for byte, pinned by `vendor/VENDORED.sha256` (one
+lower-case hex line and a newline; the manifest copy keeps its own `vendor/manifest.sha256`). It imports two modules of the fleet,
+a git boundary and one constant; `vendor/standin-bundle/` answers those imports, pinned by one hash over its five files
+(`vendor/standin-bundle.sha256`, same form as `standin.sha256`). The uploader stops with `REFUSED vendor` unless every hash
+matches, and runs the bytes it hashed. The stand-in git module is the fleet's with two differences: an error never carries git's
+stderr, and git gets a bare environment (`PATH` and a fixed few, nothing else of the runner's). `.gitattributes` marks all of it `-text`. A change to the packer ships as the same file and the same pin in both
+repositories, in the same step; nothing on the fleet side checks `vendor/bundle.py` against its own copy yet (its
+`vendor-sync` covers the manifest only), so until that check exists a drift shows first as `REFUSED bundle-hash`. The copy's
+comments still carry the fleet's internal plan ids: they go upstream first and the file is re-vendored (comments only, so the
+tar bytes do not change) before this repository is merged, or the owner accepts them. `tests/test_kit_upload.py` freezes the packer's output against a golden sha256 on every Python
+the tests run on.
 
 ## Trust model
 
@@ -163,8 +223,11 @@ The workflows' `if: github.ref == ...` lines are an accident guard, not a bounda
 ref's workflow file). The real boundary is set in the repo, not in code:
 
 - Create the Environment `release` first (Settings, Environments), restricted to the `release` branch with admins unable to
-  bypass, and put `SIGN_KEY`, `TAG_KEY` and `FLEET_READ` in it. The disk build has its own Environment `disk`
+  bypass, and put `SIGN_KEY`, `TAG_KEY`, `FLEET_READ` and `KIT_UPLOAD_KEY` in it. The disk build has its own Environment `disk`
   (restricted to `main`), so nothing about `release` gates or reaches it.
+- Create the Environment `kit-floor`, restricted to the `release` branch, with the owner (or the team `security`) as required
+  reviewer and admins unable to bypass, and no secret. It is the only gate on a floor run (`floor-approve`); `release` has no
+  reviewer, so a release run is unattended during the test phase.
 - Rulesets: `release` takes pull requests from `main` only; the tags `install-*` only the `TAG_KEY` deploy key may create.
 - A ruleset on `main` that requires pull requests.
 - Settings, Releases, **Immutable releases** on.
@@ -191,6 +254,13 @@ leaves the runner, and the job has no token, no environment and no secret.
    take the public halves from that output, never from a separate look at the log.
 
 The verified public lines go to the deploy-key settings and the fingerprint into `install.yml` later.
+
+**The kit upload key.** The same workflow and helper make `KIT_UPLOAD_KEY`, the Ed25519 key that signs uploads to the kit host:
+dispatch with `-f keys=kit-upload` (the default is `test`), then `bin/fleet-keygen-put.py --run <id> --sha <commit> --keys kit-upload`.
+Only that one key is made (`openssl genpkey -algorithm ed25519`, a 119-byte PKCS8 PEM, no passphrase), sealed to the same
+Environment `release` key and checked the same way; the helper refuses a log of the other set. The job prints one public line,
+`KEYGEN-PUBLIC KIT_UPLOAD_KEY ed25519 <64 hex>`, derived from the very bytes that were sealed, and the SHA256 fingerprint of
+exactly those 32 bytes (the helper recomputes it). The 64 hex is the host's `KIT_UP_PUB`. The key has no Cloudflare power.
 
 ## Tests
 
