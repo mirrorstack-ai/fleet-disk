@@ -50,9 +50,11 @@ def check_sealed(name: str, text: str) -> bytes:
     """The decoded sealed box, or Refused. It cannot prove a value was sealed to the right key (nobody but GitHub can);
     it proves it is not a plaintext key and has the one length keygen.yml produces."""
     try:
-        raw = base64.b64decode(text, validate=True)    # the exact length below leaves no padding and no spare bits
+        raw = base64.b64decode(text, validate=True)
     except ValueError:
         raise Refused('%s: not base64' % name) from None
+    if base64.b64encode(raw).decode('ascii') != text:  # canonical only: 3.11's validate=True still accepts extra '=' padding
+        raise Refused('%s: not canonical base64' % name)
     if len(raw) != SEALED_LEN:
         raise Refused('%s: %d bytes, a sealed box here is exactly %d' % (name, len(raw), SEALED_LEN))
     if b'-----' in raw or b'PRIVATE KEY' in raw or all(b in PRINTABLE for b in raw):
