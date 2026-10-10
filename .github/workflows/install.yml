@@ -32,6 +32,9 @@ env:
   KEY_SHA256: SHA256:NOT-SET-fill-in-after-keygen
   # test: serials below 1000 (the test key); release: serials 1000 and up (the release key)
   SERIES: test
+  # Filled in by hand: the one host install.json's signed bundle.url may name (the bootstrap sends a helper's invite code
+  # to it). While it is not a lowercase DNS name, plan and publish refuse `kit-host`.
+  KIT_HOST: NOT-SET-fill-in-the-kit-host
   FLEET_REPO: git@github.com:mirrorstack-ai/mirrorstack-fleet.git
   # GitHub's ssh host key (ed25519, SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU), the only one ssh will accept
   GH_HOSTKEY: github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
@@ -69,17 +72,19 @@ jobs:
         run: |
           set -eu
           umask 077
-          printf '%s\n' "$FLEET_READ" > "$RUNNER_TEMP/fleet-read"
-          printf '%s\n' "$GH_HOSTKEY" > "$RUNNER_TEMP/known_hosts"
-          export GIT_SSH_COMMAND="/usr/bin/ssh -i $RUNNER_TEMP/fleet-read -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts -o GlobalKnownHostsFile=/dev/null -o HostKeyAlgorithms=ssh-ed25519"
+          d=$(mktemp -d /dev/shm/fleet.XXXXXX)
+          trap 'shred -u "$d/key" 2>/dev/null || true; rm -rf "$d"' EXIT
+          printf '%s\n' "$FLEET_READ" > "$d/key"
+          printf '%s\n' "$GH_HOSTKEY" > "$d/known_hosts"
+          export GIT_SSH_COMMAND="/usr/bin/ssh -i $d/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$d/known_hosts -o GlobalKnownHostsFile=/dev/null -o HostKeyAlgorithms=ssh-ed25519"
           git init -q "$RUNNER_TEMP/fleet"
           git -C "$RUNNER_TEMP/fleet" fetch -q --no-tags "$FLEET_REPO" '+refs/heads/release:refs/remotes/origin/release'
-          rm -f "$RUNNER_TEMP/fleet-read"
       - id: plan
         env:
           SERIAL: ${{ inputs.serial }}
           MIN_SERIAL: ${{ inputs.min_serial }}
           OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}
+          KIT_HOST: ${{ env.KIT_HOST }}
         run: python3 bin/fleet-install-publish.py plan "$RUNNER_TEMP/fleet" --serial "$SERIAL" --min-serial "$MIN_SERIAL" --out "$RUNNER_TEMP/out"
       - env:
           GH_TOKEN: ${{ github.token }}
@@ -95,9 +100,13 @@ jobs:
               echo "last release: $last. Changes to the signer code (.github, bin, vendor) since its tag:"
               echo '```'; git diff --stat "$last" HEAD -- .github bin vendor; echo '```'
               prev=$(/usr/bin/gh release download "$last" --repo "$GITHUB_REPOSITORY" --pattern install.json --output - | jq -r .source_head || true)
-              case "$prev" in *[!0-9a-f]* | '') prev=none;; esac
-              echo "Fleet commits (hashes only) on release since the last release's source ($prev):"
-              echo '```'; git -C "$RUNNER_TEMP/fleet" rev-list "$prev..$tip" || true; echo '```'
+              if printf '%s\n' "$prev" | grep -Eq '^[0-9a-f]{40}$' && commits=$(git -C "$RUNNER_TEMP/fleet" rev-list "$prev..$tip"); then
+                echo "Fleet commits (hashes only) on release since the last release's source ($prev), $(printf '%s' "$commits" | grep -c . || true) in all:"
+                echo '```'; printf '%s\n' "$commits"; echo '```'
+              else
+                echo "UNKNOWN: could not work out the fleet commits since $last's source; review EVERY commit of the fleet release branch (newest 200 of $(git -C "$RUNNER_TEMP/fleet" rev-list --count "$tip" || echo '?'), hashes only):"
+                echo '```'; git -C "$RUNNER_TEMP/fleet" rev-list "$tip" | head -n 200 || true; echo '```'
+              fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"
       - id: immutable
@@ -222,4 +231,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           IMMUTABLE_CONFIRMED: ${{ needs.plan.outputs.immutable }}
           OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}
+          KIT_HOST: ${{ env.KIT_HOST }}
         run: cd "$RUNNER_TEMP/stage" && python3 "$GITHUB_WORKSPACE/bin/fleet-install-publish.py" publish "release/install-$SERIAL" --owner-pub "$RUNNER_TEMP/owner.pub" --min-serial "$MIN_SERIAL"

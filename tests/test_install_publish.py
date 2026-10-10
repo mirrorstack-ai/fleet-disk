@@ -36,6 +36,7 @@ SERIAL = 5
 TAG = f'install-{SERIAL}'
 bundle_url = lambda serial: f'https://kit.example.org/v1/kit/{serial}/bundle.tar'  # noqa: E731  (the kit host, never GitHub)
 BUNDLE_URL = bundle_url(SERIAL)
+KIT_HOST = 'kit.example.org'  # the workflow's KIT_HOST constant, as the tests set it
 sha = lambda data: hashlib.sha256(data).hexdigest()  # noqa: E731
 blob = lambda data: hashlib.sha1(b'blob %d\0' % len(data) + data).hexdigest()  # noqa: E731
 utc = lambda dt: dt.strftime('%Y-%m-%dT%H:%M:%SZ')  # noqa: E731
@@ -47,7 +48,7 @@ PS1_TEMPLATE = (b"# a bootstrap\nWrite-Output 'hi'\n$OwnerKey = 'ssh-ed25519 UNB
                 b"$Expires = '1970-01-01T00:00:00Z'\n$Release = 'https://example.org'\n")
 SH_TEMPLATE = (b"#!/bin/sh\n# a bootstrap\nOWNER_KEY='ssh-ed25519 UNBAKED'\nEXPIRES=1970-01-01T00:00:00Z\n"
                b"RELEASES=https://example.org\n")
-BAKED_UNTIL = NOW + timedelta(days=120)  # past valid_until (90 days) and past the 30-day floor
+BAKED_UNTIL = NOW + timedelta(days=90)  # valid_until (90 days) and at the test series' cap, past the 30-day floor
 
 
 def bake(template: bytes, key_line: str, expires: str) -> bytes:
@@ -149,8 +150,8 @@ class Fixture:
     def signed_install(self, doc: dict, key: Path | None = None, namespace: str = fp.NS) -> None:
         sign(key or self.key, self.put('install.json', json.dumps(doc).encode()), namespace)
 
-    def check(self, min_serial: int = 0, now: datetime = NOW, run=fp.run_argv) -> 'fp.Plan':
-        plan = fp.check_dir(Path('release') / self.dir.name, self.pub.read_bytes(), min_serial, now, run)
+    def check(self, min_serial: int = 0, now: datetime = NOW, run=fp.run_argv, kit_host: str = '', series: str = '') -> 'fp.Plan':
+        plan = fp.check_dir(Path('release') / self.dir.name, self.pub.read_bytes(), min_serial, now, run, kit_host, series)
         self.plans.append(plan)
         return plan
 
@@ -271,6 +272,95 @@ class Publish(unittest.TestCase):
         self.assertEqual(self.fx.check().tag, TAG)
         self.fx.build(valid_until=NOW + timedelta(days=30) - timedelta(minutes=1))
         self.refuses_locally('short-validity')
+
+    # the kit host: the one host the signed bundle.url may name (a constant of the workflow)
+
+    def with_url(self, url: str) -> None:
+        self.fx.build(bundle=dict(manifest()['bundle'], url=url))
+
+    def test_the_signed_bundle_host_must_be_exactly_the_kit_host_when_one_is_given(self):
+        self.fx.build()
+        self.assertEqual(self.fx.check(kit_host=KIT_HOST).tag, TAG)
+        self.fx.check()  # check_dir alone (verify by hand) holds no host
+        for url in ('https://attacker.example/v1/kit/5/bundle.tar', 'https://evil.kit.example.org/v1/kit/5/bundle.tar',
+                    'https://kit.example.org.evil.example/v1/kit/5/bundle.tar', 'https://KIT.example.org/v1/kit/5/bundle.tar',
+                    'https://kit.example.org:443/v1/kit/5/bundle.tar', 'https://kit.example.org@attacker.example/v1/kit/5/bundle.tar',
+                    'https://attacker.example@kit.example.org/v1/kit/5/bundle.tar'):
+            with self.subTest(url):
+                self.with_url(url)
+                with self.assertRaises(fp.Refused) as why:
+                    self.fx.check(kit_host=KIT_HOST)
+                self.assertIn(why.exception.code, ('kit-host', 'form'))
+        self.with_url('https://attacker.example/v1/kit/5/bundle.tar')
+        self.refuses_locally('kit-host', kit_host=KIT_HOST)  # the probe of the review: it used to be signed
+        self.fx.check()  # and without a pin it still is: the pin is what plan and publish always give
+
+    def test_a_publish_or_plan_knows_the_kit_host_and_a_placeholder_or_a_github_name_is_none(self):
+        for bad in ('', 'NOT-SET-fill-in-the-kit-host', 'kit', 'Kit.example.org', 'kit.example.org:443', 'github.com',
+                    'raw.githubusercontent.com', 'a.b.github.io', 'kit.example.org/', ' kit.example.org', 'kit.example.org\n',
+                    'kit..example.org', '-kit.example.org', 'k\u00eft.example.org'):
+            with self.subTest(bad), self.assertRaises(fp.Refused) as why:
+                fp.check_kit_host(bad)
+            self.assertEqual(why.exception.code, 'kit-host')
+        for good in ('kit.example.org', 'a.b-c.example.co', 'kit.example'):
+            self.assertEqual(fp.check_kit_host(good), good)
+
+    def test_main_publish_refuses_another_host_before_gh_and_verify_holds_a_host_only_when_given(self):
+        self.with_url('https://attacker.example/v1/kit/5/bundle.tar')
+        gh = FakeGh()
+        code, out, _, _ = self.run_main(gh=gh)
+        self.assertEqual((code, out.strip(), gh.calls), (1, 'REFUSED kit-host', []))
+        self.assertEqual(self.run_main('verify', drop=('KIT_HOST',))[0], 0)  # by hand, offline, no pin
+        self.assertEqual(self.run_main('verify')[1].strip(), 'REFUSED kit-host')
+        self.fx.build()
+        self.assertEqual(self.run_main('verify')[0], 0)
+
+    # the validity ceiling: valid_until and the baked expiry may not be set far past the key's life
+
+    def build_days(self, valid_days: float, baked_days: float) -> None:
+        """install.json valid for valid_days and both bootstraps baked to expire baked_days from NOW."""
+        valid_until = NOW + timedelta(days=valid_days)
+        self.fx.build(valid_until=valid_until)
+        doc = manifest(valid_until)
+        for name, template in (('ps1', PS1_TEMPLATE), ('sh', SH_TEMPLATE)):
+            data = bake(template, OWNER_LINE, utc(NOW + timedelta(days=baked_days)))
+            self.fx.put(f'bootstrap.{name}', data)
+            doc['bootstrap'][name] = {'sha256': sha(data), 'blob': blob(data)}
+        doc['kit']['kit_json_sha256'] = sha((self.fx.dir / 'kit.json').read_bytes())
+        self.fx.signed_install(doc)
+
+    def test_the_validity_ceiling_is_90_days_for_the_test_series_and_180_for_release(self):
+        self.assertEqual(fp.MAX_DAYS, {'test': 90, 'release': 180})
+        for series, cap in (('test', 90), ('release', 180)):
+            with self.subTest(series):
+                self.build_days(cap, cap)
+                self.assertEqual(self.fx.check(series=series).tag, TAG)  # exactly the cap
+                self.build_days(cap + 1, cap + 1)
+                self.refuses_locally('long-validity', series=series)  # one day past it, in both
+                self.build_days(cap, cap + 1)
+                self.refuses_locally('long-validity', series=series)  # the bake alone is one day past
+                self.build_days(cap + 1, cap)
+                self.refuses_locally('long-validity', series=series)  # the install.json alone is
+        self.build_days(120, 120)
+        self.refuses_locally('long-validity', series='test')
+        self.assertEqual(self.fx.check(series='release').tag, TAG)  # 120 days is fine for release
+        self.assertEqual(self.fx.check().tag, TAG)  # an unknown series is held to the larger one
+
+    def test_a_far_future_validity_or_bake_is_refused_long_validity_by_check_dir_and_by_main(self):
+        far = (datetime(2106, 9, 18, 12, tzinfo=timezone.utc) - NOW).total_seconds() / 86400  # the review's probe
+        self.build_days(far, far)
+        self.refuses_locally('long-validity')  # with no series at all
+        gh = FakeGh()
+        code, out, _, _ = self.run_main(gh=gh)
+        self.assertEqual((code, out.strip(), gh.calls), (1, 'REFUSED long-validity', []))
+        self.build_days(90, far)  # a sane install.json whose bootstraps trust the key for good
+        self.assertEqual(self.run_main(gh=gh)[1].strip(), 'REFUSED long-validity')
+        self.build_days(120, 120)  # past the test series' 90 days: main hands the series on to check_dir
+        self.assertEqual(self.run_main(gh=gh)[1].strip(), 'REFUSED long-validity')
+        self.assertEqual(self.run_main('verify', drop=('SERIES',))[0], 0)  # verify with no series: the larger ceiling
+        self.assertEqual(self.run_main('verify', env={'SERIES': 'test'})[1].strip(), 'REFUSED long-validity')
+        self.build_days(75, 75)  # the T bake of about 75 days still publishes
+        self.assertEqual(self.run_main()[0], 0)
 
     # the owner's signature
 
@@ -669,7 +759,7 @@ class Publish(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = fp.main(['x', 'publish', f'release/{TAG}', '--owner-pub', str(self.fx.pub), '--min-serial', '0'],
-                           {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN, 'SERIES': 'test',
+                           {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN, 'SERIES': 'test', 'KIT_HOST': KIT_HOST,
                             'OWNER_PIN_SHA256': fp.key_fingerprint(self.fx.pub.read_bytes())}, gh, now=NOW)
         self.assertEqual((code, out.getvalue().strip()), (1, 'REFUSED unlisted'))
         self.assertIn('fleet-install-publish: refused unlisted\n', err.getvalue())  # the log line names the rule
@@ -988,7 +1078,7 @@ class Publish(unittest.TestCase):
 
     def run_main(self, verb='publish', gh=None, env=None, key=None, run=fp.run_argv, drop=()):
         gh = gh or FakeGh()
-        environ = {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN, 'SERIES': 'test',
+        environ = {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN, 'SERIES': 'test', 'KIT_HOST': KIT_HOST,
                    'OWNER_PIN_SHA256': fp.key_fingerprint(self.fx.pub.read_bytes()), **(env or {})}
         for name in drop:
             del environ[name]
@@ -1020,7 +1110,9 @@ class Publish(unittest.TestCase):
     def test_main_refuses_a_serial_of_the_other_series_and_a_publish_without_the_fingerprint_before_gh(self):
         self.fx.build()
         for env, drop, code in (({'SERIES': 'release'}, (), 'series'), ({}, ('SERIES',), 'series'),
-                                ({}, ('OWNER_PIN_SHA256',), 'key')):
+                                ({}, ('OWNER_PIN_SHA256',), 'key'), ({}, ('KIT_HOST',), 'kit-host'),
+                                ({'KIT_HOST': 'NOT-SET-fill-in-the-kit-host'}, (), 'kit-host'),
+                                ({'KIT_HOST': 'other.example.org'}, (), 'kit-host')):
             gh = FakeGh()
             c, out, _, _ = self.run_main(gh=gh, env=env, drop=drop)
             self.assertEqual((c, out.strip(), gh.calls), (1, f'REFUSED {code}', []))
@@ -1239,7 +1331,7 @@ class Publish(unittest.TestCase):
     def test_main_publishes_and_verify_never_calls_gh(self):
         self.fx.build()
         argv = lambda verb: ['x', verb, f'release/{TAG}', '--owner-pub', str(self.fx.pub), '--min-serial', '5']  # noqa
-        env = {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN, 'SERIES': 'test',
+        env = {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN, 'SERIES': 'test', 'KIT_HOST': KIT_HOST,
                'OWNER_PIN_SHA256': fp.key_fingerprint(self.fx.pub.read_bytes())}
         gh = FakeGh()
         out, err = io.StringIO(), io.StringIO()
@@ -1262,7 +1354,7 @@ class Publish(unittest.TestCase):
         done = subprocess.run([sys.executable, str(ROOT / 'bin/fleet-install-publish.py'), 'publish',
                                str(Path(self._tmp.name) / 'install-9'), '--owner-pub', str(self.fx.pub),
                                '--min-serial', '0'], capture_output=True, text=True, timeout=60,
-                              env={'PATH': '/usr/bin:/bin', 'SERIES': 'test',
+                              env={'PATH': '/usr/bin:/bin', 'SERIES': 'test', 'KIT_HOST': KIT_HOST,
                                    'OWNER_PIN_SHA256': fp.key_fingerprint(self.fx.pub.read_bytes())})
         self.assertEqual((done.returncode, done.stdout.strip()), (1, 'REFUSED dir'))
 
@@ -2053,17 +2145,20 @@ class PlanJob(unittest.TestCase):
         return subprocess.run([fp.GIT, '-C', str(self.fleet), *args], env=GIT_ENV, check=True, capture_output=True,
                               text=True).stdout.strip()
 
-    def files(self, head: str, tree: str, **over) -> dict[str, bytes]:
+    def files(self, head: str, tree: str, source: str | None = None, **over) -> dict[str, bytes]:
         kit = json.dumps({'serial': 3, 'files': [{'path': n, 'sha256': sha(d)} for n, d in KIT.items()],
                           'python_zip': {'version': '3.14.7', 'sha256': H64}}).encode()
         bundle = {'head': head, 'tree': tree, 'url': BUNDLE_URL, 'sha256': sha(BUNDLE_BYTES), 'size': len(BUNDLE_BYTES)}
-        doc = manifest(source_head=head, bundle=bundle, kit={'serial': 3, 'kit_json_sha256': sha(kit)})
+        doc = manifest(source_head=source or head, bundle=bundle, kit={'serial': 3, 'kit_json_sha256': sha(kit)})
         return {'install.json': json.dumps(doc).encode(), 'kit.json': kit, '.gitattributes': fp.GITATTRIBUTES,
                 'deploy-pin.json': json.dumps({'serial': 4, 'head': head, 'tree': tree}).encode(),
                 'bootstrap.ps1': PS1, 'bootstrap.sh': SH, **KIT, **over}
 
-    def build(self, mutate=lambda files: None, side: bool = False, wrong_tree: bool = False, tip: bool = True) -> None:
-        """A fleet repo whose release branch holds a source commit and then release/install-5."""
+    def build(self, mutate=lambda files: None, side: bool = False, wrong_tree: bool = False, tip: bool = True,
+              split: str = '') -> None:
+        """A fleet repo whose release branch holds a source commit and then release/install-5. `split` makes the signed
+        source_head and the bundle/pin head two different commits: 'source-side' (the source is only on a side branch),
+        'pin-side' (the pin and bundle head is), 'source-unknown' (the source is a commit id the repo does not have)."""
         self.fleet.mkdir()
         self.git('init', '-q', '-b', 'release')
         (self.fleet / 'src.txt').write_text('source\n')
@@ -2077,7 +2172,18 @@ class PlanJob(unittest.TestCase):
             self.git('commit', '-q', '-m', 'side')
             head = self.git('rev-parse', 'HEAD')
             self.git('checkout', '-q', 'release')
-        files = self.files(head, '1' * 40 if wrong_tree else self.git('rev-parse', f'{head}^{{tree}}'))
+        source = None
+        if split:
+            main_head = head
+            self.git('checkout', '-q', '-b', 'side')
+            (self.fleet / 'side.txt').write_text('side\n')
+            self.git('add', 'side.txt')
+            self.git('commit', '-q', '-m', 'side')
+            side_head = self.git('rev-parse', 'HEAD')
+            self.git('checkout', '-q', 'release')
+            head, source = {'source-side': (main_head, side_head), 'pin-side': (side_head, main_head),
+                            'source-unknown': (main_head, '8' * 40)}[split]
+        files = self.files(head, '1' * 40 if wrong_tree else self.git('rev-parse', f'{head}^{{tree}}'), source)
         mutate(files)
         folder = self.fleet / 'release' / TAG
         folder.mkdir(parents=True)
@@ -2090,7 +2196,7 @@ class PlanJob(unittest.TestCase):
 
     def plan(self, serial: int = SERIAL, env: dict | None = None):
         out, err = io.StringIO(), io.StringIO()
-        environ = {'SERIES': 'test', 'OWNER_PIN_SHA256': fp.key_fingerprint((OWNER_LINE + '\n').encode()),
+        environ = {'SERIES': 'test', 'KIT_HOST': KIT_HOST, 'OWNER_PIN_SHA256': fp.key_fingerprint((OWNER_LINE + '\n').encode()),
                    'GITHUB_OUTPUT': str(self.root / 'output'), 'GITHUB_STEP_SUMMARY': str(self.root / 'summary'), **(env or {})}
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = fp.main(['x', 'plan', str(self.fleet), '--serial', str(serial), '--min-serial', '0', '--out',
@@ -2138,6 +2244,14 @@ class PlanJob(unittest.TestCase):
                 ('another key than the constant', {}, SERIAL, {'OWNER_PIN_SHA256': 'SHA256:' + 'A' * 43}, 'key'),
                 ('the placeholder constant', {}, SERIAL, {'OWNER_PIN_SHA256': 'SHA256:NOT-SET-fill-in'}, 'key'),
                 ('a source that is not on the release branch', {'side': True}, SERIAL, {}, 'not-on-release'),
+                ('a source only on a side branch, the bundle and pin head on release', {'split': 'source-side'}, SERIAL, {},
+                 'not-on-release'),
+                ('a pin and bundle head only on a side branch, the source on release', {'split': 'pin-side'}, SERIAL, {},
+                 'not-on-release'),
+                ('a source commit the repository does not have', {'split': 'source-unknown'}, SERIAL, {}, 'fleet'),
+                ('no kit host', {}, SERIAL, {'KIT_HOST': ''}, 'kit-host'),
+                ('the placeholder kit host', {}, SERIAL, {'KIT_HOST': 'NOT-SET-fill-in-the-kit-host'}, 'kit-host'),
+                ('a kit host that is not the signed URL\'s', {}, SERIAL, {'KIT_HOST': 'other.example.org'}, 'kit-host'),
                 ('a pin tree that is not its commit\'s', {'wrong_tree': True}, SERIAL, {}, 'pin-tree'),
                 ('no release tip fetched', {'tip': False}, SERIAL, {}, 'fleet'),
                 ('another serial than the folder', {}, SERIAL + 1, {}, 'fleet')):
@@ -2251,8 +2365,11 @@ class Workflow(unittest.TestCase):
 
     def test_the_key_fingerprint_series_and_host_key_are_constants_of_the_file(self):
         env = dict(re.findall(r'(?m)^  ([A-Z_0-9]+): (.*)$', self.TEXT.split('\njobs:\n', 1)[0].split('\nenv:\n', 1)[1]))
-        self.assertEqual(set(env), {'KEY_SHA256', 'SERIES', 'FLEET_REPO', 'GH_HOSTKEY'})
+        self.assertEqual(set(env), {'KEY_SHA256', 'SERIES', 'KIT_HOST', 'FLEET_REPO', 'GH_HOSTKEY'})
         self.assertIsNone(fp.FPR.fullmatch(env['KEY_SHA256']))  # still the placeholder: the sign job refuses it
+        with self.assertRaises(fp.Refused):  # and so is the kit host: plan and publish refuse `kit-host` until it is set
+            fp.check_kit_host(env['KIT_HOST'])
+        self.assertEqual(self.TEXT.count('KIT_HOST: ${{ env.KIT_HOST }}'), 2)  # handed to plan and to publish as env
         self.assertEqual(env['SERIES'], 'test')
         host, kind, key = env['GH_HOSTKEY'].split()
         digest = hashlib.sha256(base64.b64decode(key)).digest()
@@ -2273,13 +2390,21 @@ class Workflow(unittest.TestCase):
         self.assertNotIn('/tmp', sign)
 
     def test_the_plan_job_reads_the_fleet_over_ssh_with_the_pinned_host_key_and_the_tag_job_never_forces(self):
-        for need in ('StrictHostKeyChecking=yes', 'IdentitiesOnly=yes', 'rm -f "$RUNNER_TEMP/fleet-read"',
-                     "*[!0-9]*) echo 'serial and min_serial are digits only'", '--stat "$last" HEAD -- .github bin vendor',
+        for need in ('StrictHostKeyChecking=yes', 'IdentitiesOnly=yes', '/dev/shm/fleet.', 'shred -u "$d/key"',
+                     "trap 'shred -u", 'umask 077', "*[!0-9]*) echo 'serial and min_serial are digits only'", '--stat "$last" HEAD -- .github bin vendor',
                      'include-hidden-files: true', 'OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}'):
             self.assertIn(need, self.JOBS['plan'])
         self.assertNotIn('--format', self.JOBS['plan'])  # hashes only: the fleet's commit subjects are private
+        self.assertNotIn('fleet-read', self.JOBS['plan'])  # the read key lives in tmpfs beside the others, never in RUNNER_TEMP
+        self.assertLess(self.JOBS['plan'].index("trap 'shred"), self.JOBS['plan'].index('"$FLEET_READ"'))  # trap before key
         self.assertIn('"$GITHUB_SHA:refs/tags/install-$SERIAL"', self.JOBS['tag'])
-        self.assertNotIn('--force', self.JOBS['tag'])
+        tag = self.JOBS['tag']
+        for need in ('StrictHostKeyChecking=yes', 'IdentitiesOnly=yes', 'GlobalKnownHostsFile=/dev/null'):
+            self.assertIn(need, tag)
+        self.assertNotIn('--force', tag)
+        self.assertNotRegex(tag, r'(?m)\bpush\b.*\s-\w*f')  # no -f
+        self.assertNotRegex(tag, r'(?m)\bpush\b.*[ "]\+')  # no +refspec
+        self.assertNotIn('StrictHostKeyChecking=no', self.TEXT)
 
     def test_the_publish_job_gets_the_key_from_the_sign_job_and_the_fingerprint_from_the_constant(self):
         for need in ('PUB: ${{ needs.sign.outputs.pub }}', 'OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}', 'needs: [plan, sign, tag]',
@@ -2301,6 +2426,192 @@ class Workflow(unittest.TestCase):
                      'MODE: ${{ inputs.mode }}'):
             self.assertIn(want, self.TEXT)
         self.assertIn('timeout-minutes: 60', self.JOBS['publish'])
+
+    # the wiring between the jobs, which the text checks above cannot see
+
+    def test_each_job_needs_exactly_the_jobs_before_it(self):
+        needs = {name: re.findall(r'(?m)^    needs: (.*)$', job) for name, job in self.JOBS.items()}
+        self.assertEqual(needs, {'plan': [], 'sign': ['plan'], 'tag': ['[plan, sign]'], 'publish': ['[plan, sign, tag]']})
+
+    def declared_outputs(self, name: str) -> dict[str, tuple[str, str]]:
+        """{output: (step id, step output)} from the job's `outputs:` block."""
+        block = re.search(r'(?ms)^    outputs:\n(.*?)(?=^    \w)', self.JOBS[name])
+        found = re.findall(r'(?m)^      (\w+): \$\{\{ steps\.(\w+)\.outputs\.(\w+) \}\}$', block[1]) if block else []
+        return {out: (step, inner) for out, step, inner in found}
+
+    def step_text(self, name: str, step_id: str) -> str:
+        found = re.search(rf'(?ms)^      - id: {step_id}\n(.*?)(?=^      - |\Z)', self.JOBS[name])
+        self.assertIsNotNone(found, f'{name} has no step {step_id}')
+        return found[1]
+
+    def written_outputs(self, name: str, step_id: str) -> set[str]:
+        """The output names the step with this id writes into $GITHUB_OUTPUT."""
+        if (name, step_id) == ('plan', 'plan'):  # python writes them: the publisher's own list
+            return {'serial', 'tag', 'tip'} | {f'{short}_{kind}' for short, _, _ in fp.SIGNED for kind in ('b64', 'sha')}
+        text = self.step_text(name, step_id)
+        self.assertIn('>> "$GITHUB_OUTPUT"', text)
+        names = set(re.findall(r'echo (\w+)=', text)) | set(re.findall(r"printf '(\w+)=", text))
+        if '%s_sig=%s' in text:  # the sign function: one `<short>_sig` per call
+            names |= {f'{short}_sig' for short in re.findall(r'(?m)^ +sign \S+ \S+ \S+ \S+ (\w+)$', text)}
+        return names
+
+    def test_every_output_a_job_reads_is_declared_and_every_declared_one_is_written_by_its_step(self):
+        for name in self.JOBS:
+            for out, (step_id, inner) in self.declared_outputs(name).items():
+                with self.subTest(f'{name}.{out}'):
+                    self.assertIn(inner, self.written_outputs(name, step_id))
+        declared = {name: set(self.declared_outputs(name)) for name in self.JOBS}
+        used = set(re.findall(r'needs\.(\w+)\.outputs\.(\w+)', self.TEXT))
+        self.assertGreater(len(used), 10)
+        for job, out in sorted(used):
+            self.assertIn(out, declared[job], f'needs.{job}.outputs.{out} is read but never declared')
+        for job in ('plan', 'sign'):  # and none is declared in vain
+            self.assertEqual(declared[job], {out for j, out in used if j == job}, job)
+
+    def test_the_publish_job_takes_its_serial_from_the_plan_and_runs_the_publisher_in_the_stage(self):
+        publish = self.JOBS['publish']
+        self.assertEqual(re.findall(r'(?m)^ +SERIAL: (.*)$', publish), ['${{ needs.plan.outputs.serial }}'] * 2)
+        self.assertNotIn('inputs.serial', publish)
+        self.assertIn('run: cd "$RUNNER_TEMP/stage" && python3 "$GITHUB_WORKSPACE/bin/fleet-install-publish.py" publish '
+                      '"release/install-$SERIAL"', publish)  # the publisher wants the relative release/install-N
+        upload = re.findall(r'(?m)^          name: (\S+)$', self.JOBS['plan'])
+        self.assertEqual((upload, re.findall(r'(?m)^          name: (\S+)$', publish)), (['install-stage'], ['install-stage']))
+
+    def test_the_sign_step_hashes_before_and_after_signing_and_verifies_what_it_signed(self):
+        sign = self.JOBS['sign']
+        self.assertEqual(sign.count('[ "$(sha256sum "$d/$1" | cut -d \' \' -f 1)" = "$4" ]'), 2)  # before and after
+        order = ['REFUSED hash', '-Y sign', '-Y verify', 'REFUSED changed', "printf '%s_sig=%s"]
+        self.assertEqual([sign.index(x) for x in order], sorted(sign.index(x) for x in order))
+
+    # the sign step, run for real: its run: block under bash with a throwaway key, tmpfs stood in by a temp dir
+
+    def sign_script(self, shm: Path) -> str:
+        body = '\n'.join(l[10:] for l in self.step_text('sign', 'sign').split('        run: |\n', 1)[1].splitlines())
+        self.assertIn('/dev/shm/sign.', body)
+        return body.replace('/dev/shm/', f'{shm}/')
+
+    def run_sign(self, tmp: Path, mode: str = 'sign', key: Path | None = None, key_sha: str | None = None, **over):
+        shm, bin_dir = tmp / 'shm', tmp / 'bin'
+        shm.mkdir(exist_ok=True)
+        bin_dir.mkdir(exist_ok=True)
+        # the runner is GNU/Linux; these stand-ins give this machine base64 -w0 and sha256sum
+        (bin_dir / 'base64').write_text('#!/bin/sh\nif [ "$1" = -w0 ]; then /usr/bin/base64 | tr -d "\\n"; else exec /usr/bin/base64 "$@"; fi\n')
+        sum_tool = '/usr/bin/shasum -a 256' if os.path.exists('/usr/bin/shasum') else '/usr/bin/sha256sum'
+        (bin_dir / 'sha256sum').write_text(f'#!/bin/sh\nexec {sum_tool} "$@"\n')
+        for tool in ('base64', 'sha256sum'):
+            (bin_dir / tool).chmod(0o755)
+        key = key or SHARED / 'owner-key'
+        files = {'install': (fp.NS, b'{"kind": "install"}\n'), 'kit': (fp.PIN_NS, b'{"kit": 1}\n'),
+                 'pin': (fp.PIN_NS, b'{"pin": 1}\n')}
+        env = {'PATH': f'{bin_dir}:/usr/bin:/bin', 'MODE': mode, 'SIGN_KEY': key.read_text(),
+               'KEY_SHA256': key_sha or fp.key_fingerprint(Path(str(SHARED / 'owner-key') + '.pub').read_bytes()),
+               'GITHUB_OUTPUT': str(tmp / 'out'), 'GITHUB_STEP_SUMMARY': str(tmp / 'summary')}
+        for short, (_, data) in files.items():
+            env[f'{short.upper()}_B64'] = base64.b64encode(data).decode()
+            env[f'{short.upper()}_SHA'] = sha(data)
+        env.update(over)
+        done = subprocess.run(['/bin/bash', '-c', self.sign_script(shm)], env=env, capture_output=True, text=True)
+        out = dict(l.split('=', 1) for l in (tmp / 'out').read_text().splitlines()) if (tmp / 'out').exists() else {}
+        return done, out, files, shm
+
+    @unittest.skipUnless(HAVE_KEYGEN, 'ssh-keygen is missing')
+    def test_the_sign_step_signs_the_three_files_the_publisher_accepts_and_leaves_no_key_behind(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            done, out, files, shm = self.run_sign(Path(tmp))
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertTrue(done.stdout.strip().splitlines()[-1].startswith('signed with key SHA256:'))
+            self.assertEqual(set(out), {'pub', 'install_sig', 'kit_sig', 'pin_sig'})
+            self.assertEqual(out['pub'], OWNER_LINE)
+            for short, (namespace, data) in files.items():
+                with self.subTest(short):
+                    sigfile, allowed = Path(tmp) / f'{short}.sig', Path(tmp) / 'allowed'
+                    sigfile.write_bytes(base64.b64decode(out[f'{short}_sig']))
+                    allowed.write_text(f'owner namespaces="{namespace}" {out["pub"]}\n')
+                    ok = subprocess.run(['ssh-keygen', '-Y', 'verify', '-f', str(allowed), '-I', 'owner', '-n', namespace,
+                                         '-s', str(sigfile)], input=data, capture_output=True)
+                    self.assertEqual(ok.returncode, 0, ok.stderr)
+                    if namespace == fp.PIN_NS:  # the publisher's own verifier says the same
+                        fp.verify_pin_signature(data, sigfile.read_bytes(), (out['pub'] + '\n').encode(), fp.run_argv)
+            self.assertEqual(list(shm.iterdir()), [])  # the tmpfs dir is gone on exit
+            secret_line = (SHARED / 'owner-key').read_text().splitlines()[1]
+            self.assertNotIn(secret_line, done.stdout + done.stderr + (Path(tmp) / 'out').read_text())
+
+    @unittest.skipUnless(HAVE_KEYGEN, 'ssh-keygen is missing')
+    def test_the_sign_step_refuses_a_wrong_key_a_placeholder_a_bad_hash_and_a_bad_mode_and_signs_nothing(self):
+        placeholder = 'SHA256:NOT-SET-fill-in-after-keygen'
+        for what, kw, want in (('another key than the constant', {'key': SHARED / 'stranger'}, 'REFUSED key'),
+                               ('a constant that is another fingerprint', {'key_sha': 'SHA256:' + 'A' * 43}, 'REFUSED key'),
+                               ('the placeholder constant', {'key_sha': placeholder}, 'REFUSED key-not-set'),
+                               ('a hash that is not the bytes', {'KIT_SHA': '0' * 64}, 'REFUSED hash kit.json'),
+                               ('a mode that is neither', {'mode': 'deploy'}, 'REFUSED mode')):
+            with self.subTest(what), tempfile.TemporaryDirectory() as tmp:
+                done, out, _, shm = self.run_sign(Path(tmp), **kw)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIn(want, done.stdout)
+                self.assertNotIn('pub', out)  # the public half is only handed on after every check passed
+                self.assertEqual(list(shm.iterdir()), [])
+        with tempfile.TemporaryDirectory() as tmp:  # pubkey mode prints the key and signs nothing
+            done, out, _, _ = self.run_sign(Path(tmp), mode='pubkey', key_sha=placeholder)
+            self.assertEqual((done.returncode, out), (0, {}))
+            self.assertIn(fp.key_fingerprint(OWNER_LINE.encode()), (Path(tmp) / 'summary').read_text())
+
+    # the review summary of the plan job, run for real over scratch repositories
+
+    def run_summary(self, tmp: Path, gh_says, count: int = 3):
+        """gh_says: None (gh fails), an index into the fleet commits (that is the last release's source_head) or a string."""
+        step = re.search(r'(?ms)^      - env:\n          GH_TOKEN: \$\{\{ github\.token \}\}\n        run: \|\n(.*?)(?=^      - )',
+                         self.JOBS['plan'])
+        body = '\n'.join(l[10:] for l in step[1].splitlines())
+        bin_dir, work, rt = tmp / 'bin', tmp / 'work', tmp / 'rt'
+        for d in (bin_dir, work, rt / 'fleet'):
+            d.mkdir(parents=True)
+        git = lambda repo, *a: subprocess.run([fp.GIT, '-C', str(repo), *a], env=GIT_ENV, check=True, capture_output=True,
+                                              text=True).stdout.strip()
+        git(work, 'init', '-q', '-b', 'main')
+        (work / 'f').write_text('x')
+        git(work, 'add', 'f')
+        git(work, 'commit', '-q', '-m', 'w')
+        git(work, 'tag', 'install-1')
+        git(rt / 'fleet', 'init', '-q', '-b', 'release')
+        heads = []
+        for i in range(count):
+            (rt / 'fleet' / 'f').write_text(str(i))
+            git(rt / 'fleet', 'add', 'f')
+            git(rt / 'fleet', 'commit', '-q', '-m', str(i))
+            heads.append(git(rt / 'fleet', 'rev-parse', 'HEAD'))
+        git(rt / 'fleet', 'update-ref', 'refs/remotes/origin/release', 'HEAD')
+        gh = bin_dir / 'gh'
+        if gh_says is None:
+            gh.write_text('#!/bin/sh\nexit 1\n')
+        else:
+            said = heads[gh_says] if isinstance(gh_says, int) else gh_says
+            gh.write_text(f"#!/bin/sh\nprintf '%s' '{json.dumps({'source_head': said})}'\n")
+        gh.chmod(0o755)
+        env = {'PATH': '/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin', 'RUNNER_TEMP': str(rt),
+               'GITHUB_STEP_SUMMARY': str(tmp / 'summary'), 'GITHUB_REPOSITORY': 'org/repo', 'GH_TOKEN': 'x',
+               'HOME': str(tmp), 'GIT_CONFIG_NOSYSTEM': '1'}
+        done = subprocess.run(['/bin/bash', '-c', body.replace('/usr/bin/gh', str(gh))], cwd=work, env=env,
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return (tmp / 'summary').read_text(), heads
+
+    @unittest.skipUnless(os.path.exists(fp.GIT) and shutil.which('jq'), 'git or jq is missing')
+    def test_the_review_summary_says_unknown_when_it_cannot_tell_and_never_shows_an_empty_list_as_no_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text, heads = self.run_summary(Path(tmp), 0)
+            self.assertIn('2 in all', text)  # the two commits after the first
+            self.assertIn(heads[2], text)
+            self.assertNotIn('UNKNOWN', text)
+        with tempfile.TemporaryDirectory() as tmp:
+            text, _ = self.run_summary(Path(tmp), 2)  # nothing since: said as a count, not as silence
+            self.assertIn('0 in all', text)
+            self.assertNotIn('UNKNOWN', text)
+        for what, says in (('gh fails', None), ('a source_head that is no commit id', 'zz'), ('a commit the fleet does not have', '8' * 40)):
+            with self.subTest(what), tempfile.TemporaryDirectory() as tmp:
+                text, heads = self.run_summary(Path(tmp), says)
+                self.assertIn('UNKNOWN:', text)
+                self.assertIn('review EVERY commit', text)
+                self.assertIn(heads[0], text)  # the whole list stands in for the one that could not be computed
 
 
 if __name__ == '__main__':

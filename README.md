@@ -41,14 +41,15 @@ Actions, then `install`, then Run workflow on the `release` branch (the only ref
 `min_serial` (the lowest serial this publish may carry, normally the previous release's); `mode` pubkey only prints the
 signing key's public line and fingerprint. Four jobs run in order:
 
-- **plan** (Environment `release`, read-only deploy key `FLEET_READ` on the fleet repository) reads the folder from the fleet
-  `release` tip as git blobs, never a checkout. It refuses unless the folder is exactly the files above as plain files, the
-  serial fits the series (below), the key baked into both bootstraps has the fingerprint `KEY_SHA256`, and `install.json`'s
+- **plan** (Environment `release`, read-only deploy key `FLEET_READ` on the fleet repository, held in `/dev/shm` and wiped
+  by a trap on every path) reads the folder from the fleet `release` tip as git blobs, never a checkout. It refuses unless the folder is exactly the files above as plain files, the
+  serial fits the series (below), `KIT_HOST` is set, the key baked into both bootstraps has the fingerprint `KEY_SHA256`, and `install.json`'s
   `source_head` and the pin's `head` are on that branch with the pin's `tree` that commit's tree. It runs every check below
   but the signatures. The run summary shows the tree id, each file's blob id and sha256, `install.json` and
   `deploy-pin.json` verbatim, the tag to be created, the hashes of the fleet commits since the previous release's source
   and a `diff --stat` of `.github`, `bin` and `vendor` since the last `install-*` tag (hashes and public files only: these
-  logs are public). The three files to sign leave as base64 outputs with their sha256, the folder as an artifact.
+  logs are public). When the previous release's `source_head` cannot be read or its range cannot be listed the summary says
+  `UNKNOWN` and lists the newest 200 fleet commits, never an empty list. The three files to sign leave as base64 outputs with their sha256, the folder as an artifact.
 - **sign** (Environment `release`, secret `SIGN_KEY`) runs no repository code and no third-party action. It keeps the key in
   `/dev/shm`, refuses unless `ssh-keygen -lf` of it equals the constant `KEY_SHA256` in `install.yml` (so it refuses while
   that is a placeholder), re-hashes the bytes against the plan's sha256, signs `install.json` (namespace
@@ -65,8 +66,13 @@ signing key's public line and fingerprint. Four jobs run in order:
   (the rules are `vendor/manifest.py`, a byte-identical copy of the fleet's install manifest verifier; see "The vendored
   verifier" below);
 - the signed `bundle.url` is `https://<kit-host>/v1/kit/<serial>/bundle.tar` for this very serial and the host is not
-  GitHub's (`github.com`, `githubusercontent.com` or a name below them), else `form`;
-- its `serial` is the folder's and at least `min_serial`, and `valid_until` is at least 30 days away;
+  GitHub's (`github.com`, `githubusercontent.com` or a name below them), else `form`; and the host is exactly the constant
+  `KIT_HOST` of `.github/workflows/install.yml`, else `kit-host` (the bootstrap sends a helper's invite code to that host,
+  so which host it is a reviewed change to that file, like `KEY_SHA256`; plan and publish refuse `kit-host` while `KIT_HOST`
+  is not a lowercase DNS name, and `verify` by hand holds the host only when `KIT_HOST` is set);
+- its `serial` is the folder's and at least `min_serial`, and `valid_until` is at least 30 days away and at most 90 days
+  (`SERIES=test`) or 180 days (`release`) away, else `long-validity` (the expiry is the only way a baked key stops being
+  trusted, so a merged change cannot set it far out);
 - both bootstraps are byte-exact release assets: ASCII, LF only, no CR, no BOM (`boot-bytes`), so the asset is the git
   blob and its blob id is the sha1 of the raw bytes only (no CRLF variant). The LF rule is enforced on the bootstrap
   assets themselves; `.gitattributes` stays an exact published copy of the fleet repo's own file (which sets
@@ -76,7 +82,8 @@ signing key's public line and fingerprint. Four jobs run in order:
   variable (a differently cased, scoped, indented or later assignment, `Set-Variable`, `read`, `export` and the like are
   refused; reading the variable is fine): the key must equal (type and base64) the owner key that verified
   `install.json`, and the expiry must have `valid_until`'s shape and be at least `valid_until` and at least 30 days from now
-  (`baked`; the placeholders `ssh-ed25519 UNBAKED` and 1970 are refused);
+  (`baked`; the placeholders `ssh-ed25519 UNBAKED` and 1970 are refused) and no further out than the same 90 or 180 days
+  (`long-validity`);
 - every asset is held to a size cap no larger than the bootstraps' own downloads: `install.json` 8192 bytes, each
   signature 4096, `kit.json` 65536, each kit file 4 MiB, `carrier-check.sh` 262144 (`size`); `kit.json`'s `python_zip`
   must be a `version` of the form `N.N.N` (one or two digits each) and a lowercase 64-hex `sha256` (`form`);
@@ -107,8 +114,7 @@ release. The pin may also not move back: when an `install-N` release exists, the
 lower, or if that previous pin cannot be read or is not a pin (a floor that cannot be read is no floor). The PC has no pin
 floor of its own, so this is one of the bounds on a pin rollback. The previous pin is that release's own asset (immutable,
 made by this publisher after it verified the signature), so it is not verified again, which keeps a key change possible.
-Not enforced here: that the kit host is a pinned one (the host is only held to a path shape and not to be one of GitHub's
-names; the signed sha256, size and pin tree bind the bundle), and that a first release under a new owner key follows a
+Not enforced here: that a first release under a new owner key follows a
 published handoff from the old key (a new key starts a new series instead: a serial-floor jump). The owner's own check of a
 release is `VERIFY.txt`'s `ssh-keygen` line.
 
