@@ -19,7 +19,7 @@ registerHooks({
 });
 
 // FixedLengthStream is a Workers global: too many or too few bytes is an error.
-globalThis.FixedLengthStream ??= class FixedLengthStream {
+const PolyfillFixedLengthStream = class FixedLengthStream {
   constructor(length) {
     let seen = 0;
     const ts = new TransformStream({
@@ -34,6 +34,15 @@ globalThis.FixedLengthStream ??= class FixedLengthStream {
     });
     this.readable = ts.readable;
     this.writable = ts.writable;
+  }
+};
+// Every constructor length is recorded: a test pins that the Worker streams with an exact length.
+export const fixedLengths = [];
+const BaseFixedLengthStream = globalThis.FixedLengthStream ?? PolyfillFixedLengthStream;
+globalThis.FixedLengthStream = class extends BaseFixedLengthStream {
+  constructor(length) {
+    super(length);
+    fixedLengths.push(length);
   }
 };
 

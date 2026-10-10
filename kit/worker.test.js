@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { sha256Hex } from './worker-util.js';
 import {
-  ready, get, read, bytesOf, admin, addInvite, uploadGateway, jsonOf, CODE,
+  ready, get, read, bytesOf, admin, addInvite, uploadGateway, jsonOf, CODE, fixedLengths, streamOf,
 } from './worker-harness.test-util.js';
 
 const BUNDLE = '/v1/kit/5/bundle.tar';
@@ -265,4 +265,56 @@ test('worker.js exports exactly the fetch handler and the Gate class, and never 
     assert.ok(!/\bconsole\s*\./.test(src), f);
     assert.ok(!/caches\s*\.|\bcaches\b|Response\.redirect|\bRange\b|\brange\b/.test(src.replace(/\/\/.*$/gm, '')), `${f}: no cache, redirect or range`);
   }
+});
+
+test('a 200 streams through a FixedLengthStream of exactly the stored size (exact Content-Length)', async () => {
+  const h = await ready({}, bytesOf(5000));
+  const gj = new TextEncoder().encode('{"gateway":1}');
+  const gs = new TextEncoder().encode('SIGNATURE-BYTES');
+  assert.equal((await uploadGateway(h, 1, gj, gs)).status, 200);
+  const cases = [
+    ['/v1/kit/5/bundle.tar', 5000],
+    ['/v1/kit/5/gateway.json', gj.byteLength],
+    ['/v1/kit/5/gateway.json.sig', gs.byteLength],
+  ];
+  for (const [path, size] of cases) {
+    const before = fixedLengths.length;
+    const res = await get(h, path);
+    assert.equal(res.status, 200, path);
+    await res.arrayBuffer();
+    assert.deepEqual(fixedLengths.slice(before), [size], path);
+  }
+});
+
+test('an R2 body that is longer or shorter than the recorded size errors the response body', async () => {
+  for (const delta of [1, -1]) {
+    const h = await ready({}, bytesOf(3000));
+    const get0 = h.env.KIT.get;
+    h.env.KIT.get = async (key) => {
+      const o = await get0(key);
+      const bytes = new Uint8Array(o.size + delta).fill(7);
+      return { ...o, body: streamOf(bytes) }; // size and checksum still say 3000
+    };
+    const res = await get(h, BUNDLE);
+    assert.equal(res.status, 200);
+    await assert.rejects(() => res.arrayBuffer(), `delta ${delta}`);
+    await h.settle();
+  }
+});
+
+test('a pepper under 16 characters is a 503 for a well-formed request and for an invite; a malformed request stays the 404', async () => {
+  for (const pepper of ['short', 'a'.repeat(15)]) {
+    const h = await ready();
+    h.env.INVITE_PEPPER = pepper;
+    const r = await read(await get(h, BUNDLE));
+    assert.equal(r.status, 503, pepper);
+    assert.equal(new TextDecoder().decode(r.body), 'unavailable\n');
+    await assert404(await get(h, `${BUNDLE}?x=1`));
+    const inv = await addInvite(h, { ref: 'ref-00000002', code: 'MMMM3333RR' });
+    assert.equal(inv.status, 503, pepper);
+    assert.equal((await jsonOf(inv)).error, 'unavailable');
+    assert.equal(h.q('SELECT * FROM invites').length, 1); // nothing was recorded
+  }
+  const h = await ready({ INVITE_PEPPER: 'a'.repeat(16) }); // exactly 16 is enough
+  assert.equal((await get(h, BUNDLE)).status, 200);
 });

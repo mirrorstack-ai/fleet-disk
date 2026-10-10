@@ -78,8 +78,8 @@ budget. Once the signature is good, replies are JSON and may say why (400 bad-re
 
 | Role | Route | Body |
 |---|---|---|
-| upload | `PUT /_k/file/<serial>/bundle.tar` | the tar. Needs `Content-Length` (at most 100 MiB) and `X-Kit-Sha256: <hex>`, the digest in the signed message. R2 stores it with `sha256` and `onlyIf: {etagDoesNotMatch: '*'}`: other bytes are refused (422), an existing key is never overwritten. Identical bytes: 200 `created:false`. Other bytes: 409. The upload must finish within 300 s of its signed `ts_ms` (the Gate checks the clock when it records the file). |
-| upload | `PUT /_k/gateway/<gserial>` | JSON `{"json": "<base64>", "sig": "<base64>"}` (at most 64 KiB and 4 KiB decoded). Both objects go to R2 first (write-once), are read back, then the Gate flips the pointer. A lower serial is 409 rollback. |
+| upload | `PUT /_k/file/<serial>/bundle.tar` | the tar. Needs `Content-Length` (at most 100 MiB) and `X-Kit-Sha256: <hex>`, the digest in the signed message. R2 stores it with `sha256` and `onlyIf: {etagDoesNotMatch: '*'}`: other bytes are refused (422), an existing key is never overwritten. The Worker `head()`s the key first and answers 409 for other bytes without a write, and reads it back after the put. Identical bytes: 200 `created:false`. Other bytes: 409. The 200 reply carries `sha256` and `size` as R2 holds them, so the uploader compares them with install.json. An R2 fault other than a checksum refusal is a retryable JSON 503, not a 422. The upload must finish within 300 s of its signed `ts_ms` (the Gate checks the clock when it records the file). |
+| upload | `PUT /_k/gateway/<gserial>` | JSON `{"json": "<base64>", "sig": "<base64>"}` (at most 64 KiB and 4 KiB decoded). Both objects go to R2 first (write-once, same head-then-put-then-read-back), then the Gate flips the pointer; the 200 reply carries `json:{sha256,size}` and `sig:{sha256,size}` as R2 holds them. A lower serial is 409 rollback. |
 | upload | `PUT /_k/floor` | `{"floor": <int>}` |
 | gateway | `POST /_k/invite` | `{ref, code, tier, lo, hi, exp, cap}` (`exp` in epoch ms). The Worker computes the HMAC tag from `code` and drops the code. |
 | gateway | `DELETE /_k/invite/<ref>` | none |
@@ -87,5 +87,5 @@ budget. Once the signature is good, replies are JSON and may say why (400 bad-re
 
 ### Measured on staging (K6), not here
 
-(a) a real client cut fires the release; (c) R2 refuses wrong bytes and overwrites; (d) the
+(a) a real client cut fires the release; (c) R2 refuses wrong bytes and overwrites (a second put of different bytes to an existing key returns null on real R2, and the wildcard `etagDoesNotMatch: '*'` is honoured); (d) the
 Free over-quota status; (g) CPU time. The unit tests use stand-ins and say nothing about these.

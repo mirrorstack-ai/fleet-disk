@@ -12,7 +12,10 @@
 // - R2 put(key, stream, {sha256: <hex string>, onlyIf: {etagDoesNotMatch: '*'}})
 //   makes R2 itself refuse other bytes (it throws) and refuse an overwrite
 //   (it returns null): https://developers.cloudflare.com/r2/api/workers/workers-api-reference/
-//   R2Object.checksums.sha256 is an ArrayBuffer.
+//   R2Object.checksums.sha256 is an ArrayBuffer. The '*' wildcard of etagDoesNotMatch
+//   is in the R2 changelog (2022-07-30, 2023-06-16), not on that reference page, so
+//   putOnce also head()s the key first and compares after the put: the precondition
+//   is the atomic guard, never the only one. K6 (c) measures it on real R2.
 // - FixedLengthStream(n) errors on too many or too few bytes, and as a
 //   Response body gives an exact Content-Length instead of chunked encoding:
 //   https://developers.cloudflare.com/workers/runtime-apis/streams/transformstream/
@@ -148,14 +151,14 @@ const ERROR_STATUS = {
   rollback: 409, revoked: 409, 'ceiling-life': 422, 'ceiling-downloads': 422, 'ceiling-open': 422,
 };
 
-const gateAdmin = async (env, role, ts, op, args) => {
+const gateAdmin = async (env, role, ts, op, args, extra = {}) => {
   let r;
   try {
     r = await gateStub(env).admin(role, ts, op, args);
   } catch {
     return json(503, { ok: false, error: 'unavailable' });
   }
-  if (r && r.ok) return json(200, r);
+  if (r && r.ok) return json(200, { ...r, ...extra });
   return json(ERROR_STATUS[r && r.error] ?? 400, { ok: false, error: (r && r.error) || 'bad-request' });
 };
 
@@ -166,20 +169,35 @@ async function readBack(env, key) {
   return { size: o.size, sha256: toHex(o.checksums.sha256) };
 }
 
-// One write-once object. Returns null when R2 holds exactly {sha256, size}
-// afterwards (this write or an earlier identical one), else a reply.
+// R2's own refusal of bytes that do not match the sha256 we passed (error 10037, BadDigest).
+const isChecksumError = (e) => /checksum|digest|\b10037\b/i.test(String((e && e.message) || e));
+
+// One write-once object. Returns {held} when R2 holds exactly {sha256, size}
+// afterwards (this write or an earlier identical one), else {refused: reply}.
+// R2 faults other than a checksum refusal are a retryable JSON 503, never a 422.
 async function putOnce(env, key, body, sha256, size) {
   try {
+    // An object already there with other bytes is refused before any write: the
+    // onlyIf below is the atomic guard, this is a guard that does not rest on it alone.
+    const before = await readBack(env, key);
+    if (before && (before.sha256 !== sha256 || before.size !== size)) {
+      return { refused: json(409, { ok: false, error: 'conflict' }) };
+    }
     // onlyIf etagDoesNotMatch '*': an existing key is never overwritten (put returns null).
     // sha256: R2 itself refuses other bytes (put throws), so nothing wrong is ever stored.
-    await env.KIT.put(key, body, { sha256, onlyIf: { etagDoesNotMatch: '*' } });
+    try {
+      await env.KIT.put(key, body, { sha256, onlyIf: { etagDoesNotMatch: '*' } });
+    } catch (e) {
+      if (isChecksumError(e)) return { refused: json(422, { ok: false, error: 'checksum' }) };
+      throw e;
+    }
+    const held = await readBack(env, key);
+    if (!held) return { refused: json(502, { ok: false, error: 'readback' }) };
+    if (held.sha256 !== sha256 || held.size !== size) return { refused: json(409, { ok: false, error: 'conflict' }) };
+    return { held };
   } catch {
-    return json(422, { ok: false, error: 'checksum' });
+    return { refused: json(503, { ok: false, error: 'unavailable' }) };
   }
-  const held = await readBack(env, key);
-  if (!held) return json(502, { ok: false, error: 'readback' });
-  if (held.sha256 !== sha256 || held.size !== size) return json(409, { ok: false, error: 'conflict' });
-  return null;
 }
 
 async function putBundle(request, env, ctx, a) {
@@ -189,9 +207,10 @@ async function putBundle(request, env, ctx, a) {
   const size = Number(declared);
   if (size > LIMITS.maxBundleBytes) return json(413, { ok: false, error: 'too-large' });
   if (request.body === null) return json(400, { ok: false, error: 'bad-request' });
-  const refused = await putOnce(env, bundleKey(serial), request.body, a.digest, size);
+  const { held, refused } = await putOnce(env, bundleKey(serial), request.body, a.digest, size);
   if (refused) return refused;
-  return gateAdmin(env, a.role, a.ts, 'putBundle', { serial, sha256: a.digest, size });
+  // The reply says what R2 holds, so the uploader can compare it with install.json.
+  return gateAdmin(env, a.role, a.ts, 'putBundle', { serial, sha256: a.digest, size }, { sha256: held.sha256, size: held.size });
 }
 
 async function putGateway(request, env, ctx, a) {
@@ -211,11 +230,12 @@ async function putGateway(request, env, ctx, a) {
   // does not move until setGateway, which refuses a rollback), then the pair at once.
   for (const [n, bytes] of parts) {
     const sha256 = await sha256Hex(bytes);
-    const refused = await putOnce(env, gatewayKey(gserial, n), bytes, sha256, bytes.byteLength);
+    const { held, refused } = await putOnce(env, gatewayKey(gserial, n), bytes, sha256, bytes.byteLength);
     if (refused) return refused;
-    meta[n] = { sha256, size: bytes.byteLength };
+    meta[n] = { sha256: held.sha256, size: held.size };
   }
-  return gateAdmin(env, a.role, a.ts, 'setGateway', { gserial, json: meta[GATEWAY_JSON], sig: meta[GATEWAY_SIG] });
+  const pair = { json: meta[GATEWAY_JSON], sig: meta[GATEWAY_SIG] };
+  return gateAdmin(env, a.role, a.ts, 'setGateway', { gserial, ...pair }, pair);
 }
 
 async function setFloor(request, env, ctx, a) {

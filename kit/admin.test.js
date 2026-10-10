@@ -100,7 +100,8 @@ test('bundle upload: R2 writes it once, identical bytes get 200, other bytes 409
   const a = bytesOf(5000, 1);
   const first = await uploadBundle(h, 7, a);
   assert.equal(first.status, 200);
-  assert.deepEqual(await jsonOf(first), { ok: true, created: true, key: 'kit/7/bundle.tar' });
+  // the reply says what R2 holds, so the uploader can compare it with install.json
+  assert.deepEqual(await jsonOf(first), { ok: true, created: true, key: 'kit/7/bundle.tar', sha256: await sha256Hex(a), size: 5000 });
   assert.deepEqual(h.env.KIT.objs.get('kit/7/bundle.tar').bytes, a);
   const rerun = await uploadBundle(h, 7, a);
   assert.equal(rerun.status, 200);
@@ -133,6 +134,10 @@ test('gateway pair: written to R2 first, then one atomic pointer flip; no rollba
   const s1 = new TextEncoder().encode('sig-1');
   const first = await uploadGateway(h, 3, j1, s1);
   assert.equal(first.status, 200);
+  // the reply says what R2 holds for each file
+  const reply = await jsonOf(first);
+  assert.deepEqual(reply.json, { sha256: await sha256Hex(j1), size: j1.byteLength });
+  assert.deepEqual(reply.sig, { sha256: await sha256Hex(s1), size: s1.byteLength });
   assert.deepEqual([...h.env.KIT.objs.keys()].sort(), ['kit/gateway/3/gateway.json', 'kit/gateway/3/gateway.json.sig']);
   assert.equal((await state(h)).gateway, 3);
   const same = await uploadGateway(h, 3, j1, s1);
@@ -237,4 +242,159 @@ test('wrangler.jsonc: the deploy settings the K6 gate reads back, and no break-g
   }
   assert.equal(cfg.r2_buckets[0].bucket_name, 'fleet-kit');
   assert.equal(cfg.env.staging.r2_buckets[0].bucket_name, 'fleet-kit-staging');
+});
+
+// ---- write-once, read-back and R2 faults ---------------------------------------------------
+
+const enc = new TextEncoder();
+const orphan = async (h, key, bytes) => h.env.KIT.objs.set(key, { bytes, sha: await sha256Hex(bytes) });
+// An R2 whose onlyIf precondition is ignored (the assumption the Worker must not rest on alone).
+const ignoreOnlyIf = (h) => {
+  const put = h.env.KIT.put;
+  h.env.KIT.put = (key, body, opts = {}) => put(key, body, { ...opts, onlyIf: undefined });
+};
+// A race: the first head() sees nothing, then another writer's object appears.
+const racyHead = (h) => {
+  const head = h.env.KIT.head;
+  let first = true;
+  h.env.KIT.head = async (key) => {
+    if (first) {
+      first = false;
+      return null;
+    }
+    return head(key);
+  };
+};
+
+test('write-once does not rest on onlyIf alone: an existing key with other bytes is a 409 before any put', async () => {
+  const h = await makeHarness();
+  const a = bytesOf(5000, 1);
+  assert.equal((await uploadBundle(h, 7, a)).status, 200);
+  ignoreOnlyIf(h);
+  const puts = h.env.KIT.puts;
+  const other = await uploadBundle(h, 7, bytesOf(5000, 2));
+  assert.equal(other.status, 409);
+  assert.equal(h.env.KIT.puts, puts); // no put reached R2
+  assert.deepEqual(h.env.KIT.objs.get('kit/7/bundle.tar').bytes, a); // the first bytes survive
+  assert.equal((await uploadBundle(h, 7, a)).status, 200); // the identical re-run still works
+});
+
+test('leftover R2 bytes with no Gate record: other bytes are a 409, nothing recorded, no pointer flip (bundle and gateway)', async () => {
+  const h = await makeHarness();
+  ignoreOnlyIf(h);
+  const x = bytesOf(3000, 3);
+  await orphan(h, 'kit/9/bundle.tar', x);
+  const puts = h.env.KIT.puts;
+  assert.equal((await uploadBundle(h, 9, bytesOf(3000, 4))).status, 409);
+  assert.equal(h.q('SELECT * FROM files').length, 0);
+  assert.deepEqual(h.env.KIT.objs.get('kit/9/bundle.tar').bytes, x);
+  const gx = enc.encode('{"left":"over"}');
+  await orphan(h, 'kit/gateway/9/gateway.json', gx);
+  assert.equal((await uploadGateway(h, 9, enc.encode('{"v":9}'), enc.encode('sig'))).status, 409);
+  assert.equal(h.env.KIT.puts, puts);
+  assert.deepEqual(h.env.KIT.objs.get('kit/gateway/9/gateway.json').bytes, gx);
+  assert.equal((await state(h)).gateway, null);
+  // the signature key: leftover under the .sig key only
+  const h2 = await makeHarness();
+  await orphan(h2, 'kit/gateway/9/gateway.json.sig', enc.encode('left'));
+  assert.equal((await uploadGateway(h2, 9, enc.encode('{"v":9}'), enc.encode('sig'))).status, 409);
+  assert.equal((await state(h2)).gateway, null);
+});
+
+test('the read-back after put is a guard of its own: a writer that wins the race makes it a 409 and the Gate records nothing', async () => {
+  const h = await makeHarness();
+  const x = bytesOf(3000, 3);
+  await orphan(h, 'kit/9/bundle.tar', x);
+  racyHead(h); // the pre-put head misses the other writer's object; onlyIf makes put return null
+  assert.equal((await uploadBundle(h, 9, bytesOf(3000, 4))).status, 409);
+  assert.equal(h.q('SELECT * FROM files').length, 0);
+  assert.deepEqual(h.env.KIT.objs.get('kit/9/bundle.tar').bytes, x);
+
+  const g = await makeHarness();
+  const gx = enc.encode('{"left":"over"}');
+  await orphan(g, 'kit/gateway/9/gateway.json', gx);
+  racyHead(g);
+  assert.equal((await uploadGateway(g, 9, enc.encode('{"v":9}'), enc.encode('sig'))).status, 409);
+  assert.equal((await state(g)).gateway, null);
+  assert.deepEqual(g.env.KIT.objs.get('kit/gateway/9/gateway.json').bytes, gx);
+});
+
+test('an upload with nothing to read back is a 502 readback and records nothing', async () => {
+  const h = await makeHarness();
+  h.env.KIT.head = async () => null;
+  const res = await uploadBundle(h, 7, bytesOf(100));
+  assert.equal(res.status, 502);
+  assert.equal((await jsonOf(res)).error, 'readback');
+  assert.equal(h.q('SELECT * FROM files').length, 0);
+});
+
+test('an R2 fault is a retryable JSON 503; only a checksum refusal is the 422', async () => {
+  const faults = {
+    'put throws': (h) => { h.env.KIT.put = async () => { throw new Error('R2 internal error 10001'); }; },
+    'head throws': (h) => { h.env.KIT.head = async () => { throw new Error('R2 internal error 10001'); }; },
+  };
+  for (const [name, inject] of Object.entries(faults)) {
+    for (const up of [
+      (h) => uploadBundle(h, 7, bytesOf(100)),
+      (h) => uploadGateway(h, 7, enc.encode('{"v":7}'), enc.encode('sig')),
+    ]) {
+      const h = await makeHarness();
+      inject(h);
+      const res = await up(h);
+      assert.equal(res.status, 503, name);
+      assert.equal(res.headers.get('content-type'), 'application/json', name);
+      assert.deepEqual(await jsonOf(res), { ok: false, error: 'unavailable' }, name);
+      assert.equal(h.q('SELECT * FROM files').length, 0, name);
+    }
+  }
+  const h = await makeHarness();
+  const res = await uploadBundle(h, 7, bytesOf(100), { digest: await sha256Hex(bytesOf(100, 9)) });
+  assert.equal(res.status, 422);
+  assert.equal((await jsonOf(res)).error, 'checksum');
+});
+
+// ---- limits and bounds -----------------------------------------------------------------------
+
+test('route body caps: one byte over is the 404, the cap itself is read (and refused as bad-request)', async () => {
+  const h = await makeHarness();
+  const caps = [
+    ['upload', 'PUT', '/_k/gateway/1', 131072],
+    ['upload', 'PUT', '/_k/floor', 1024],
+    ['gateway', 'POST', '/_k/invite', 4096],
+  ];
+  for (const [role, method, path, cap] of caps) {
+    await is404(await admin(h, role, method, path, 'x'.repeat(cap + 1)));
+    const at = await admin(h, role, method, path, 'x'.repeat(cap));
+    assert.equal(at.status, 400, `${method} ${path}`);
+  }
+  // routes that take no body: any declared body is the 404 (a GET cannot carry one, so the header says it)
+  await is404(await admin(h, 'gateway', 'DELETE', '/_k/invite/ref-00000001', 'x'));
+  await is404(await admin(h, 'gateway', 'GET', '/_k/state', null, { contentLength: 1 }));
+  assert.equal((await admin(h, 'gateway', 'GET', '/_k/state')).status, 200);
+});
+
+test('route and field bounds: serials, refs and invite codes', async () => {
+  const h = await makeHarness();
+  for (const serial of ['0', '012', '1234567890']) {
+    await is404(await admin(h, 'upload', 'PUT', `/_k/gateway/${serial}`, '{}'));
+  }
+  assert.equal((await admin(h, 'upload', 'PUT', '/_k/gateway/123456789', '{}')).status, 400); // routed, then refused
+  for (const ref of ['abcdefg', 'a'.repeat(65), 'bad.ref!']) {
+    await is404(await admin(h, 'gateway', 'DELETE', `/_k/invite/${ref}`));
+  }
+  for (const ref of ['abcdefgh', 'a'.repeat(64)]) {
+    assert.equal((await admin(h, 'gateway', 'DELETE', `/_k/invite/${ref}`)).status, 200, ref);
+  }
+  for (const code of ['MMMM3333R', 'MMMM3333RRR', 'AAAAAAAAAA', 'mmmm3333rr', '']) {
+    assert.equal((await addInvite(h, { ref: 'ref-00000002', code })).status, 400, code);
+  }
+  assert.equal((await addInvite(h, { ref: 'ref-00000002', code: 'MMMM3333RR' })).status, 200);
+});
+
+test('a signature the Worker accepts but the Gate clock calls stale is a 401 stale', async () => {
+  const h = await makeHarness();
+  h.gate.core.now = () => Date.now() + 6 * 60 * 1000; // the Gate clock is 6 min ahead; the Worker's is not
+  const res = await admin(h, 'upload', 'PUT', '/_k/floor', JSON.stringify({ floor: 1 }));
+  assert.equal(res.status, 401);
+  assert.equal((await jsonOf(res)).error, 'stale');
 });
