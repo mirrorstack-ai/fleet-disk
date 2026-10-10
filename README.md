@@ -152,18 +152,24 @@ The install bundle (a deterministic tar of the listed files at the signed head, 
 invite-gated kit host, so something has to put it there. `bin/fleet-kit-upload.py` does, from the kit job of `install.yml`, and
 holds no Cloudflare key: the host takes a request only when it carries an Ed25519 signature of the *upload* role, made with
 `openssl pkeyutl -rawin` over `kit-admin-v1\n<role>\n<ts_ms>\n<METHOD>\n<path>\n<sha256hex(body)>` (header
-`Authorization: KitAdmin upload.<ts_ms>.<base64url signature>`, plus `X-Kit-Sha256` with the body's hash). `KIT_UPLOAD_KEY` lives
-in a 0600 file on tmpfs for the length of the run and is overwritten and removed at the end.
+`Authorization: KitAdmin upload <ts_ms> <128 lower-case hex of the signature>`, plus `X-Kit-Sha256` with the body's hash; the
+host's own README, "Admin calls", is the contract). `KIT_UPLOAD_KEY` lives in a 0600 file on tmpfs for the length of the run and
+is overwritten and removed at the end; it is taken out of the process environment at the start, so git, ssh-keygen and openssl
+never inherit it. `OWNER_PIN_SHA256` is required for both verbs (`REFUSED key` without it).
 
 - `fleet-kit-upload.py bundle <dir> --owner-pub P` checks `<dir>/install.json` (the vendored verifier, the owner's signature,
   the bundle url is this host's for this serial), shallow-fetches the commit `bundle.head` with the runner's read-only deploy
   key, reads `fleet/install/closure.txt` at that commit (a list of paths: data, so no code of the other repository runs here),
   builds the tar with the vendored packer and refuses unless its size, sha256, head and tree equal install.json
   (`REFUSED bundle-hash <field>`). Only then it does `PUT /_k/file/<serial>/bundle.tar` and requires the host's answer
-  (`{"sha256", "size"}`) to equal what it sent. An identical re-run is a 200; different bytes for the same serial are a 409.
+  (`{"sha256", "size"}`, as R2 holds them) to equal what it sent. An identical re-run is a 200; different bytes for the same serial
+  are a 409 `conflict`. The other 409s keep their own word (`REFUSED replay`, `rollback`, `revoked`), and another known error
+  word of the host follows the status (`REFUSED upload 401 stale`).
 - `fleet-kit-upload.py gateway --owner-pub P` reads `fleet/core/gateway.json` and `.sig` from the tip of the fleet `release`
-  branch, checks the owner's signature under namespace `mirrorstack-fleet-pin`, and `POST /_k/gateway/<serial>` with both files in
-  one request, so the host flips to the pair whole or not at all. These two files never enter the release folder.
+  branch, checks the owner's signature under namespace `mirrorstack-fleet-pin` and that the record has the gateway record's keys
+  (`serial`, `address`, `cert_sha256`, `manifest_key`, `session_key`: the other files signed under the same namespace do not),
+  and `PUT /_k/gateway/<serial>` (one to nine digits) with both files in one request, so the host flips to the pair whole or
+  not at all. The answer must carry `gserial` and the `{sha256, size}` of both files. These two files never enter the release folder.
 - This repository is public, so nothing a build holds is printed: git's stderr and the build's output go to a file in
   `RUNNER_TEMP`, an error names the rule and never a value, and there is no stack dump. The log shows a size and a sha256 only.
 
@@ -171,9 +177,12 @@ in a 0600 file on tmpfs for the length of the run and is overwritten and removed
 lower-case hex line and a newline; the manifest copy keeps its own `vendor/manifest.sha256`). It imports two modules of the fleet,
 a git boundary and one constant; `vendor/standin-bundle/` answers those imports, pinned by one hash over its five files
 (`vendor/standin-bundle.sha256`, same form as `standin.sha256`). The uploader stops with `REFUSED vendor` unless every hash
-matches, and runs the bytes it hashed. The stand-in git module is the fleet's with one difference: an error never carries git's
-stderr. `.gitattributes` marks all of it `-text`. A change to the packer ships as the same file and the same pin in both
-repositories, in the same step. `tests/test_kit_upload.py` freezes the packer's output against a golden sha256 on every Python
+matches, and runs the bytes it hashed. The stand-in git module is the fleet's with two differences: an error never carries git's
+stderr, and git gets a bare environment (`PATH` and a fixed few, nothing else of the runner's). `.gitattributes` marks all of it `-text`. A change to the packer ships as the same file and the same pin in both
+repositories, in the same step; nothing on the fleet side checks `vendor/bundle.py` against its own copy yet (its
+`vendor-sync` covers the manifest only), so until that check exists a drift shows first as `REFUSED bundle-hash`. The copy's
+comments still carry the fleet's internal plan ids: they go upstream first and the file is re-vendored (comments only, so the
+tar bytes do not change) before this repository is merged, or the owner accepts them. `tests/test_kit_upload.py` freezes the packer's output against a golden sha256 on every Python
 the tests run on.
 
 ## Trust model

@@ -1,6 +1,7 @@
 """Stand-in for the one git boundary the vendored packer imports: an argument list with no shell and the same fixed flags
 on every call, so no hook and no fsmonitor command in the repository runs, paths come back unquoted and git never prompts.
-Unlike the fleet's own, an error never carries git's stderr: this runs in a public log, where a path name is a leak."""
+Unlike the fleet's own, an error never carries git's stderr, and git gets a bare environment (PATH, and nothing else of the
+caller's): this runs in a public log, where a path name is a leak, on a runner whose environment can hold a signing key."""
 from __future__ import annotations
 
 import os
@@ -10,11 +11,7 @@ from pathlib import Path
 # under this regular file: absolute and never a directory on every OS, so no hook can exist there
 NO_HOOKS = os.path.join(os.path.abspath(__file__), 'no-hooks')
 FIXED = ('-c', f'core.hooksPath={NO_HOOKS}', '-c', 'core.fsmonitor=false', '-c', 'core.quotePath=false')
-# `git rev-parse --local-env-vars`: what git itself clears before it works in another repository
-LOCAL_ENV = ('GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT',
-             'GIT_OBJECT_DIRECTORY', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_IMPLICIT_WORK_TREE', 'GIT_GRAFT_FILE',
-             'GIT_INDEX_FILE', 'GIT_NO_REPLACE_OBJECTS', 'GIT_REPLACE_REF_BASE', 'GIT_PREFIX', 'GIT_SHALLOW_FILE',
-             'GIT_COMMON_DIR')
+KEPT_ENV = ('PATH', 'SYSTEMROOT')  # the only variables of the caller's that reach git (every call here is a local read)
 
 
 class GitError(RuntimeError):
@@ -31,8 +28,9 @@ class Git:
 
     def run(self, *args: str, input: bytes | None = None) -> bytes:
         """git's stdout; stdin is input or empty, never the terminal. Raises GitError on any failure."""
-        env = {k: v for k, v in os.environ.items() if k not in LOCAL_ENV}
+        env = {k: v for k, v in os.environ.items() if k in KEPT_ENV}  # nothing else of the runner's: it can hold a secret
         env['GIT_TERMINAL_PROMPT'] = '0'
+        env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, HOME='/nonexistent')
         verb = args[0] if args else ''
         try:
             done = self._runner(['git', *FIXED, *args], cwd=self.cwd, input=input or b'', capture_output=True,

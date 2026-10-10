@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -36,6 +37,7 @@ fk.OPENSSL = OPENSSL or fk.OPENSSL
 HOST = 'kit.example.org'
 SERIAL = 7
 sha = lambda data: hashlib.sha256(data).hexdigest()  # noqa: E731
+AUTH = re.compile(r'KitAdmin (upload|gateway) ([1-9][0-9]{12,15}) ([0-9a-f]{128})')  # copied from the Worker: its only accepted form
 GOLDEN_PACK = '6043671935c55bd79ada977327b6fae943b9437ae778f9d2b042d37df49f8f9f'  # the same on 3.11, 3.13 and 3.14
 GIT_ENV = {**os.environ, 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@x',
            'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@x', 'GIT_AUTHOR_DATE': '2026-10-10T00:00:00Z',
@@ -56,8 +58,23 @@ def ssh_sign(key: Path, path: Path, namespace: str) -> None:
     subprocess.run(['ssh-keygen', '-q', '-Y', 'sign', '-f', str(key), '-n', namespace, str(path)], check=True)
 
 
+def host(status: int, error: str | None) -> tuple[int, bytes, str]:
+    """What the Worker answers after the signature is good: {ok: false, error}, and what the uploader says of it."""
+    word = error if error in ('conflict', 'replay', 'rollback', 'revoked') else f'upload {status} {error}'
+    return status, json.dumps({'ok': False, 'error': error}).encode(), f'REFUSED {word}'
+
+
+HOST_CASES = (host(409, 'conflict'), host(409, 'replay'), host(409, 'rollback'), host(409, 'revoked'), host(401, 'stale'),
+              host(422, 'checksum'), host(503, 'unavailable'), host(400, 'bad-request'),
+              (404, b'not found\n', 'REFUSED upload 404'), (409, b'', 'REFUSED upload 409'), (503, b'', 'REFUSED upload 503'),
+              (302, b'', 'REFUSED upload 302'),
+              (409, b'{"ok":false,"error":"PRIVATE-WORD"}', 'REFUSED upload 409'),  # a word the host is not known to say is not shown
+              (500, b'{"error":["conflict"]}', 'REFUSED upload 500'))
+
+
 class FakeNet:
-    """The kit host: it records every request and answers from `answer` (a function of the request) or the right readback."""
+    """The kit host: it records every request and answers from `answer` (a function of the request) or, by default, as the Worker
+    does (kit/worker.js, `gateAdmin`): the Gate's own fields plus what R2 holds."""
 
     def __init__(self, pub_pem: Path | None = None, answer=None) -> None:
         self.calls: list[dict] = []
@@ -70,18 +87,21 @@ class FakeNet:
         if self.answer is not None:
             return self.answer(call)
         if path.startswith('/_k/file/'):
-            return 200, json.dumps({'sha256': sha(body), 'size': len(body)}).encode()
+            return 200, json.dumps({'ok': True, 'created': True, 'sha256': sha(body), 'size': len(body)}).encode()
         doc = json.loads(body)
         text, sig = base64.b64decode(doc['json']), base64.b64decode(doc['sig'])
-        return 200, json.dumps({'gserial': int(path.rsplit('/', 1)[1]), 'json': {'sha256': sha(text), 'size': len(text)},
+        return 200, json.dumps({'ok': True, 'created': True, 'gserial': int(path.rsplit('/', 1)[1]),
+                                'json': {'sha256': sha(text), 'size': len(text)},
                                 'sig': {'sha256': sha(sig), 'size': len(sig)}}).encode()
 
     def signature_ok(self, call: dict) -> bool:
         """Does the Authorization header's signature verify, with the public key, over exactly the documented message."""
-        scheme, _, token = call['headers']['Authorization'].partition(' ')
-        role, ts, sig = token.split('.')
+        match = AUTH.fullmatch(call['headers']['Authorization'])  # the Worker's own grammar (kit/worker.js ADMIN_AUTH)
+        if match is None:
+            return False
+        scheme, role, ts, sig = 'KitAdmin', *match.groups()
         want = fk.message(role, int(ts), call['method'], call['path'], sha(call['body']))
-        sig_bytes = base64.urlsafe_b64decode(sig + '=' * (-len(sig) % 4))
+        sig_bytes = bytes.fromhex(sig)
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / 'm').write_bytes(want)
             (Path(tmp) / 's').write_bytes(sig_bytes)
@@ -106,6 +126,7 @@ class Fixture(unittest.TestCase):
         self.owner = keygen(self.tmp, 'owner')
         self.pub = self.tmp / 'owner.pub'
         self.pub.write_bytes(Path(str(self.owner) + '.pub').read_bytes())
+        self.pin = subprocess.run([fp.SSH_KEYGEN, '-l', '-f', str(self.pub)], capture_output=True, text=True).stdout.split()[1]
         self.up_key, self.up_pub = self.tmp / 'up.pem', self.tmp / 'up.pub.pem'
         subprocess.run([fk.OPENSSL, 'genpkey', '-algorithm', 'ed25519', '-out', str(self.up_key)], check=True, capture_output=True)
         subprocess.run([fk.OPENSSL, 'pkey', '-in', str(self.up_key), '-pubout', '-out', str(self.up_pub)], check=True, capture_output=True)
@@ -121,7 +142,7 @@ class Fixture(unittest.TestCase):
         git(self.origin, 'commit', '-q', '-m', 'head')
         self.head = git(self.origin, 'rev-parse', 'HEAD')
         self.tree = git(self.origin, 'rev-parse', 'HEAD^{tree}')
-        self.write('fleet/core/gateway.json', json.dumps({'serial': 3, 'address': '203.0.113.9'}) + '\n')
+        self.write('fleet/core/gateway.json', json.dumps(self.record(3)) + '\n')
         ssh_sign(self.owner, self.origin / 'fleet/core/gateway.json', fp.PIN_NS)
         git(self.origin, 'add', '-A')
         git(self.origin, 'commit', '-q', '-m', 'tip')
@@ -135,6 +156,10 @@ class Fixture(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
         self.sign_install()
+
+    @staticmethod
+    def record(serial: int, **extra) -> dict:
+        return {'serial': serial, 'address': '203.0.113.9', 'cert_sha256': 'ab' * 32, 'manifest_key': 'k', 'session_key': 's', **extra}
 
     def write(self, rel: str, text: str) -> None:
         path = self.origin / rel
@@ -156,7 +181,7 @@ class Fixture(unittest.TestCase):
 
     def env(self, **over) -> dict:
         env = {'KIT_HOST': HOST, 'KIT_UPLOAD_KEY': self.up_key.read_text(), 'FLEET_REPO': self.remote,
-               'RUNNER_TEMP': str(self.runner), 'PATH': os.environ['PATH']}
+               'RUNNER_TEMP': str(self.runner), 'PATH': os.environ['PATH'], 'OWNER_PIN_SHA256': self.pin}
         env.update(over)
         return {k: v for k, v in env.items() if v is not None}
 
@@ -208,7 +233,7 @@ class TestBundle(Fixture):
     def test_the_request_is_signed_by_the_upload_role_with_a_rising_time(self):
         self.bundle()
         self.bundle()
-        stamps = [int(c['headers']['Authorization'].split()[1].split('.')[1]) for c in self.net.calls]
+        stamps = [int(c['headers']['Authorization'].split()[2]) for c in self.net.calls]
         self.assertEqual(len(stamps), 2)
         self.assertLess(stamps[0], stamps[1])
         self.assertTrue(all(self.net.signature_ok(c) for c in self.net.calls))
@@ -314,11 +339,9 @@ class TestBundle(Fixture):
         self.assertEqual(len(self.net.calls), 1)
 
     def test_the_hosts_answers(self):
-        cases = ((409, b'', 'REFUSED conflict'), (404, b'not found\n', 'REFUSED upload 404'), (503, b'', 'REFUSED upload 503'),
-                 (302, b'', 'REFUSED upload 302'))
-        for status, body, line in cases:
+        for status, body, line in HOST_CASES:
             code, out, _ = self.bundle(net=FakeNet(self.up_pub, lambda call, s=status, b=body: (s, b)))
-            self.assertEqual((code, out.splitlines()[-1]), (1, line), status)
+            self.assertEqual((code, out.splitlines()[-1]), (1, line), (status, body))
         for name, answer in {'another sha': json.dumps({'sha256': '00' * 32, 'size': len(self.tar)}).encode(),
                              'another size': json.dumps({'sha256': sha(self.tar), 'size': 1}).encode(),
                              'not json': b'ok', 'a list': b'[]', 'a string size': json.dumps({'sha256': sha(self.tar), 'size': str(len(self.tar))}).encode(),
@@ -353,13 +376,88 @@ class TestBundle(Fixture):
         self.assertEqual(self.bundle(env=self.env(KIT_UPLOAD_KEY=ec.read_text()))[1].splitlines()[-1], 'REFUSED sign')
         self.assertEqual(self.net.calls, [])
 
-    def test_the_owner_pin_is_checked_when_set(self):
-        self.assertEqual(self.bundle(env=self.env(OWNER_PIN_SHA256='SHA256:' + 'A' * 43))[:2], (1, 'REFUSED key\n'))
-        mine = subprocess.run([fp.SSH_KEYGEN, '-l', '-f', str(self.pub)], capture_output=True, text=True).stdout.split()[1]
-        self.assertEqual(self.bundle(env=self.env(OWNER_PIN_SHA256=mine))[0], 0)
+    def test_the_owner_pin_is_required_and_checked_for_both_verbs(self):
+        for run in (self.bundle, self.gateway):
+            for pin in (None, '', 'SHA256:' + 'A' * 43, 'not a fingerprint'):
+                self.assertEqual(run(env=self.env(OWNER_PIN_SHA256=pin))[:2], (1, 'REFUSED key\n'), (run.__name__, pin))
+            self.assertEqual(run(env=self.env(OWNER_PIN_SHA256=self.pin))[0], 0)
+        self.assertEqual(len(self.net.calls), 2)  # only the two runs with the owner's own fingerprint reached the host
 
     def test_the_remote_is_never_read_as_an_option(self):
         self.assertEqual(self.bundle(env=self.env(FLEET_REPO='--upload-pack=touch /tmp/x'))[:2], (1, 'REFUSED fetch\n'))
+
+
+class TestBundleHygiene(Fixture):
+    """What would break a real run, or the public log, without any other test noticing."""
+
+    def cli(self, env: dict | None = None) -> subprocess.CompletedProcess:
+        """The script as a process, so what a child writes to the real fd 2 is seen (redirect_stderr cannot see it)."""
+        return subprocess.run([sys.executable, str(ROOT / 'bin/fleet-kit-upload.py'), 'bundle', str(self.folder), '--owner-pub', str(self.pub)],
+                              capture_output=True, text=True, timeout=300, env=self.env() if env is None else env)
+
+    def test_a_failing_fetch_says_one_line_on_the_real_stderr(self):
+        self.sign_install(head='99' * 20)  # not on the remote: git itself prints "not our ref ..." to its stderr
+        done = self.cli()
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (1, 'REFUSED fetch\n', 'fleet-kit-upload: refused fetch\n'))
+
+    def test_a_failing_build_says_one_line_on_the_real_stderr(self):
+        self.write('fleet/install/closure.txt', 'fleet/a.txt\nfleet/missing-customer.txt\n')
+        git(self.origin, 'add', '-A')
+        git(self.origin, 'commit', '-q', '-m', 'list')
+        self.sign_install(head=git(self.origin, 'rev-parse', 'HEAD'), tree=git(self.origin, 'rev-parse', 'HEAD^{tree}'))
+        done = self.cli()
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (1, 'REFUSED bundle-build\n', 'fleet-kit-upload: refused bundle-build\n'))
+
+    def test_a_fetch_whose_fetch_head_is_another_commit_is_refused(self):
+        real = fk.git_run
+        other = (self.head[:-1] + ('0' if self.head[-1] != '0' else '1')).encode() + b'\n'
+        wrong = lambda repo, env, *args, **kw: other if args[:1] == ('rev-parse',) else real(repo, env, *args, **kw)  # noqa: E731
+        with mock.patch.object(fk, 'git_run', wrong):
+            self.assertEqual(self.bundle()[:2], (1, 'REFUSED fetch\n'))
+        self.assertEqual(self.net.calls, [])
+
+    def test_git_gets_a_bare_environment_with_only_the_ssh_command(self):
+        runner = {'KIT_UPLOAD_KEY': 'PEM-SENTINEL', 'GITHUB_TOKEN': 'T', 'GIT_DIR': '/x', 'GIT_SSH_COMMAND': 'ssh -i /k', 'PATH': '/p'}
+        env = fk.git_env(runner)
+        self.assertEqual(env, {'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull,
+                               'GIT_TERMINAL_PROMPT': '0', 'GIT_SSH_COMMAND': 'ssh -i /k'})
+        self.assertNotIn('GIT_SSH_COMMAND', fk.git_env({'PATH': '/p'}))
+        seen = []
+        real = subprocess.run
+        with mock.patch.object(subprocess, 'run', lambda argv, **kw: (seen.append((argv, kw.get('env'))), real(argv, **kw))[1]):
+            fk.git_run(self.origin, env, 'rev-parse', 'HEAD')
+        self.assertEqual(seen[0][1], env)  # exactly that, not the process's own
+
+    def test_the_ssh_command_reaches_the_git_child(self):
+        # an ssh:// remote runs GIT_SSH_COMMAND: a script that records that it ran and then fails, so the fetch is refused
+        mark = self.tmp / 'ssh-ran'
+        script = self.tmp / 'ssh.sh'
+        script.write_text(f'#!/bin/sh\necho ran > {mark}\nexit 1\n')
+        script.chmod(0o755)
+        code, out, err = self.bundle(env=self.env(FLEET_REPO='ssh://git@example.invalid/x.git', GIT_SSH_COMMAND=str(script)))
+        self.assertEqual((code, out, err), (1, 'REFUSED fetch\n', 'fleet-kit-upload: refused fetch\n'))
+        self.assertTrue(mark.exists())
+
+    def test_the_upload_key_is_in_no_childs_environment(self):
+        pem = self.up_key.read_text()
+        seen = []
+        real = subprocess.run
+
+        def spy(argv, **kw):
+            seen.append(kw.get('env') if kw.get('env') is not None else dict(os.environ))
+            return real(argv, **kw)
+        with mock.patch.dict(os.environ, {'KIT_UPLOAD_KEY': pem}), mock.patch.object(subprocess, 'run', spy):
+            code, out, _ = self.bundle()
+            self.assertNotIn('KIT_UPLOAD_KEY', os.environ)  # taken out for good, not just hidden from the uploader's own git
+        self.assertEqual(code, 0, out)
+        self.assertGreater(len(seen), 3)  # git, ssh-keygen (several times) and openssl
+        for env in seen:
+            self.assertFalse(any(pem.splitlines()[1] in str(v) for v in env.values()))
+            self.assertNotIn('KIT_UPLOAD_KEY', env)
+
+    def test_the_constants_the_host_depends_on(self):
+        self.assertEqual(fk.MAX_UPLOAD, 90_000_000)
+        self.assertEqual((fk.MAX_SERIAL, fk.MAX_GATEWAY_SERIAL), (999_999_999, 999_999_999))  # the host's routes: one to nine digits
 
 
 class TestGateway(Fixture):
@@ -370,7 +468,7 @@ class TestGateway(Fixture):
         sig = (self.origin / 'fleet/core/gateway.json.sig').read_bytes()
         self.assertEqual(out, f'OK gateway serial=3 json={sha(text.encode())} sig={sha(sig)}\n')
         (call,) = self.net.calls
-        self.assertEqual((call['method'], call['path']), ('POST', '/_k/gateway/3'))
+        self.assertEqual((call['method'], call['path']), ('PUT', '/_k/gateway/3'))
         self.assertEqual(json.loads(call['body']), {'json': base64.b64encode(text.encode()).decode(), 'sig': base64.b64encode(sig).decode()})
         self.assertTrue(self.net.signature_ok(call))
         self.assertClean()
@@ -386,13 +484,13 @@ class TestGateway(Fixture):
         ssh_sign(key, self.origin / 'fleet/core/gateway.json', namespace)
 
     def test_the_pair_is_the_one_at_the_release_tip_not_an_older_one(self):
-        self.write('fleet/core/gateway.json', json.dumps({'serial': 4}) + '\n')
+        self.write('fleet/core/gateway.json', json.dumps(self.record(4)) + '\n')
         self.sign_gateway(self.owner, fp.PIN_NS)
         self.commit()
         self.assertIn('serial=4', self.gateway()[1])
 
     def test_a_pair_the_owner_did_not_sign_under_the_pin_namespace_is_refused(self):
-        self.commit(**{'fleet/core/gateway.json': json.dumps({'serial': 5}) + '\n'})  # the old signature no longer fits
+        self.commit(**{'fleet/core/gateway.json': json.dumps(self.record(5)) + '\n'})  # the old signature no longer fits
         self.assertEqual(self.gateway()[:2], (1, 'REFUSED sig\n'))
         self.sign_gateway(self.owner, fp.NS)  # right key, the install namespace
         self.commit()
@@ -407,25 +505,42 @@ class TestGateway(Fixture):
         git(self.origin, 'rm', '-q', 'fleet/core/gateway.json.sig')
         git(self.origin, 'commit', '-q', '-m', 'no sig')
         self.assertEqual(self.gateway()[:2], (1, 'REFUSED gateway\n'))
-        for body in ('{"serial": 0}\n', '{"serial": "3"}\n', '{"serial": true}\n', '{"serial": 3000000000}\n', '{}\n', '[]\n',
-                     '{"serial": 3, "serial": 4}\n', '{"serial": 3.5}\n'):
-            self.write('fleet/core/gateway.json', body)
+        record = json.dumps(self.record(3))
+        bodies = [record.replace('"serial": 3', f'"serial": {bad}') for bad in ('0', '"3"', 'true', '3000000000', '1000000000', '3.5')]
+        bodies += ['{}', '[]', record.replace('"serial": 3', '"serial": 3, "serial": 4')]
+        for body in bodies:
+            self.write('fleet/core/gateway.json', body + '\n')
             self.sign_gateway(self.owner, fp.PIN_NS)
             self.commit()
             self.assertEqual(self.gateway()[:2], (1, 'REFUSED gateway\n'), body)
+        self.write('fleet/core/gateway.json', record.replace('"serial": 3', '"serial": 999999999') + '\n')
+        self.sign_gateway(self.owner, fp.PIN_NS)
+        self.commit()
+        self.assertEqual(self.gateway()[0], 0)  # the host's route takes up to nine digits
+        self.assertEqual(self.net.calls[-1]['path'], '/_k/gateway/999999999')
+
+    def test_a_file_signed_under_the_pin_namespace_that_is_not_a_gateway_record_is_refused(self):
+        for name, doc in {'a deploy pin': {'serial': 3, 'sha256': 'ab' * 32}, 'a kit record': {'serial': 3, 'kit_json_sha256': 'ab' * 32},
+                          'a record short of one key': {k: v for k, v in self.record(3).items() if k != 'session_key'}}.items():
+            self.write('fleet/core/gateway.json', json.dumps(doc) + '\n')
+            self.sign_gateway(self.owner, fp.PIN_NS)  # a valid owner signature under the right namespace
+            self.commit()
+            self.assertEqual(self.gateway()[:2], (1, 'REFUSED gateway\n'), name)
         self.assertEqual(self.net.calls, [])
 
     def test_the_sizes_the_host_accepts_are_the_limits(self):
-        self.write('fleet/core/gateway.json', json.dumps({'serial': 3, 'pad': 'x' * fk.MAX_GATEWAY_JSON}) + '\n')
+        self.write('fleet/core/gateway.json', json.dumps(self.record(3, pad='x' * fk.MAX_GATEWAY_JSON)) + '\n')
         self.sign_gateway(self.owner, fp.PIN_NS)
         self.commit()
         self.assertEqual(self.gateway()[:2], (1, 'REFUSED gateway\n'))
         self.assertEqual((fk.MAX_GATEWAY_JSON, fk.MAX_GATEWAY_SIG), (65536, 4096))
 
     def test_the_hosts_answers(self):
-        self.assertEqual(self.gateway(net=FakeNet(self.up_pub, lambda c: (409, b'')))[:2], (1, 'REFUSED conflict\n'))
-        self.assertEqual(self.gateway(net=FakeNet(self.up_pub, lambda c: (404, b'')))[:2], (1, 'REFUSED upload 404\n'))
-        for answer in ({'gserial': 4, 'json': {}, 'sig': {}}, {'gserial': 3, 'json': {'sha256': '0' * 64, 'size': 1}, 'sig': {}}, []):
+        for status, body, line in HOST_CASES:
+            code, out, _ = self.gateway(net=FakeNet(self.up_pub, lambda call, s=status, b=body: (s, b)))
+            self.assertEqual((code, out), (1, line + '\n'), (status, body))
+        for answer in ({'gserial': 4, 'json': {}, 'sig': {}}, {'gserial': 3, 'json': {'sha256': '0' * 64, 'size': 1}, 'sig': {}}, [],
+                       {'ok': True, 'created': True, 'gserial': 3}):  # the last: no read-back at all
             net = FakeNet(self.up_pub, lambda c, a=answer: (200, json.dumps(a).encode()))
             self.assertEqual(self.gateway(net=net)[:2], (1, 'REFUSED readback\n'), answer)
 
@@ -461,10 +576,22 @@ class TestSigner(unittest.TestCase):
         signer.close()
         self.assertEqual(list(self.shm.iterdir()), [])
 
+    def test_the_header_is_the_workers_grammar_and_the_default_clock_is_epoch_milliseconds(self):
+        signer = fk.Signer(self.pem.read_text())
+        self.addCleanup(signer.close)
+        before = time.time() * 1000
+        auth = signer.sign('PUT', '/_k/file/7/bundle.tar', b'x')['Authorization']
+        after = time.time() * 1000
+        match = AUTH.fullmatch(auth)  # the Worker takes this form and no other (13 to 16 digits, 128 hex)
+        self.assertIsNotNone(match, auth)
+        self.assertEqual(match.group(1), 'upload')
+        self.assertEqual(len(match.group(2)), 13)
+        self.assertTrue(before - 1 <= int(match.group(2)) <= after + 1)
+
     def test_the_time_rises_even_when_the_clock_does_not(self):
         signer = fk.Signer(self.pem.read_text(), now_ms=lambda: 5000)
         self.addCleanup(signer.close)
-        stamps = [int(signer.sign('PUT', '/p', b'')['Authorization'].split('.')[1]) for _ in range(3)]
+        stamps = [int(signer.sign('PUT', '/p', b'')['Authorization'].split()[2]) for _ in range(3)]
         self.assertEqual(stamps, [5000, 5001, 5002])
 
     def test_openssl_failing_is_sign_and_the_argument_list_holds_no_key(self):
@@ -620,7 +747,7 @@ class TestScript(unittest.TestCase):
         self.assertEqual(sorted(said - set(fk.CODES) - {'form', 'key', 'kit-host', 'sig'}), [])
         self.assertEqual(fk.CODES, ('vendor', 'args', 'env', 'key', 'install', 'kit-host', 'fetch', 'closure', 'bundle-build',
                                     'bundle-hash', 'bundle-size', 'gateway', 'sig', 'sign', 'net', 'upload', 'conflict',
-                                    'readback', 'internal'))
+                                    'replay', 'rollback', 'revoked', 'readback', 'internal'))
 
     def test_the_script_prints_no_traceback_and_no_value(self):
         self.assertNotIn('traceback', self.SRC.lower())
@@ -659,6 +786,17 @@ class TestScript(unittest.TestCase):
             (root / 'a/b/f').write_bytes(b'k')
             fk.wipe_tree(root)
             self.assertFalse(root.exists())
+
+    def test_the_wipe_zeroes_a_read_only_file_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'object'
+            path.write_bytes(b'secret' * 100)
+            path.chmod(0o444)  # as git writes its objects
+            seen = []
+            real_unlink = Path.unlink
+            with mock.patch.object(Path, 'unlink', lambda self, *a, **k: (seen.append(self.read_bytes()), real_unlink(self, *a, **k))):
+                fk.wipe_tree(Path(tmp))
+            self.assertEqual(seen, [bytes(600)])
 
 
 if __name__ == '__main__':

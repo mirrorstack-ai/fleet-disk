@@ -11,8 +11,8 @@ equal install.json (`REFUSED bundle-hash`). Only then does it PUT /_k/file/<seri
 says it stored.
 
 `gateway`: reads fleet/core/gateway.json and fleet/core/gateway.json.sig from the tip of the fleet `release` branch, checks
-the owner's signature under the pin's namespace (ssh-keygen -Y verify) and POSTs the pair as one request, so the host flips
-to it whole or not at all. These two files are not part of the public release folder and never pass through an artifact.
+the owner's signature under the pin's namespace (ssh-keygen -Y verify) and the shape of the record, and PUTs the pair as one
+request, so the host flips to it whole or not at all. These two files are not part of the public release folder and never pass through an artifact.
 
 This repository is public, so nothing here prints what it built: the build's own output goes to a file in RUNNER_TEMP that is
 never printed, the log shows only a size and a sha256, and an error names the rule, never a value. No stack dump is
@@ -120,7 +120,13 @@ except ValueError:  # fail closed, and say it the way a refusal is said
 # ---------------------------------------------------------------------------------------------------------------
 
 CODES = ('vendor', 'args', 'env', 'key', 'install', 'kit-host', 'fetch', 'closure', 'bundle-build', 'bundle-hash',
-         'bundle-size', 'gateway', 'sig', 'sign', 'net', 'upload', 'conflict', 'readback', 'internal')  # the word after REFUSED
+         'bundle-size', 'gateway', 'sig', 'sign', 'net', 'upload', 'conflict', 'replay', 'rollback', 'revoked', 'readback',
+         'internal')  # the word after REFUSED
+# What the host says (a JSON `error` word, only after it has accepted the signature) and what it is called here: a 409 is
+# one of four different things, and only `conflict` means other bytes for the same serial.
+HOST_REFUSALS = ('conflict', 'replay', 'rollback', 'revoked')
+HOST_WORDS = ('bad-request', 'expired', 'stale', 'forbidden', 'checksum', 'too-large', 'length-required', 'readback',
+              'unavailable', 'ceiling-life', 'ceiling-downloads', 'ceiling-open')  # shown after the status, never any other word
 ROLE = 'upload'
 MESSAGE_TAG = 'kit-admin-v1'
 MAX_UPLOAD = 90 * 1000 * 1000  # bytes: the Free plan's request body is 100 MB, and the host's own cap sits under it
@@ -130,7 +136,9 @@ MAX_INSTALL = 8192  # install.json (the verifier's own cap)
 MAX_SIG = 4096
 MAX_GATEWAY_JSON, MAX_GATEWAY_SIG = 65536, 4096  # what the host accepts of each file of the pair
 MAX_SERIAL = 999999999  # the host's range for a bundle serial
-MAX_GATEWAY_SERIAL = 1 << 31
+MAX_GATEWAY_SERIAL = MAX_SERIAL  # the host's route takes one to nine digits
+GATEWAY_KEYS = ('serial', 'address', 'cert_sha256', 'manifest_key', 'session_key')  # a gateway record has all of these;
+# kit.json and deploy-pin.json, signed under the same namespace by the same key, do not
 MAX_ANSWER = 65536  # the most of an answer that is read
 CLOSURE_PATH = 'fleet/install/closure.txt'
 GATEWAY_PATH, GATEWAY_SIG_PATH = 'fleet/core/gateway.json', 'fleet/core/gateway.json.sig'
@@ -170,7 +178,10 @@ def sha256_hex(data: bytes) -> str:
 
 
 def wipe(path: Path) -> None:
-    """Overwrite a file with zeros and remove it (shred -u where there is no shred); missing is fine."""
+    """Overwrite a file with zeros and remove it; missing is fine. A read-only file (git writes its objects 0444) is made
+    writable first, so it is zeroed too."""
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
     try:
         size = path.stat().st_size
         with open(path, 'r+b') as f:
@@ -248,10 +259,6 @@ def parse_closure(data: bytes) -> list[str]:
 
 # --- the signed request --------------------------------------------------------------------------------------------
 
-def b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode('ascii').rstrip('=')
-
-
 def message(role: str, ts_ms: int, method: str, path: str, body_sha: str) -> bytes:
     """What the key signs, byte for byte: the tag, the role, the time in milliseconds, the method, the path (no host, no
     query) and the sha256 of the body, one to a line and no final newline."""
@@ -277,15 +284,17 @@ class Signer:
         wipe_tree(self.dir)
 
     def sign(self, method: str, path: str, body: bytes) -> dict[str, str]:
-        """The headers of one admin call: Authorization: KitAdmin upload.<ts_ms>.<signature>, and X-Kit-Sha256, the hash
-        of the body that the signature covers. The time is strictly later than the one before (the host insists)."""
+        """The headers of one admin call: `Authorization: KitAdmin upload <ts_ms> <signature as 128 lower-case hex>`, and
+        X-Kit-Sha256, the hash of the body that the signature covers. The time is strictly later than the one before (the
+        host insists)."""
         self._last = ts = max(self._now_ms(), self._last + 1)
         body_sha = sha256_hex(body)
         msg, sig = self.dir / 'msg', self.dir / 'sig'
         msg.write_bytes(message(ROLE, ts, method, path, body_sha))
         try:
             done = self._run([OPENSSL, 'pkeyutl', '-sign', '-rawin', '-inkey', str(self.key), '-in', str(msg), '-out', str(sig)],
-                             stdin=subprocess.DEVNULL, capture_output=True, check=False, timeout=SIGN_TIMEOUT)
+                             stdin=subprocess.DEVNULL, capture_output=True, check=False, timeout=SIGN_TIMEOUT,
+                             env={'PATH': '/usr/bin:/bin'})  # nothing of the runner's environment, which holds the key's source
             raw = sig.read_bytes() if done.returncode == 0 else b''
         except (OSError, subprocess.SubprocessError):
             raw = b''
@@ -294,7 +303,7 @@ class Signer:
             wipe(msg)
         if len(raw) != 64:  # an Ed25519 signature
             raise Refused('sign')
-        return {'Authorization': f'KitAdmin {ROLE}.{ts}.{b64url(raw)}', 'X-Kit-Sha256': body_sha}
+        return {'Authorization': f'KitAdmin {ROLE} {ts} {raw.hex()}', 'X-Kit-Sha256': body_sha}
 
 
 def answer_json(raw: bytes) -> dict:
@@ -312,14 +321,28 @@ def stored(doc: object, sha: str, size: int) -> bool:
     return isinstance(doc, dict) and doc.get('sha256') == sha and type(doc.get('size')) is int and doc['size'] == size
 
 
+def host_error(raw: bytes) -> str:
+    """The `error` word of the host's JSON reply when it is one the host is known to say, else ''. Nothing else of the
+    reply is ever shown."""
+    try:
+        doc = fp.manifest.canon.loads_strict(raw)
+    except Exception:  # a non-JSON reply (the plain 404, a proxy's page) has no word
+        return ''
+    word = doc.get('error') if isinstance(doc, dict) else None
+    return word if isinstance(word, str) and word in (*HOST_REFUSALS, *HOST_WORDS) else ''
+
+
 def call(net: Net, signer: Signer, host: str, method: str, path: str, body: bytes) -> bytes:
-    """One signed call; the answer's body on 200, else Refused('conflict') for 409 and Refused('upload') with the status."""
+    """One signed call; the answer's body on 200. Otherwise the host's own word decides: conflict, replay, rollback or
+    revoked (all four are a 409) are said as they are; another known word follows the status (`upload 401 stale`), and a
+    reply without one is `upload <status>`."""
     headers = {**signer.sign(method, path, body), 'Content-Type': 'application/octet-stream'}
     status, raw = net.request(method, host, path, headers, body)
-    if status == 409:
-        raise Refused('conflict')
     if status != 200:
-        raise Refused(f'upload {status}')
+        word = host_error(raw)
+        if word in HOST_REFUSALS:
+            raise Refused(word)
+        raise Refused(f'upload {status} {word}' if word else f'upload {status}')
     return raw
 
 
@@ -416,12 +439,14 @@ def upload_gateway(owner_pub: bytes, environ: dict[str, str], net: Net, signer: 
         doc = fp.manifest.canon.loads_strict(text)
     except fp.manifest.canon.SchemaError:
         raise Refused('gateway') from None
-    serial = doc.get('serial') if isinstance(doc, dict) else None
+    if not isinstance(doc, dict) or any(key not in doc for key in GATEWAY_KEYS):
+        raise Refused('gateway')  # signed by the owner under this namespace, but not a gateway record
+    serial = doc['serial']
     if type(serial) is not int or not 1 <= serial <= MAX_GATEWAY_SERIAL:
         raise Refused('gateway')
     body = json.dumps({'json': base64.b64encode(text).decode('ascii'), 'sig': base64.b64encode(sig).decode('ascii')},
                       sort_keys=True, separators=(',', ':')).encode('ascii')
-    answer = answer_json(call(net, signer, host, 'POST', f'/_k/gateway/{serial}', body))
+    answer = answer_json(call(net, signer, host, 'PUT', f'/_k/gateway/{serial}', body))
     if (answer.get('gserial') != serial or not stored(answer.get('json'), sha256_hex(text), len(text))
             or not stored(answer.get('sig'), sha256_hex(sig), len(sig))):
         raise Refused('readback')
@@ -439,19 +464,24 @@ def parse_args(argv: list[str]) -> tuple[str, Path | None, str] | None:
 
 def main(argv: list[str], environ: dict[str, str], net: Net | None = None) -> int:
     """0 done, 1 refused, 2 usage. The environment: KIT_HOST (the workflow's constant), KIT_UPLOAD_KEY (the Ed25519 key, PEM),
-    FLEET_REPO (the private repository's address), RUNNER_TEMP, GIT_SSH_COMMAND (the read key's ssh command, optional) and
-    OWNER_PIN_SHA256 (optional: the owner key's fingerprint, checked when set)."""
+    FLEET_REPO (the private repository's address), RUNNER_TEMP, OWNER_PIN_SHA256 (the owner key's fingerprint: it is what
+    ties --owner-pub to the key the owner pinned, so a run without it is `REFUSED key`) and GIT_SSH_COMMAND (the read
+    key's ssh command, optional). KIT_UPLOAD_KEY is taken out of this process's own environment at once, so no child
+    process (git, ssh-keygen, openssl) inherits it."""
     args = parse_args(argv)
     if args is None:
         sys.stderr.write(USAGE_TEXT)
         return 2
     verb, folder, pub_path = args
+    os.environ.pop('KIT_UPLOAD_KEY', None)
     work = signer = None
     try:
         if not all(environ.get(k) for k in ('KIT_HOST', 'KIT_UPLOAD_KEY', 'FLEET_REPO', 'RUNNER_TEMP')) \
                 or not os.path.isdir(environ['RUNNER_TEMP']):
             raise Refused('env')
-        owner_pub = fp.owner_key(pub_path, environ.get('OWNER_PIN_SHA256', ''), fp.run_argv)
+        if not environ.get('OWNER_PIN_SHA256'):
+            raise Refused('key')
+        owner_pub = fp.owner_key(pub_path, environ['OWNER_PIN_SHA256'], fp.run_argv)
         work = Path(tempfile.mkdtemp(prefix='kit-', dir=environ['RUNNER_TEMP']))
         signer = Signer(environ['KIT_UPLOAD_KEY'])
         net = net or Real()
