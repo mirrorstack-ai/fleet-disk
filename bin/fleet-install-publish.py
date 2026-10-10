@@ -12,7 +12,7 @@ the release will carry is checked first, offline: install.json.sig verifies agai
 mirrorstack-fleet-install, every file's sha256 equals the signed one, no file is unlisted, deploy-pin.json is there with
 its shape, signature and the signed bundle's head and tree, the bundle's URL is the invite-gated kit host's for this serial
 and its host is exactly the constant KIT_HOST (the bootstrap sends the invite code there; the bundle is never a file of
-this release), and install.json is valid for at least 30 more days and at most 90 (SERIES=test) or 180 (release). Each file is copied once into a private stage; the checks
+this release), the bundle is at most 90 MB (`kit-host-size`: the host takes it in one request), and install.json is valid for at least 30 more days and at most 90 (SERIES=test) or 180 (release). Each file is copied once into a private stage; the checks
 and the upload use that copy. The two bootstraps are held to the one-hash rule (ASCII, LF only, no CR, no
 BOM: the asset is the git blob) and must carry the baked values (the signing key, the one that verified install.json, and
 an expiry no earlier than valid_until, 30 days out and no further out than that cap); every asset is held to a size cap no larger than the bootstraps' own.
@@ -175,7 +175,7 @@ REPO = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}', re.ASC
 PUBLISH_CODES = ('serial', 'dir', 'missing', 'no-deploy-pin', 'pin-mismatch', 'hash', 'unlisted', 'kit', 'short-validity',
                  'release-env', 'tag-check-failed', 'tag-exists', 'tag-missing', 'tag-moved', 'series', 'fleet',
                  'not-on-release', 'pin-tree', 'not-newer', 'immutable-off', 'immutable-unreadable',
-                 'immutable-not-set', 'attributes', 'boot-bytes', 'baked', 'kit-host', 'long-validity', 'tool-missing', 'tool-timeout', 'publish-failed', 'publish-mismatch')
+                 'immutable-not-set', 'attributes', 'boot-bytes', 'baked', 'kit-host', 'kit-host-size', 'long-validity', 'tool-missing', 'tool-timeout', 'publish-failed', 'publish-mismatch')
 SERIES_FLOOR = 1000  # test-key serials are below it, release-key serials at or above it
 GIT = '/usr/bin/git'
 FLEET_TIP = 'refs/remotes/origin/release'  # where the plan job fetched the fleet repository's release branch
@@ -420,6 +420,16 @@ def check_kit_host(kit_host: str) -> str:
     return kit_host
 
 
+MAX_KIT_BUNDLE = 90 * 1000 * 1000  # bytes: the kit host's Free plan takes a 100 MB request body, and the host's own cap sits under it
+
+
+def check_bundle_size(doc: dict) -> None:
+    """The signed bundle.size must fit what the kit host can take in one request (MAX_KIT_BUNDLE); else Refused('kit-host-size').
+    Plan runs this, so an oversized bundle stops before anything is signed, tagged or uploaded."""
+    if doc['bundle']['size'] > MAX_KIT_BUNDLE:
+        raise Refused('kit-host-size')
+
+
 def check_bundle_url(doc: dict, kit_host: str = '') -> None:
     """install.json's signed bundle.url must be the kit host's download of this very serial, https://<host>/v1/kit/<serial>/
     bundle.tar, and the host must not be GitHub's; else Refused('form'). When kit_host is given (plan and publish always
@@ -475,6 +485,7 @@ def _check_staged(d: Path, tag: str, folder_serial: int, stage: Path, owner_pub:
     if doc['serial'] != folder_serial:
         raise Refused('serial')
     check_bundle_url(doc, kit_host)
+    check_bundle_size(doc)
     if _parse_utc(doc['valid_until']) < now + timedelta(days=MIN_DAYS):
         raise Refused('short-validity')
     if _parse_utc(doc['valid_until']) > now + max_validity(series):

@@ -273,6 +273,16 @@ class Publish(unittest.TestCase):
         self.fx.build(valid_until=NOW + timedelta(days=30) - timedelta(minutes=1))
         self.refuses_locally('short-validity')
 
+    def test_a_bundle_over_90_mb_is_refused_kit_host_size_and_exactly_90_mb_is_not(self):
+        self.assertEqual(fp.MAX_KIT_BUNDLE, 90_000_000)
+        self.assertIn('kit-host-size', fp.PUBLISH_CODES)
+        self.fx.build(bundle=dict(manifest()['bundle'], size=90_000_000))
+        self.assertEqual(self.fx.check(kit_host=KIT_HOST).tag, TAG)
+        for size in (90_000_001, 100_000_000, 1 << 30):  # the manifest verifier's own cap is far higher
+            self.fx.build(bundle=dict(manifest()['bundle'], size=size))
+            self.refuses_locally('kit-host-size', kit_host=KIT_HOST)
+            self.refuses_locally('kit-host-size')  # check_dir alone holds the cap too: plan and publish both run it
+
     # the kit host: the one host the signed bundle.url may name (a constant of the workflow)
 
     def with_url(self, url: str) -> None:
@@ -2323,21 +2333,23 @@ class Readme(unittest.TestCase):
 class Workflow(unittest.TestCase):
     TEXT = (ROOT / '.github/workflows/install.yml').read_text(encoding='utf-8')
     DISK = (ROOT / '.github/workflows/disk.yml').read_text(encoding='utf-8')
-    JOBS = {m[1]: m[2] for m in re.finditer(r'(?ms)^  (plan|sign|tag|publish):\n(.*?)(?=^  \w+:\n|\Z)',
+    JOBS = {m[1]: m[2] for m in re.finditer(r'(?ms)^  (plan|sign|kit|tag|publish|floor):\n(.*?)(?=^  \w+:\n|\Z)',
                                             TEXT.split('\njobs:\n', 1)[1])}
 
-    def test_it_is_a_release_branch_dispatch_of_four_jobs(self):
+    def test_it_is_a_release_branch_dispatch_of_five_jobs_and_a_floor_job(self):
         self.assertRegex(self.TEXT, r'(?m)^on:\n  workflow_dispatch:\n    inputs:\n      mode:\n')
         self.assertEqual(re.findall(r'(?m)^      (\w+):\n        (?:description|required)', self.TEXT),
-                         ['mode', 'serial', 'min_serial'])
-        self.assertEqual(list(self.JOBS), ['plan', 'sign', 'tag', 'publish'])
+                         ['mode', 'serial', 'min_serial', 'floor'])
+        self.assertRegex(self.TEXT, r'(?m)^        options: \[sign, pubkey, floor\]\n        default: sign\n')
+        self.assertEqual(list(self.JOBS), ['plan', 'sign', 'kit', 'tag', 'publish', 'floor'])
+        self.assertEqual(re.findall(r'(?m)^  (\w+):$', self.TEXT.split('\njobs:\n', 1)[1]), list(self.JOBS))  # and no other job
         for bad in ('pull_request', 'push:', 'self-hosted', 'refs/heads/main', 'actions/cache'):
             self.assertNotIn(bad, self.TEXT)
         for name, job in self.JOBS.items():
             self.assertIn("github.ref == 'refs/heads/release'", job.split('steps:')[0], name)
-        self.assertEqual(re.findall(r'runs-on: (\S+)', self.TEXT), ['ubuntu-24.04'] * 4)
+        self.assertEqual(re.findall(r'runs-on: (\S+)', self.TEXT), ['ubuntu-24.04'] * 6)
         self.assertEqual([re.findall(r'(?m)^    environment: (\S+)$', j) for j in self.JOBS.values()],
-                         [['release'], ['release'], ['release'], []])  # publish has none: no secret, no variable of release
+                         [['release'], ['release'], ['release'], ['release'], [], ['release']])  # publish has none: no secret, no variable of release
 
     def test_only_publish_writes_and_only_contents_and_sign_and_tag_hold_no_token(self):
         self.assertRegex(self.TEXT, r'(?m)^permissions:\n  contents: read\n')
@@ -2347,9 +2359,11 @@ class Workflow(unittest.TestCase):
             self.assertTrue('    permissions: {}\n' in self.JOBS[name] and 'github.token' not in self.JOBS[name])
 
     def test_each_secret_is_read_by_one_job_and_the_sign_and_tag_jobs_run_no_action_and_no_repository_code(self):
-        self.assertEqual(sorted(re.findall(r'secrets\.(\w+)', self.TEXT)), ['FLEET_READ', 'SIGN_KEY', 'TAG_KEY'])
-        for name, secret in (('plan', 'FLEET_READ'), ('sign', 'SIGN_KEY'), ('tag', 'TAG_KEY')):
-            self.assertEqual(re.findall(r'secrets\.(\w+)', self.JOBS[name]), [secret])
+        self.assertEqual(sorted(re.findall(r'secrets\.(\w+)', self.TEXT)),
+                         ['FLEET_READ', 'FLEET_READ', 'KIT_UPLOAD_KEY', 'KIT_UPLOAD_KEY', 'SIGN_KEY', 'TAG_KEY'])
+        for name, secrets in (('plan', ['FLEET_READ']), ('sign', ['SIGN_KEY']), ('kit', ['FLEET_READ', 'KIT_UPLOAD_KEY']),
+                              ('tag', ['TAG_KEY']), ('floor', ['KIT_UPLOAD_KEY'])):
+            self.assertEqual(re.findall(r'secrets\.(\w+)', self.JOBS[name]), secrets)
         self.assertNotIn('secrets.', self.JOBS['publish'])
         for name in ('sign', 'tag'):
             for bad in ('uses:', 'checkout', 'fleet-install-publish', 'python', 'RUNNER_WORKSPACE', 'GITHUB_WORKSPACE'):
@@ -2369,7 +2383,7 @@ class Workflow(unittest.TestCase):
         self.assertIsNone(fp.FPR.fullmatch(env['KEY_SHA256']))  # still the placeholder: the sign job refuses it
         with self.assertRaises(fp.Refused):  # and so is the kit host: plan and publish refuse `kit-host` until it is set
             fp.check_kit_host(env['KIT_HOST'])
-        self.assertEqual(self.TEXT.count('KIT_HOST: ${{ env.KIT_HOST }}'), 2)  # handed to plan and to publish as env
+        self.assertEqual(self.TEXT.count('KIT_HOST: ${{ env.KIT_HOST }}'), 4)  # handed to plan, kit, publish and floor as env
         self.assertEqual(env['SERIES'], 'test')
         host, kind, key = env['GH_HOSTKEY'].split()
         digest = hashlib.sha256(base64.b64decode(key)).digest()
@@ -2407,7 +2421,7 @@ class Workflow(unittest.TestCase):
         self.assertNotIn('StrictHostKeyChecking=no', self.TEXT)
 
     def test_the_publish_job_gets_the_key_from_the_sign_job_and_the_fingerprint_from_the_constant(self):
-        for need in ('PUB: ${{ needs.sign.outputs.pub }}', 'OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}', 'needs: [plan, sign, tag]',
+        for need in ('PUB: ${{ needs.sign.outputs.pub }}', 'OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}', 'needs: [plan, sign, kit, tag]',
                      'IMMUTABLE_CONFIRMED: ${{ needs.plan.outputs.immutable }}', '--owner-pub "$RUNNER_TEMP/owner.pub"'):
             self.assertIn(need, self.JOBS['publish'])
 
@@ -2431,7 +2445,8 @@ class Workflow(unittest.TestCase):
 
     def test_each_job_needs_exactly_the_jobs_before_it(self):
         needs = {name: re.findall(r'(?m)^    needs: (.*)$', job) for name, job in self.JOBS.items()}
-        self.assertEqual(needs, {'plan': [], 'sign': ['plan'], 'tag': ['[plan, sign]'], 'publish': ['[plan, sign, tag]']})
+        self.assertEqual(needs, {'plan': [], 'sign': ['plan'], 'kit': ['[plan, sign]'], 'tag': ['[plan, sign, kit]'],
+                                 'publish': ['[plan, sign, kit, tag]'], 'floor': []})
 
     def declared_outputs(self, name: str) -> dict[str, tuple[str, str]]:
         """{output: (step id, step output)} from the job's `outputs:` block."""
@@ -2476,6 +2491,156 @@ class Workflow(unittest.TestCase):
                       '"release/install-$SERIAL"', publish)  # the publisher wants the relative release/install-N
         upload = re.findall(r'(?m)^          name: (\S+)$', self.JOBS['plan'])
         self.assertEqual((upload, re.findall(r'(?m)^          name: (\S+)$', publish)), (['install-stage'], ['install-stage']))
+
+    # the kit job and the floor job
+
+    def run_body(self, name: str) -> str:
+        """The one `run: |` block of a job, dedented."""
+        body = self.JOBS[name].split('        run: |\n')
+        self.assertEqual(len(body), 2, name)
+        return '\n'.join(line[10:] for line in body[1].splitlines())
+
+    def test_tag_and_publish_both_need_kit_and_kit_needs_the_signatures_not_the_tag(self):
+        self.assertIn('    needs: [plan, sign]\n', self.JOBS['kit'])
+        self.assertIn('    needs: [plan, sign, kit]\n', self.JOBS['tag'])
+        self.assertIn('    needs: [plan, sign, kit, tag]\n', self.JOBS['publish'])
+        self.assertLess(self.TEXT.index('\n  sign:\n'), self.TEXT.index('\n  kit:\n'))
+        self.assertLess(self.TEXT.index('\n  kit:\n'), self.TEXT.index('\n  tag:\n'))
+
+    def test_the_kit_job_holds_the_read_key_and_the_upload_key_and_nothing_else_and_leaves_nothing_behind(self):
+        kit = self.JOBS['kit']
+        self.assertEqual(re.findall(r'secrets\.(\w+)', kit), ['FLEET_READ', 'KIT_UPLOAD_KEY'])
+        self.assertEqual(re.findall(r'vars\.(\w+)', kit), [])
+        self.assertNotIn('github.token', kit)
+        self.assertIn('    permissions:\n      contents: read\n', kit)
+        for bad in ('upload-artifact', 'download-artifact', 'actions/cache', 'cache:', 'GITHUB_STEP_SUMMARY', 'GITHUB_OUTPUT',
+                    'GITHUB_ENV', 'set -x', '::add-mask', '::debug', 'self-hosted', 'tee ', 'wrangler', 'CLOUDFLARE', 'curl ',
+                    'out/', 'RUNNER_TEMP/stage', 'gh '):
+            self.assertNotIn(bad, kit, bad)
+        self.assertEqual(re.findall(r'uses: (\S+)', kit), ['actions/checkout@11d5960a326750d5838078e36cf38b85af677262'])
+        body = self.run_body('kit')
+        self.assertLess(body.index("trap 'shred"), body.index('"$FLEET_READ" > "$d/key"'))   # the trap is set before the key is written
+        self.assertLess(body.index('"$FLEET_READ" > "$d/key"'), body.index('unset FLEET_READ'))
+        self.assertLess(body.index('unset FLEET_READ'), body.index('python3 '))              # no child sees the read key
+        self.assertIn('/dev/shm/kit.', body)
+        self.assertIn('umask 077', body)
+        self.assertLess(body.index('bundle "$d/install"'), body.index('gateway --owner-pub'))   # the bundle first, then the pair
+        self.assertEqual(body.count('python3 bin/fleet-kit-upload.py '), 2)
+        self.assertIn('--owner-pub "$d/owner.pub"', body)
+        for need in ('OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}', 'INSTALL_B64: ${{ needs.plan.outputs.install_b64 }}',
+                     'INSTALL_SHA: ${{ needs.plan.outputs.install_sha }}', 'INSTALL_SIG: ${{ needs.sign.outputs.install_sig }}',
+                     'PUB: ${{ needs.sign.outputs.pub }}', 'StrictHostKeyChecking=yes', 'IdentitiesOnly=yes',
+                     'GlobalKnownHostsFile=/dev/null'):
+            self.assertIn(need, kit)
+        self.assertLess(body.index('= "$INSTALL_SHA"'), body.index('python3 '))   # the bytes are the ones the plan hashed
+        self.assertIn('timeout-minutes: 30', kit)
+
+    def test_the_gateway_record_never_enters_the_folder_the_plan_publishes(self):
+        for name in fp.FIXED + fp.KIT_FILES + fp.DATA:
+            self.assertNotIn('gateway', name)
+        for job in ('plan', 'sign', 'tag', 'publish'):
+            self.assertNotIn('gateway', self.JOBS[job], job)
+        self.assertIn('gateway --owner-pub', self.JOBS['kit'])   # the kit job reads the pair itself, at the release tip
+
+    def test_the_floor_job_is_only_the_floor_mode_in_the_release_environment_with_the_upload_key(self):
+        floor = self.JOBS['floor']
+        self.assertIn("inputs.mode == 'floor'", floor.split('steps:')[0])
+        self.assertNotIn('needs:', floor)
+        self.assertIn('    environment: release\n', floor)   # the Environment's approval is the owner's, per run
+        self.assertEqual(re.findall(r'secrets\.(\w+)', floor), ['KIT_UPLOAD_KEY'])
+        self.assertIn('FLOOR: ${{ inputs.floor }}', floor)
+        self.assertNotIn('inputs.', self.run_body('floor'))
+        for job in ('plan',):
+            self.assertIn("inputs.mode == 'sign'", self.JOBS[job].split('steps:')[0])
+        self.assertIn("(inputs.mode == 'pubkey' || needs.plan.result == 'success')", self.JOBS['sign'])   # plan is skipped in floor mode, so is sign
+        for bad in ('upload-artifact', 'GITHUB_STEP_SUMMARY', 'set -x', 'FLEET_READ', 'gh '):
+            self.assertNotIn(bad, floor, bad)
+
+    # those two run blocks, for real, over a stand-in python3 that records what it is given
+
+    STUB = """#!/bin/sh
+{
+  echo "ARGS $*"
+  echo "FLEET_READ=${FLEET_READ-unset}"
+  echo "UPLOAD=${KIT_UPLOAD_KEY:+set}"
+  echo "SSH=${GIT_SSH_COMMAND:+set}"
+  if [ "$2" = bundle ] || [ "$2" = gateway ]; then
+    for last; do :; done
+    d=$(dirname "$last")
+    echo "KEYFILE=$(cat "$d/key")"
+    echo "KEYMODE=$(ls -ld "$d/key" | cut -c1-10)"
+    echo "INSTALL=$(cat "$d/install/install.json")"
+    echo "SIG=$(cat "$d/install/install.json.sig")"
+    echo "PUBFILE=$(cat "$d/owner.pub")"
+    echo "KNOWN=$(cat "$d/known_hosts")"
+  fi
+} >> "$STUB_LOG"
+[ "$2" != "$STUB_FAIL" ]
+"""
+
+    def run_block(self, tmp: Path, name: str, env: dict) -> tuple:
+        shm, bin_dir = tmp / 'shm', tmp / 'bin'
+        shm.mkdir(exist_ok=True)
+        bin_dir.mkdir(exist_ok=True)
+        sum_tool = '/usr/bin/shasum -a 256' if os.path.exists('/usr/bin/shasum') else '/usr/bin/sha256sum'
+        (bin_dir / 'sha256sum').write_text(f'#!/bin/sh\nexec {sum_tool} "$@"\n')
+        (bin_dir / 'python3').write_text(self.STUB)
+        for tool in ('sha256sum', 'python3'):
+            (bin_dir / tool).chmod(0o755)
+        body = self.run_body(name).replace('/dev/shm/', f'{shm}/')
+        full = {'PATH': f'{bin_dir}:/usr/bin:/bin', 'HOME': str(tmp), 'STUB_LOG': str(tmp / 'stub.log'), 'GH_HOSTKEY': 'github.com ssh-ed25519 AAAA', **env}
+        done = subprocess.run(['/bin/bash', '-c', body], env=full, capture_output=True, text=True, cwd=tmp)
+        log = (tmp / 'stub.log').read_text() if (tmp / 'stub.log').exists() else ''
+        return done, log, shm
+
+    def kit_env(self, **over) -> dict:
+        install = b'{"kind": "install"}\n'
+        env = {'INSTALL_B64': base64.b64encode(install).decode(), 'INSTALL_SHA': sha(install), 'INSTALL_SIG': base64.b64encode(b'SIGBYTES').decode(),
+               'PUB': 'ssh-ed25519 PUBLINE', 'OWNER_PIN_SHA256': 'SHA256:x', 'KIT_HOST': 'kit.example.org',
+               'FLEET_READ': 'THROWAWAY-READ-KEY', 'KIT_UPLOAD_KEY': 'THROWAWAY-UPLOAD-KEY'}
+        env.update(over)
+        return env
+
+    def test_the_kit_step_hands_the_uploader_the_signed_manifest_and_the_upload_key_but_not_the_read_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            done, log, shm = self.run_block(Path(tmp), 'kit', self.kit_env())
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(done.stdout + done.stderr, '')
+            calls = [l for l in log.splitlines() if l.startswith('ARGS ')]
+            self.assertEqual(len(calls), 2)
+            self.assertRegex(calls[0], r'^ARGS bin/fleet-kit-upload\.py bundle \S+/install --owner-pub \S+/owner\.pub$')
+            self.assertRegex(calls[1], r'^ARGS bin/fleet-kit-upload\.py gateway --owner-pub \S+/owner\.pub$')
+            for want in ('FLEET_READ=unset', 'UPLOAD=set', 'SSH=set', 'KEYFILE=THROWAWAY-READ-KEY', 'KEYMODE=-rw-------',
+                         'INSTALL={"kind": "install"}', 'SIG=SIGBYTES', 'PUBFILE=ssh-ed25519 PUBLINE', 'KNOWN=github.com ssh-ed25519 AAAA'):
+                self.assertEqual(log.count(want + '\n'), 2, want)
+            self.assertEqual(list(shm.iterdir()), [])   # the key and the files are gone on exit
+
+    def test_the_kit_step_stops_and_cleans_up_when_the_bundle_is_refused_or_the_manifest_is_not_the_planned_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / 'x').mkdir()
+            done, log, shm = self.run_block(tmp / 'x', 'kit', dict(self.kit_env(), STUB_FAIL='bundle'))
+            self.assertNotEqual(done.returncode, 0)
+            self.assertEqual(len([l for l in log.splitlines() if l.startswith('ARGS ')]), 1)   # no gateway after a refused bundle
+            self.assertEqual(list(shm.iterdir()), [])
+            (tmp / 'y').mkdir()
+            done, log, shm = self.run_block(tmp / 'y', 'kit', self.kit_env(INSTALL_SHA='0' * 64))
+            self.assertEqual(done.returncode, 1)
+            self.assertIn('REFUSED hash install.json', done.stdout)
+            self.assertEqual(log, '')   # the uploader never ran
+            self.assertEqual(list(shm.iterdir()), [])
+
+    def test_the_floor_step_takes_digits_only_and_passes_the_upload_key_to_the_floor_verb(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            done, log, _ = self.run_block(Path(tmp), 'floor', {'FLOOR': '7', 'KIT_UPLOAD_KEY': 'THROWAWAY-UPLOAD-KEY', 'KIT_HOST': 'kit.example.org'})
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertIn('ARGS bin/fleet-kit-upload.py floor 7\n', log)
+            self.assertIn('UPLOAD=set\n', log)
+        for bad in ('', '7;id', '-1', '7 8', '$(id)', '7\n8x'):
+            with self.subTest(bad), tempfile.TemporaryDirectory() as tmp:
+                done, log, _ = self.run_block(Path(tmp), 'floor', {'FLOOR': bad, 'KIT_UPLOAD_KEY': 'k', 'KIT_HOST': 'kit.example.org'})
+                self.assertEqual(done.returncode, 1)
+                self.assertEqual(log, '')   # the uploader never ran
 
     def test_the_sign_step_hashes_before_and_after_signing_and_verifies_what_it_signed(self):
         sign = self.JOBS['sign']

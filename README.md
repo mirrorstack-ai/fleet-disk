@@ -39,7 +39,7 @@ refused as unlisted.
 
 Actions, then `install`, then Run workflow on the `release` branch (the only ref the jobs accept) with `serial` and
 `min_serial` (the lowest serial this publish may carry, normally the previous release's); `mode` pubkey only prints the
-signing key's public line and fingerprint. Four jobs run in order:
+signing key's public line and fingerprint, and `mode` floor runs only the floor job (below). Five jobs run in order:
 
 - **plan** (Environment `release`, read-only deploy key `FLEET_READ` on the fleet repository, held in `/dev/shm` and wiped
   by a trap on every path) reads the folder from the fleet `release` tip as git blobs, never a checkout. It refuses unless the folder is exactly the files above as plain files, the
@@ -54,7 +54,14 @@ signing key's public line and fingerprint. Four jobs run in order:
   `/dev/shm`, refuses unless `ssh-keygen -lf` of it equals the constant `KEY_SHA256` in `install.yml` (so it refuses while
   that is a placeholder), re-hashes the bytes against the plan's sha256, signs `install.json` (namespace
   `mirrorstack-fleet-install`), `kit.json` and `deploy-pin.json` (`mirrorstack-fleet-pin`), verifies each and wipes the key.
-- **tag** (Environment `release`, deploy key `TAG_KEY`) pushes the lightweight tag `install-<serial>` on this run's commit.
+- **kit** (Environment `release`, secrets `FLEET_READ` and `KIT_UPLOAD_KEY` and nothing else) runs `bin/fleet-kit-upload.py`
+  twice: `bundle` rebuilds the tar from the fleet commit `install.json` names and uploads it, `gateway` reads the gateway record
+  and its signature from the fleet `release` tip, checks the owner's signature and uploads the pair. The install.json it works
+  from is the plan's output re-hashed against the plan's sha256, with the sign job's signature, so nothing here is downloaded.
+  The job uploads no artifact, uses no cache and writes no step summary; the log shows a size and a sha256 only. The gateway pair
+  is never in the plan's folder, which becomes a public artifact and public release assets.
+- **tag** (Environment `release`, deploy key `TAG_KEY`) pushes the lightweight tag `install-<serial>` on this run's commit. It
+  needs kit, and so does publish: no tag or release page can exist for a bundle the host cannot serve. A failed upload is a re-run.
 - **publish** (no environment, no secret) adds the signatures to the plan's files and runs
   `bin/fleet-install-publish.py publish` with the sign job's public line as `--owner-pub`.
 
@@ -142,6 +149,15 @@ a second implementation. The copy imports two helpers (a strict JSON reader and 
 those imports without changing a byte of the copy. They decide how strict the copy's rules are, so `vendor/standin.sha256`
 pins them too (one hash over the four files, in the order and form `stand_in_digest` in the script says), and the bytes
 that were hashed are the ones executed. The UTC reader is deliberately stricter than the fleet's (no fractional seconds).
+The publisher refuses a signed `bundle.size` over 90 MB (`REFUSED kit-host-size`, from `plan` on): the host takes a bundle in one
+request and its Free plan's request body is 100 MB. `KIT_HOST` stays a placeholder until the host is measured, so `plan`, `kit`
+and `publish` all refuse `kit-host` until it is set.
+
+**Floor.** `mode` floor with `floor` set to a serial makes the host serve no serial below it, the break-glass for a bad
+release. It is its own job in the Environment `release` with `KIT_UPLOAD_KEY`, and it runs the `floor` verb of the uploader,
+which needs no fleet repository and no owner key. Like every job here it waits for the Environment's approval, so each floor
+change is approved by the owner when it is run; `floor` 0 lifts it.
+
 `.gitattributes` marks the vendored files `-text` so no checkout rewrites their line endings.
 A change to the verifier ships as the same two files in both repositories, in the same step: the fleet
 repository's `bin/fleet-install.py vendor-sync <this checkout>` says `OK vendor-sync` when the copy and both pins agree.
@@ -155,7 +171,7 @@ holds no Cloudflare key: the host takes a request only when it carries an Ed2551
 `Authorization: KitAdmin upload <ts_ms> <128 lower-case hex of the signature>`, plus `X-Kit-Sha256` with the body's hash; the
 host's own README, "Admin calls", is the contract). `KIT_UPLOAD_KEY` lives in a 0600 file on tmpfs for the length of the run and
 is overwritten and removed at the end; it is taken out of the process environment at the start, so git, ssh-keygen and openssl
-never inherit it. `OWNER_PIN_SHA256` is required for both verbs (`REFUSED key` without it).
+never inherit it. `OWNER_PIN_SHA256` is required for both verbs (`REFUSED key` without it). The third verb, `floor N` (`PUT /_k/floor`, read back, `REFUSED readback` unless the host says that floor), needs neither of them.
 
 - `fleet-kit-upload.py bundle <dir> --owner-pub P` checks `<dir>/install.json` (the vendored verifier, the owner's signature,
   the bundle url is this host's for this serial), shallow-fetches the commit `bundle.head` with the runner's read-only deploy
@@ -230,6 +246,13 @@ leaves the runner, and the job has no token, no environment and no secret.
    take the public halves from that output, never from a separate look at the log.
 
 The verified public lines go to the deploy-key settings and the fingerprint into `install.yml` later.
+
+**The kit upload key.** The same workflow and helper make `KIT_UPLOAD_KEY`, the Ed25519 key that signs uploads to the kit host:
+dispatch with `-f keys=kit-upload` (the default is `test`), then `bin/fleet-keygen-put.py --run <id> --sha <commit> --keys kit-upload`.
+Only that one key is made (`openssl genpkey -algorithm ed25519`, a 119-byte PKCS8 PEM, no passphrase), sealed to the same
+Environment `release` key and checked the same way; the helper refuses a log of the other set. The job prints one public line,
+`KEYGEN-PUBLIC KIT_UPLOAD_KEY ed25519 <64 hex>`, derived from the very bytes that were sealed, and the SHA256 fingerprint of
+exactly those 32 bytes (the helper recomputes it). The 64 hex is the host's `KIT_UP_PUB`. The key has no Cloudflare power.
 
 ## Tests
 
