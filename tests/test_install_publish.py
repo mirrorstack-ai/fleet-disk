@@ -4,6 +4,7 @@ existing tag, the immutable setting, GitHub's digests read back, the exact gh ca
 the copied manifest rules frozen against a golden, and the workflow's shape. The signature tests are skipped when ssh-keygen is missing. Plain unittest, stdlib only."""
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import importlib.util
@@ -154,6 +155,11 @@ class Fixture:
         return plan
 
 
+def tag_ref(tag: str = TAG, sha_: str = SHA, kind: str = 'commit') -> dict:
+    """What `matching-refs` says of a tag the tag job made (a lightweight tag is an object of type commit)."""
+    return {'ref': f'refs/tags/{tag}', 'object': {'type': kind, 'sha': sha_}}
+
+
 class FakeGh:
     """The Io of the publish: records every call, answers the four gh queries and serves what `release create` got."""
 
@@ -162,7 +168,8 @@ class FakeGh:
         self.envs: list[dict] = []
         self.timeouts: list[int] = []
         self.release_flags = {'immutable': True, 'draft': False}  # what GitHub says about the created release
-        self.refs, self.releases = refs if refs is not None else [], releases if releases is not None else []
+        self.refs = refs if refs is not None else [tag_ref()]
+        self.releases = releases if releases is not None else []  # the tag job made install-N on the run's commit
         self.immutable, self.create_code, self.created = immutable, create_code, []
         self.tweak = lambda assets: assets  # a test edits what GitHub "serves" back
         self.query_code = 0
@@ -662,22 +669,28 @@ class Publish(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = fp.main(['x', 'publish', f'release/{TAG}', '--owner-pub', str(self.fx.pub), '--min-serial', '0'],
-                           {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN}, gh, now=NOW)
+                           {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN, 'SERIES': 'test',
+                            'OWNER_PIN_SHA256': fp.key_fingerprint(self.fx.pub.read_bytes())}, gh, now=NOW)
         self.assertEqual((code, out.getvalue().strip()), (1, 'REFUSED unlisted'))
         self.assertIn('fleet-install-publish: refused unlisted\n', err.getvalue())  # the log line names the rule
         self.assertEqual(gh.calls, [])
 
     # the tag
 
-    def test_an_existing_tag_is_refused_whether_a_bare_tag_or_a_release_and_nothing_is_created(self):
+    def test_a_release_of_the_tag_is_refused_tag_exists_whatever_the_tag_says_and_nothing_is_created(self):
         self.fx.build()
-        for gh in (FakeGh(refs=[{'ref': f'refs/tags/{TAG}'}]), FakeGh(releases=[{'tagName': TAG, 'isDraft': True}])):
-            self.assertEqual(self.refuses('tag-exists', gh).creates(), [])
+        for draft in (True, False):
+            self.assertEqual(self.refuses('tag-exists', FakeGh(releases=[{'tagName': TAG, 'isDraft': draft}])).creates(), [])
 
-    def test_another_serial_that_only_starts_with_the_tag_is_not_the_tag(self):
+    def test_the_tag_must_exist_as_a_lightweight_tag_on_the_runs_commit(self):
         self.fx.build()
-        gh = FakeGh(refs=[{'ref': f'refs/tags/{TAG}0'}], releases=[{'tagName': 'v1', 'isDraft': False}])
-        fp.publish(gh, self.fx.check(), REPO, SHA, TOKEN)
+        for refs, code in (([], 'tag-missing'), ([tag_ref(TAG + '0')], 'tag-missing'),  # install-50 is not install-5
+                           ([tag_ref(sha_='cd' * 20)], 'tag-moved'), ([tag_ref(kind='tag')], 'tag-moved'),
+                           ([{'ref': f'refs/tags/{TAG}'}], 'tag-moved'), ([tag_ref(), tag_ref()], 'tag-missing')):
+            with self.subTest(refs):
+                self.assertEqual(self.refuses(code, FakeGh(refs=refs)).creates(), [])
+        gh = FakeGh(refs=[tag_ref(TAG + '0', 'cd' * 20), tag_ref()], releases=[{'tagName': 'v1', 'isDraft': False}])
+        fp.publish(gh, self.fx.check(), REPO, SHA, TOKEN)  # a prefix match of another serial is ignored
         self.assertEqual(len(gh.creates()), 1)
 
     def test_a_tag_check_that_cannot_be_answered_refuses(self):
@@ -956,8 +969,7 @@ class Publish(unittest.TestCase):
         gh = FakeGh()
         plan = self.fx.check()
         fp.publish(gh, plan, REPO, SHA, TOKEN)
-        notes = (f'Owner-signed install set {TAG}. Verify install.json with ssh-keygen -Y verify'
-                 f' -n mirrorstack-fleet-install -I owner.')
+        notes = fp.release_notes(plan, REPO)
         self.assertEqual(gh.calls, [
             ['/usr/bin/gh', 'api', f'repos/{REPO}/git/matching-refs/tags/{TAG}'],
             ['/usr/bin/gh', 'release', 'list', '--limit', '1000', '--json', 'tagName,isDraft'],
@@ -976,7 +988,8 @@ class Publish(unittest.TestCase):
 
     def run_main(self, verb='publish', gh=None, env=None, key=None, run=fp.run_argv, drop=()):
         gh = gh or FakeGh()
-        environ = {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN, **(env or {})}
+        environ = {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN, 'SERIES': 'test',
+                   'OWNER_PIN_SHA256': fp.key_fingerprint(self.fx.pub.read_bytes()), **(env or {})}
         for name in drop:
             del environ[name]
         out, err = io.StringIO(), io.StringIO()
@@ -1003,6 +1016,24 @@ class Publish(unittest.TestCase):
                 code, out, _, _ = self.run_main(gh=gh, env=env)
                 self.assertEqual((code, out.strip()), (1, 'REFUSED immutable-unreadable'))
                 self.assertEqual(gh.creates(), [])
+
+    def test_main_refuses_a_serial_of_the_other_series_and_a_publish_without_the_fingerprint_before_gh(self):
+        self.fx.build()
+        for env, drop, code in (({'SERIES': 'release'}, (), 'series'), ({}, ('SERIES',), 'series'),
+                                ({}, ('OWNER_PIN_SHA256',), 'key')):
+            gh = FakeGh()
+            c, out, _, _ = self.run_main(gh=gh, env=env, drop=drop)
+            self.assertEqual((c, out.strip(), gh.calls), (1, f'REFUSED {code}', []))
+
+    def test_main_writes_the_key_and_a_line_per_os_into_the_run_summary_and_the_release_body(self):
+        self.fx.build()
+        path, gh = self.fx.tmp / 'summary', FakeGh()
+        self.assertEqual(self.run_main(gh=gh, env={'GITHUB_STEP_SUMMARY': str(path)})[0], 0)
+        notes, summary = gh.creates()[0][-1], path.read_text()
+        self.assertTrue(summary.startswith(notes) and 'bootstrap.sh sha256:' in summary)  # then the asset lines
+        self.assertIn(f'\nkey {fp.key_fingerprint(self.fx.pub.read_bytes())}\n', notes)
+        for os_name, boot in (('win', PS1), ('mac', SH), ('ubuntu', SH)):
+            self.assertIn(fp.check_line(os_name, REPO, SERIAL, sha(boot), 0), notes)
 
     # the bundle's URL: the invite-gated kit host's download of this serial, never GitHub's
 
@@ -1047,7 +1078,7 @@ class Publish(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / '.other'
             path.write_bytes(b'x')
-            plan = fp.Plan(TAG, {'serial': SERIAL}, [fp.Asset(path, sha(b'x'), 1)], 'SHA256:x', Path(tmp))
+            plan = fp.Plan(TAG, manifest(), [fp.Asset(path, sha(b'x'), 1)], 'SHA256:x', Path(tmp))
             gh = FakeGh()
             fp.publish(gh, plan, REPO, SHA, TOKEN)  # served as .other, exactly: fine
             gh = FakeGh()
@@ -1208,7 +1239,8 @@ class Publish(unittest.TestCase):
     def test_main_publishes_and_verify_never_calls_gh(self):
         self.fx.build()
         argv = lambda verb: ['x', verb, f'release/{TAG}', '--owner-pub', str(self.fx.pub), '--min-serial', '5']  # noqa
-        env = {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN}
+        env = {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN, 'SERIES': 'test',
+               'OWNER_PIN_SHA256': fp.key_fingerprint(self.fx.pub.read_bytes())}
         gh = FakeGh()
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -1230,7 +1262,8 @@ class Publish(unittest.TestCase):
         done = subprocess.run([sys.executable, str(ROOT / 'bin/fleet-install-publish.py'), 'publish',
                                str(Path(self._tmp.name) / 'install-9'), '--owner-pub', str(self.fx.pub),
                                '--min-serial', '0'], capture_output=True, text=True, timeout=60,
-                              env={'PATH': '/usr/bin:/bin'})
+                              env={'PATH': '/usr/bin:/bin', 'SERIES': 'test',
+                                   'OWNER_PIN_SHA256': fp.key_fingerprint(self.fx.pub.read_bytes())})
         self.assertEqual((done.returncode, done.stdout.strip()), (1, 'REFUSED dir'))
 
     # mutation survivors: each test below fails when the guard it names is removed
@@ -1319,7 +1352,7 @@ class Publish(unittest.TestCase):
         moved = self.fx.dir.parent / 'install-0'
         self.fx.dir.rename(moved)
         self.fx.dir = moved
-        gh = FakeGh()
+        gh = FakeGh(refs=[tag_ref('install-0')])
         plan = self.fx.check()
         fp.publish(gh, plan, REPO, SHA, TOKEN)
         self.assertEqual((plan.tag, len(gh.creates())), ('install-0', 1))
@@ -2002,72 +2035,272 @@ class Constants(unittest.TestCase):
         self.assertEqual(fp.MIN_DAYS, 30)
 
 
+GIT_ENV = {'PATH': '/usr/bin', 'HOME': '/nonexistent', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_AUTHOR_NAME': 't',
+           'GIT_AUTHOR_EMAIL': 't@example.org', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@example.org'}
+
+
+@unittest.skipUnless(os.path.exists(fp.GIT), 'git is missing')
+class PlanJob(unittest.TestCase):
+    """`plan` over a real throwaway git repository standing in for the fleet's `release` branch."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.fleet = self.root / 'fleet'
+
+    def git(self, *args: str) -> str:
+        return subprocess.run([fp.GIT, '-C', str(self.fleet), *args], env=GIT_ENV, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def files(self, head: str, tree: str, **over) -> dict[str, bytes]:
+        kit = json.dumps({'serial': 3, 'files': [{'path': n, 'sha256': sha(d)} for n, d in KIT.items()],
+                          'python_zip': {'version': '3.14.7', 'sha256': H64}}).encode()
+        bundle = {'head': head, 'tree': tree, 'url': BUNDLE_URL, 'sha256': sha(BUNDLE_BYTES), 'size': len(BUNDLE_BYTES)}
+        doc = manifest(source_head=head, bundle=bundle, kit={'serial': 3, 'kit_json_sha256': sha(kit)})
+        return {'install.json': json.dumps(doc).encode(), 'kit.json': kit, '.gitattributes': fp.GITATTRIBUTES,
+                'deploy-pin.json': json.dumps({'serial': 4, 'head': head, 'tree': tree}).encode(),
+                'bootstrap.ps1': PS1, 'bootstrap.sh': SH, **KIT, **over}
+
+    def build(self, mutate=lambda files: None, side: bool = False, wrong_tree: bool = False, tip: bool = True) -> None:
+        """A fleet repo whose release branch holds a source commit and then release/install-5."""
+        self.fleet.mkdir()
+        self.git('init', '-q', '-b', 'release')
+        (self.fleet / 'src.txt').write_text('source\n')
+        self.git('add', 'src.txt')
+        self.git('commit', '-q', '-m', 'source')
+        head = self.git('rev-parse', 'HEAD')
+        if side:  # a commit that is not on the release branch
+            self.git('checkout', '-q', '-b', 'side')
+            (self.fleet / 'side.txt').write_text('side\n')
+            self.git('add', 'side.txt')
+            self.git('commit', '-q', '-m', 'side')
+            head = self.git('rev-parse', 'HEAD')
+            self.git('checkout', '-q', 'release')
+        files = self.files(head, '1' * 40 if wrong_tree else self.git('rev-parse', f'{head}^{{tree}}'))
+        mutate(files)
+        folder = self.fleet / 'release' / TAG
+        folder.mkdir(parents=True)
+        for name, data in files.items():
+            (folder / name).write_bytes(data)
+        self.git('add', '-A')
+        self.git('commit', '-q', '-m', 'release')
+        if tip:
+            self.git('update-ref', 'refs/remotes/origin/release', 'HEAD')
+
+    def plan(self, serial: int = SERIAL, env: dict | None = None):
+        out, err = io.StringIO(), io.StringIO()
+        environ = {'SERIES': 'test', 'OWNER_PIN_SHA256': fp.key_fingerprint((OWNER_LINE + '\n').encode()),
+                   'GITHUB_OUTPUT': str(self.root / 'output'), 'GITHUB_STEP_SUMMARY': str(self.root / 'summary'), **(env or {})}
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = fp.main(['x', 'plan', str(self.fleet), '--serial', str(serial), '--min-serial', '0', '--out',
+                            str(self.root / 'out')], environ, FakeGh(), now=NOW)
+        return code, out.getvalue().strip()
+
+    def test_the_plan_reads_git_blobs_not_the_checkout_and_hands_on_exactly_the_bytes_to_sign(self):
+        self.build()
+        (self.fleet / 'release' / TAG / 'bootstrap.sh').write_bytes(b'echo a checkout copy that is not committed\n')
+        self.assertEqual(self.plan(), (0, f'OK plan {TAG}'))
+        folder = self.root / 'out' / 'release' / TAG
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), sorted(fp.DATA))  # no signature, no other file
+        self.assertEqual((folder / 'bootstrap.sh').read_bytes(), SH)
+        got = dict(line.split('=', 1) for line in (self.root / 'output').read_text().splitlines())
+        for short, name, _ in fp.SIGNED:
+            data = (folder / name).read_bytes()
+            self.assertEqual((base64.b64decode(got[f'{short}_b64']), got[f'{short}_sha']), (data, sha(data)))
+        self.assertEqual((got['serial'], got['tag']), (str(SERIAL), TAG))
+        summary = (self.root / 'summary').read_text()
+        for want in (self.git('rev-parse', 'refs/remotes/origin/release'), self.git('rev-parse', f'HEAD:release/{TAG}'),
+                     self.git('rev-parse', f'HEAD:release/{TAG}/install.json'), sha(SH), 'install.json, verbatim',
+                     'deploy-pin.json, verbatim', f'the tag the tag job will create: {TAG}', fp.key_fingerprint(OWNER_LINE.encode())):
+            self.assertIn(want, summary)
+        self.assertNotIn(b'a checkout copy'.decode(), summary)
+
+    @unittest.skipUnless(HAVE_KEYGEN, 'ssh-keygen is missing')
+    def test_what_the_plan_hands_on_passes_the_publishers_checks_once_signed(self):
+        self.build()
+        self.assertEqual(self.plan()[0], 0)
+        folder = self.root / 'out' / 'release' / TAG
+        for name, namespace in (('install.json', fp.NS), ('kit.json', fp.PIN_NS), ('deploy-pin.json', fp.PIN_NS)):
+            sign(SHARED / 'owner-key', folder / name, namespace)
+        pub = self.root / 'owner.pub'
+        pub.write_text(OWNER_LINE + '\n')
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.root / 'out')
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(fp.main(['x', 'verify', f'release/{TAG}', '--owner-pub', str(pub), '--min-serial', '0'],
+                                     {}, FakeGh(), now=NOW), 0)
+
+    def test_each_refusal_has_its_code_and_writes_nothing_to_hand_on(self):
+        for what, build, serial, env, code in (
+                ('a serial in the other series', {}, SERIAL, {'SERIES': 'release'}, 'series'),
+                ('no series', {}, SERIAL, {'SERIES': ''}, 'series'),
+                ('another key than the constant', {}, SERIAL, {'OWNER_PIN_SHA256': 'SHA256:' + 'A' * 43}, 'key'),
+                ('the placeholder constant', {}, SERIAL, {'OWNER_PIN_SHA256': 'SHA256:NOT-SET-fill-in'}, 'key'),
+                ('a source that is not on the release branch', {'side': True}, SERIAL, {}, 'not-on-release'),
+                ('a pin tree that is not its commit\'s', {'wrong_tree': True}, SERIAL, {}, 'pin-tree'),
+                ('no release tip fetched', {'tip': False}, SERIAL, {}, 'fleet'),
+                ('another serial than the folder', {}, SERIAL + 1, {}, 'fleet')):
+            with self.subTest(what):
+                with tempfile.TemporaryDirectory() as tmp:
+                    self.root, self.fleet = Path(tmp), Path(tmp) / 'fleet'
+                    self.build(**build)
+                    self.assertEqual(self.plan(serial, env), (1, f'REFUSED {code}'))
+                    self.assertFalse((Path(tmp) / 'output').exists())
+
+    def test_the_folder_must_be_exactly_the_data_files_as_plain_blobs(self):
+        for what, mutate, code in (('an extra file', lambda f: f.update({'extra.txt': b'x'}), 'unlisted'),
+                                   ('a missing file', lambda f: f.pop('verify-archive.py'), 'missing'),
+                                   ('a signature', lambda f: f.update({'install.json.sig': b'sig'}), 'unlisted')):
+            with self.subTest(what), tempfile.TemporaryDirectory() as tmp:
+                self.root, self.fleet = Path(tmp), Path(tmp) / 'fleet'
+                self.build(mutate)
+                self.assertEqual(self.plan(), (1, f'REFUSED {code}'))
+        for what, mode in (('an executable file', '100755'), ('a link', '120000')):
+            with self.subTest(what), tempfile.TemporaryDirectory() as tmp:
+                self.root, self.fleet = Path(tmp), Path(tmp) / 'fleet'
+                self.build()
+                blob = self.git('rev-parse', f'HEAD:release/{TAG}/check.ps1')
+                self.git('update-index', '--cacheinfo', f'{mode},{blob},release/{TAG}/check.ps1')
+                self.git('commit', '-q', '-m', 'mode')
+                self.git('update-ref', 'refs/remotes/origin/release', 'HEAD')
+                self.assertEqual(self.plan(), (1, 'REFUSED unlisted'))
+
+    def test_a_bad_plan_command_line_is_usage_2_and_digits_are_canonical(self):
+        for argv in (['x', 'plan'], ['x', 'plan', 'd', '--serial', '05', '--min-serial', '0', '--out', 'o'],
+                     ['x', 'plan', 'd', '--serial', '5', '--min-serial', '\u0665', '--out', 'o']):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(fp.main(argv, {}, FakeGh()), 2, argv)
+
+
+class ReleaseBody(unittest.TestCase):
+    UBUNTU = ("d=$(mktemp -d) && { if ! curl -fsSL --max-redirs 3 --proto '=https' --proto-redir '=https' --tlsv1.2 "
+              "--connect-timeout 20 --max-time 120 --max-filesize 262144 -o \"$d/bootstrap.sh\" "
+              "'https://github.com/org/repo/releases/download/install-5/bootstrap.sh'; then echo 'REFUSED fetch'; echo 'The "
+              "download failed. Nothing was run. Tell the owner.'; rc=1; elif printf '%s  %s\\n' '" + 'ab' * 32 + "' "
+              "\"$d/bootstrap.sh\" | sha256sum -c - >/dev/null; then sh \"$d/bootstrap.sh\" --serial 5 --min-serial 3; rc=$?; "
+              "else echo 'REFUSED boot-hash'; echo 'The download is not the file the owner signed. Nothing was run. Tell the "
+              "owner.'; rc=1; fi; rm -rf \"$d\"; (exit $rc); }")
+
+    def test_a_line_is_the_text_the_fleet_makes_for_its_check_mode(self):
+        self.assertEqual(fp.check_line('ubuntu', 'org/repo', 5, 'ab' * 32, 3), self.UBUNTU)  # copied from the fleet's render
+        self.assertEqual(fp.check_line('mac', 'org/repo', 5, 'ab' * 32, 3), self.UBUNTU.replace('sha256sum -c -', 'shasum -a 256 -c -'))
+        for want in ('bootstrap.ps1', "-eq '" + 'ab' * 32 + "'", '-Serial 5 -MinSerial 3', 'curl.exe'):
+            self.assertIn(want, fp.check_line('win', 'org/repo', 5, 'ab' * 32, 3))
+
+    def test_the_series_decides_which_serials_a_key_may_sign(self):
+        for serial, series in ((0, 'test'), (999, 'test'), (1000, 'release'), (2 ** 31, 'release')):
+            fp.check_series(serial, series)
+        for serial, series in ((1000, 'test'), (999, 'release'), (5, ''), (5, 'Test')):
+            with self.assertRaisesRegex(fp.Refused, 'series'):
+                fp.check_series(serial, series)
+
+
 class Readme(unittest.TestCase):
     TEXT = (ROOT / 'README.md').read_text(encoding='utf-8')
 
-    def test_the_owners_key_section_says_where_the_key_comes_from_and_what_the_log_shows(self):
-        self.assertIn("\n## The owner's key\n", self.TEXT)
-        section = re.split(r'(?m)^## ', self.TEXT.split("## The owner's key\n", 1)[1])[0]
-        for need in ('not in this repo', '`OWNER_PIN_PUB`', 'Environment `release`', '`OWNER_PIN_SHA256`',
-                     'The run log prints the fingerprint of the key it used', 'owner key\nSHA256:',
-                     'The bootstraps carry their own baked copy of the key', '`--owner-pub PATH`'):
-            self.assertIn(need, section.replace('(`owner key\nSHA256', '(`owner key\nSHA256'))
-        self.assertIn('"The owner\'s key"', self.TEXT)  # the one-time settings point at the section
+    def test_the_signing_key_section_says_where_the_key_lives_and_what_the_log_shows(self):
+        section = re.split(r'(?m)^## ', self.TEXT.split('\n## The signing key\n', 1)[1])[0]
+        for need in ('`SIGN_KEY`', '`KEY_SHA256`', '`OWNER_PIN_SHA256`', 'not in this repo', 'prints the fingerprint of the key'):
+            self.assertIn(need, section)
+        self.assertNotIn('OWNER_PIN_PUB', self.TEXT)
 
 
 class Workflow(unittest.TestCase):
     TEXT = (ROOT / '.github/workflows/install.yml').read_text(encoding='utf-8')
     DISK = (ROOT / '.github/workflows/disk.yml').read_text(encoding='utf-8')
+    JOBS = {m[1]: m[2] for m in re.finditer(r'(?ms)^  (plan|sign|tag|publish):\n(.*?)(?=^  \w+:\n|\Z)',
+                                            TEXT.split('\njobs:\n', 1)[1])}
 
-    def test_it_is_a_main_only_dispatch_with_two_inputs_in_the_release_environment(self):
-        self.assertRegex(self.TEXT, r'(?m)^on:\n  workflow_dispatch:\n    inputs:\n      serial:\n')
+    def test_it_is_a_release_branch_dispatch_of_four_jobs(self):
+        self.assertRegex(self.TEXT, r'(?m)^on:\n  workflow_dispatch:\n    inputs:\n      mode:\n')
         self.assertEqual(re.findall(r'(?m)^      (\w+):\n        (?:description|required)', self.TEXT),
-                         ['serial', 'min_serial'])
-        self.assertNotIn('pull_request', self.TEXT)
-        self.assertNotIn('push:', self.TEXT)
-        self.assertIn("if: github.ref == 'refs/heads/main'", self.TEXT)
-        self.assertEqual(re.findall(r'(?m)^    environment: (\S+)$', self.TEXT), ['release'])
-        self.assertEqual(re.findall(r'runs-on: (\S+)', self.TEXT), ['ubuntu-24.04'])
-        self.assertNotIn('self-hosted', self.TEXT)
+                         ['mode', 'serial', 'min_serial'])
+        self.assertEqual(list(self.JOBS), ['plan', 'sign', 'tag', 'publish'])
+        for bad in ('pull_request', 'push:', 'self-hosted', 'refs/heads/main', 'actions/cache'):
+            self.assertNotIn(bad, self.TEXT)
+        for name, job in self.JOBS.items():
+            self.assertIn("github.ref == 'refs/heads/release'", job.split('steps:')[0], name)
+        self.assertEqual(re.findall(r'runs-on: (\S+)', self.TEXT), ['ubuntu-24.04'] * 4)
+        self.assertEqual([re.findall(r'(?m)^    environment: (\S+)$', j) for j in self.JOBS.values()],
+                         [['release'], ['release'], ['release'], []])  # publish has none: no secret, no variable of release
 
-    def test_only_the_one_job_writes_and_only_contents(self):
+    def test_only_publish_writes_and_only_contents_and_sign_and_tag_hold_no_token(self):
         self.assertRegex(self.TEXT, r'(?m)^permissions:\n  contents: read\n')
         self.assertEqual(re.findall(r'(\w[\w-]*): write', self.TEXT), ['contents'])
-        self.assertIn('    permissions:\n      contents: write\n', self.TEXT)
-        self.assertEqual(self.TEXT.count('jobs:'), 1)
-        self.assertEqual(len(re.findall(r'(?m)^  \w+:\n    (?:#.*\n    )*(?:if|environment)', self.TEXT)), 1)
+        self.assertIn('    permissions:\n      contents: write\n', self.JOBS['publish'])
+        for name in ('sign', 'tag'):
+            self.assertTrue('    permissions: {}\n' in self.JOBS[name] and 'github.token' not in self.JOBS[name])
+
+    def test_each_secret_is_read_by_one_job_and_the_sign_and_tag_jobs_run_no_action_and_no_repository_code(self):
+        self.assertEqual(sorted(re.findall(r'secrets\.(\w+)', self.TEXT)), ['FLEET_READ', 'SIGN_KEY', 'TAG_KEY'])
+        for name, secret in (('plan', 'FLEET_READ'), ('sign', 'SIGN_KEY'), ('tag', 'TAG_KEY')):
+            self.assertEqual(re.findall(r'secrets\.(\w+)', self.JOBS[name]), [secret])
+        self.assertNotIn('secrets.', self.JOBS['publish'])
+        for name in ('sign', 'tag'):
+            for bad in ('uses:', 'checkout', 'fleet-install-publish', 'python', 'RUNNER_WORKSPACE', 'GITHUB_WORKSPACE'):
+                self.assertNotIn(bad, self.JOBS[name], name)
+        self.assertEqual(re.findall(r'vars\.(\w+)', self.TEXT), ['IMMUTABLE_RELEASES_CONFIRMED'])
+        self.assertNotIn('OWNER_PIN_PUB', self.TEXT)
 
     def test_the_actions_are_sha_pinned_the_same_as_disk_and_no_credential_stays_in_git(self):
-        self.assertEqual(re.findall(r'uses: (actions/checkout@\S+)', self.TEXT),
-                         re.findall(r'uses: (actions/checkout@\S+)', self.DISK))
+        self.assertEqual(re.findall(r'uses: (actions/checkout@\S+)', self.TEXT)[0], re.findall(r'uses: (actions/checkout@\S+)', self.DISK)[0])
         for uses in re.findall(r'uses: (\S+)', self.TEXT):
-            self.assertRegex(uses, r'^actions/checkout@[0-9a-f]{40}$')
+            self.assertRegex(uses, r'^actions/(?:checkout|upload-artifact|download-artifact)@[0-9a-f]{40}$')
         self.assertEqual(self.TEXT.count('persist-credentials: false'), self.TEXT.count('actions/checkout@'))
 
-    def test_the_owners_confirmation_reaches_the_script_from_the_release_environments_variable(self):
-        step = self.TEXT[self.TEXT.index('          SERIAL:'):]
-        self.assertIn('          IMMUTABLE_CONFIRMED: ${{ vars.IMMUTABLE_RELEASES_CONFIRMED }}\n', step)
-        self.assertEqual(re.findall(r'IMMUTABLE_\w+: (.*)', self.TEXT), ['${{ vars.IMMUTABLE_RELEASES_CONFIRMED }}'])
+    def test_the_key_fingerprint_series_and_host_key_are_constants_of_the_file(self):
+        env = dict(re.findall(r'(?m)^  ([A-Z_0-9]+): (.*)$', self.TEXT.split('\njobs:\n', 1)[0].split('\nenv:\n', 1)[1]))
+        self.assertEqual(set(env), {'KEY_SHA256', 'SERIES', 'FLEET_REPO', 'GH_HOSTKEY'})
+        self.assertIsNone(fp.FPR.fullmatch(env['KEY_SHA256']))  # still the placeholder: the sign job refuses it
+        self.assertEqual(env['SERIES'], 'test')
+        host, kind, key = env['GH_HOSTKEY'].split()
+        digest = hashlib.sha256(base64.b64decode(key)).digest()
+        self.assertEqual((host, kind, base64.b64encode(digest).decode().rstrip('=')),
+                         ('github.com', 'ssh-ed25519', '+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU'))  # GitHub's published one
 
-    def test_the_owners_key_and_fingerprint_come_from_the_release_environment_not_the_repo(self):
-        self.assertIn('          OWNER_PIN_PUB: ${{ vars.OWNER_PIN_PUB }}\n', self.TEXT)
-        self.assertIn('          OWNER_PIN_SHA256: ${{ vars.OWNER_PIN_SHA256 }}\n', self.TEXT)
-        self.assertEqual(re.findall(r'\$\{\{ (?:vars|secrets)\.\w+ \}\}', self.TEXT).count('${{ vars.OWNER_PIN_PUB }}'), 1)
-        self.assertIn('umask 077', self.TEXT)  # the temp file is the job's alone (0600)
-        self.assertNotIn('keys/', self.TEXT)
-        self.assertNotIn('owner-pin.pub"\n', self.TEXT.split('run: umask')[0])
+    def test_the_sign_step_checks_the_fingerprint_holds_the_key_in_memory_and_signs_what_it_hashed(self):
+        sign = self.JOBS['sign']
+        for need in ('/dev/shm/sign.', 'umask 077', 'shred -u', '/usr/bin/ssh-keygen -l -f "$d/key"', 'REFUSED key-not-set',
+                     "grep -Eq '^SHA256:[A-Za-z0-9+/]{43}$'", '[ "$fp" = "$KEY_SHA256" ] ||', 'set -euo pipefail',
+                     '/usr/bin/ssh-keygen -Y verify -f "$d/allowed" -I owner', 'if [ "$MODE" = pubkey ]',
+                     f'sign install.json {fp.NS} "$INSTALL_B64" "$INSTALL_SHA" install',
+                     f'sign kit.json {fp.PIN_NS} "$KIT_B64" "$KIT_SHA" kit',
+                     f'sign deploy-pin.json {fp.PIN_NS} "$PIN_B64" "$PIN_SHA" pin'):
+            self.assertIn(need, sign)
+        self.assertLess(sign.index('[ "$fp" = "$KEY_SHA256" ]'), sign.index('-Y sign'))
+        self.assertIn('sha256sum "$d/$1"', sign)
+        self.assertNotIn('/tmp', sign)
 
-    def test_the_inputs_reach_the_script_only_through_env(self):
-        runs = re.findall(r'(?m)^\s+(?:- )?run: (.*)$', self.TEXT)
-        self.assertEqual(runs, ['umask 077 && printf \'%s\\n\' "$OWNER_PIN_PUB" > "$RUNNER_TEMP/owner-pin.pub"',
-                                'python3 bin/fleet-install-publish.py publish "release/install-$SERIAL"'
-                                ' --owner-pub "$RUNNER_TEMP/owner-pin.pub" --min-serial "$MIN_SERIAL"'])
-        self.assertFalse([r for r in runs if '${{' in r])  # nothing in a run: line is an expression
-        for want in ('SERIAL: ${{ inputs.serial }}', 'MIN_SERIAL: ${{ inputs.min_serial }}',
-                     'GH_TOKEN: ${{ github.token }}'):
+    def test_the_plan_job_reads_the_fleet_over_ssh_with_the_pinned_host_key_and_the_tag_job_never_forces(self):
+        for need in ('StrictHostKeyChecking=yes', 'IdentitiesOnly=yes', 'rm -f "$RUNNER_TEMP/fleet-read"',
+                     "*[!0-9]*) echo 'serial and min_serial are digits only'", '--stat "$last" HEAD -- .github bin vendor',
+                     'include-hidden-files: true', 'OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}'):
+            self.assertIn(need, self.JOBS['plan'])
+        self.assertNotIn('--format', self.JOBS['plan'])  # hashes only: the fleet's commit subjects are private
+        self.assertIn('"$GITHUB_SHA:refs/tags/install-$SERIAL"', self.JOBS['tag'])
+        self.assertNotIn('--force', self.JOBS['tag'])
+
+    def test_the_publish_job_gets_the_key_from_the_sign_job_and_the_fingerprint_from_the_constant(self):
+        for need in ('PUB: ${{ needs.sign.outputs.pub }}', 'OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}', 'needs: [plan, sign, tag]',
+                     'IMMUTABLE_CONFIRMED: ${{ needs.plan.outputs.immutable }}', '--owner-pub "$RUNNER_TEMP/owner.pub"'):
+            self.assertIn(need, self.JOBS['publish'])
+
+    def test_the_inputs_reach_the_scripts_only_through_env(self):
+        bodies, block = [], None  # every run: line, and the lines of every run: | block
+        for line in self.TEXT.splitlines():
+            if block is not None and (not line.strip() or len(line) - len(line.lstrip()) > block):
+                bodies.append(line)
+                continue
+            m = re.match(r'(\s+)(?:- )?run: (.*)$', line)
+            block = len(m[1]) if m and m[2] == '|' else None
+            bodies += [m[2]] if m else []
+        self.assertGreater(len(bodies), 40)
+        self.assertEqual([b for b in bodies if '${{' in b], [])  # nothing in a run: is an expression
+        for want in ('SERIAL: ${{ inputs.serial }}', 'MIN_SERIAL: ${{ inputs.min_serial }}', 'GH_TOKEN: ${{ github.token }}',
+                     'MODE: ${{ inputs.mode }}'):
             self.assertIn(want, self.TEXT)
-        self.assertNotRegex(self.TEXT, r'(?i)secrets\.')
-        self.assertIn('timeout-minutes: 60', self.TEXT)
+        self.assertIn('timeout-minutes: 60', self.JOBS['publish'])
 
 
 if __name__ == '__main__':

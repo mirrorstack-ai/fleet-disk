@@ -22,9 +22,9 @@ concurrency:
 jobs:
   build:
     # `if` only stops an accidental dispatch from a branch: a dispatched run uses the workflow file of ITS ref, so a
-    # writer could drop it. The boundary is the environment: `release` is restricted to main (see the README).
+    # writer could drop it. The boundary is the environment: `disk` is restricted to main (see the README).
     if: github.ref == 'refs/heads/main'
-    environment: release
+    environment: disk
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
