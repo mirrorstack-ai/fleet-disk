@@ -2385,8 +2385,9 @@ class Workflow(unittest.TestCase):
         # the test key signs only the test series and the test series only the test key, so a release-series serial is
         # never signed with T, and a mistyped constant fails here, not at the first run
         self.assertEqual(env['SERIES'] == 'test', env['KEY_SHA256'] == test_key, env)
-        with self.assertRaises(fp.Refused):  # and so is the kit host: plan and publish refuse `kit-host` until it is set
-            fp.check_kit_host(env['KIT_HOST'])
+        # and so is the kit host: the production kit Worker (D305, 2026-10-11), and the publisher's own check accepts it
+        self.assertEqual(env['KIT_HOST'], 'fleet-kit.mirrorstack-fleet.workers.dev')
+        self.assertEqual(fp.check_kit_host(env['KIT_HOST']), env['KIT_HOST'])
         self.assertEqual(self.TEXT.count('KIT_HOST: ${{ env.KIT_HOST }}'), 4)  # handed to plan, kit, publish and floor as env
         self.assertEqual(env['SERIES'], 'test')
         host, kind, key = env['GH_HOSTKEY'].split()

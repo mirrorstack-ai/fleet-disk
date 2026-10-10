@@ -64,6 +64,9 @@ budget write) and the same 404. A cut stream is `release` through `ctx.waitUntil
 Worker variables: `INVITE_PEPPER` (secret, 16+ chars; absent is a 503 for well-formed
 requests), `KIT_DISABLED` (any non-empty value: all 404), `KIT_FLOOR` (read by the Gate),
 `KIT_GW_PUB` / `KIT_UP_PUB` (raw Ed25519 public keys, 64 hex; empty switches that role off).
+In `wrangler.jsonc` production holds `KIT_UP_PUB` (keygen run 38040384564's `KIT_UPLOAD_KEY`, fingerprint
+`SHA256:WKjmfza1zWKDkEpz7uoc9c+Nl2e9+dxsI18chRha8rQ`) and an empty `KIT_GW_PUB` (the gateway admin routes stay off until
+K9 first starts on `mirrorstack-fleet-ctl`, G-K11-1); staging holds both empty and gets throwaway keys from `kit-deploy.yml`.
 
 ### Admin calls
 
