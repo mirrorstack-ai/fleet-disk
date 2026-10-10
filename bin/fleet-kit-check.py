@@ -147,12 +147,8 @@ def secret_names(text: str) -> set[str]:
 
 
 def _enabled_anywhere(node) -> bool:
-    """True if an `enabled: true` sits anywhere under node (observability.logs, .traces, ...)."""
-    if isinstance(node, dict):
-        return any((k == 'enabled' and v is True) or _enabled_anywhere(v) for k, v in node.items())
-    if isinstance(node, list):
-        return any(_enabled_anywhere(v) for v in node)
-    return False
+    """True if an `enabled: true` sits anywhere under node (observability.logs, .traces, ...). One walker decides."""
+    return bool(_enabled_paths(node))
 
 
 def _enabled_paths(node, prefix='') -> list[str]:
@@ -160,7 +156,7 @@ def _enabled_paths(node, prefix='') -> list[str]:
     found = []
     if isinstance(node, dict):
         for k, v in node.items():
-            path = prefix + str(k)
+            path = prefix + ascii(str(k))[1:-1]       # escaped: a key never injects a newline or a log command
             if k == 'enabled' and v is True:
                 found.append(path)
             else:
@@ -179,7 +175,8 @@ def _why_observability_on(obs) -> str:
         return 'observability: not an object (%s)' % type(obs).__name__
     on = _enabled_paths(obs)
     if on:
-        return 'observability on: ' + ', '.join(on)
+        shown = ', '.join(p if len(p) <= 80 else p[:77] + '...' for p in on[:8])
+        return 'observability on: ' + shown + (' (+%d more)' % (len(on) - 8) if len(on) > 8 else '')
     return 'observability.enabled: missing' if 'enabled' not in obs else 'observability.enabled: not false'
 
 

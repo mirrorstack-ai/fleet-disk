@@ -17,8 +17,8 @@
   "workers_dev": true,
   "preview_urls": false,
   // Logging off: tail would show request headers (the invite).
-  // Every flag is set off explicitly because new Workers default the nested ones on, and the settings gate refuses
-  // any `enabled: true` under observability (refusal 2026-10-10, run 38076806590).
+  // Every flag is set off explicitly; the settings gate refuses any `enabled: true` under observability
+  // (refusal 2026-10-10, run 38076806590, cause not yet read back).
   "observability": { "enabled": false, "issues": { "enabled": false }, "logs": { "enabled": false, "invocation_logs": false, "persist": false }, "traces": { "enabled": false, "persist": false } },
   "logpush": false,
   "keep_vars": true,
@@ -35,8 +35,8 @@
       "compatibility_date": "2026-09-01",
       "workers_dev": true,
       "preview_urls": false,
-      // Every flag is set off explicitly because new Workers default the nested ones on, and the settings gate refuses
-      // any `enabled: true` under observability (refusal 2026-10-10, run 38076806590).
+      // Every flag is set off explicitly; the settings gate refuses any `enabled: true` under observability
+      // (refusal 2026-10-10, run 38076806590, cause not yet read back).
       "observability": { "enabled": false, "issues": { "enabled": false }, "logs": { "enabled": false, "invocation_logs": false, "persist": false }, "traces": { "enabled": false, "persist": false } },
       "logpush": false,
       "keep_vars": true,

@@ -381,6 +381,18 @@ class Judges(unittest.TestCase):
         self.assertEqual(kc.judge_settings([dict(self.GOOD, observability='acct-SECRET')], self.SUB),
                          ['observability is not off', 'observability: not an object (str)'])
 
+    def test_the_detail_line_is_escaped_and_capped(self):
+        out = kc.judge_settings([dict(self.GOOD, observability={'enabled': False, 'a\nb::error::x': {'enabled': True}})],
+                                self.SUB)
+        self.assertEqual(out, ['observability is not off', 'observability on: a\\nb::error::x.enabled'])
+        many = {'enabled': False, **{'k%d' % i: {'enabled': True} for i in range(100)}}
+        out = kc.judge_settings([dict(self.GOOD, observability=many)], self.SUB)
+        self.assertEqual(out[0], 'observability is not off')
+        self.assertIn('(+92 more)', out[1])
+        self.assertLess(len(out[1]), 300)
+        long_key = {'enabled': False, 'x' * 5000: {'enabled': True}}
+        self.assertLess(len(kc.judge_settings([dict(self.GOOD, observability=long_key)], self.SUB)[1]), 300)
+
     def test_a_passing_observability_adds_no_detail_and_old_verdicts_hold(self):
         full_off = {'enabled': False, 'issues': {'enabled': False},
                     'logs': {'enabled': False, 'invocation_logs': False, 'persist': False},
