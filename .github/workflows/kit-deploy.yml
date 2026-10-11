@@ -42,7 +42,10 @@ jobs:
   verify:
     if: github.ref == 'refs/heads/release'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # 20, not 10: run 38176886697 (release 8737d43) was cancelled here after 10 minutes with test_kit_deploy.py still
+    # running, so the deploy never reached its gate. Each of its ~55 replays waits about 6 s of real time for a short-lived
+    # invite to expire (measured 2026-10-12; gap G-KITTEST-1 shortens that wait and puts this back to 10).
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
         with:
