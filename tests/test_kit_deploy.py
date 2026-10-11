@@ -135,6 +135,9 @@ class FakeKit:
         self.per_source = flags.get('per_source', 30)
         self.gate_failures = 0
         self.robots_fetches = 0
+        self.signed_calls = 0                    # well-formed KitAdmin calls seen, in order (version-propagation flags)
+        self.per_target: dict[tuple[str, str | None], int] = {}
+        self.admin_log: list[tuple[str, str, str, int, int]] = []  # (role, method, path, ts, status) per signed call
 
     def now(self) -> int:
         return int(time.time() * 1000)
@@ -163,6 +166,8 @@ def make_handler(kit: FakeKit):
             pass
 
         def send_fixed(self, status, body, ctype='text/plain', server=None):
+            if kit.admin_log and getattr(self, 'signed', False):  # the status of this signed call, for the log
+                kit.admin_log[-1] = kit.admin_log[-1][:4] + (status,)
             if server:                                           # as the live host: every answer there says cloudflare
                 self.send_response_only(status)
                 self.send_header('Server', server)
@@ -173,6 +178,9 @@ def make_handler(kit: FakeKit):
             self.send_header('Cache-Control', 'no-store, no-transform')
             self.send_header('Content-Length', str(len(body)))
             self.send_header('CF-RAY', os.urandom(8).hex())
+            if kit.flags.get('report_to_404') and status == 404:  # a per-response reporting header on the Worker's 404
+                self.send_header('Report-To', '{"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=%s"}]}'
+                                 % os.urandom(8).hex())
             if kit.flags.get('gzip_404') and status == 404 and 'gzip' in (self.headers.get('Accept-Encoding') or ''):
                 self.send_header('Content-Encoding', 'gzip')
             self.end_headers()
@@ -194,7 +202,7 @@ def make_handler(kit: FakeKit):
             self.end_headers()
             self.wfile.write(body)
 
-        def send_robots(self, body=MANAGED_ROBOTS, status=200):
+        def send_robots(self, body=MANAGED_ROBOTS, status=200, extra=()):
             # Cloudflare's managed robots.txt: an edge page with the Worker's own cache-control, as the probes measured it
             self.send_response_only(status)
             self.send_header('Server', 'cloudflare')
@@ -203,6 +211,8 @@ def make_handler(kit: FakeKit):
             self.send_header('Content-Length', str(len(body)))
             self.send_header('Cache-Control', 'no-store, no-transform')
             self.send_header('CF-RAY', os.urandom(8).hex())
+            for k, v in extra:
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
@@ -229,6 +239,12 @@ def make_handler(kit: FakeKit):
                 self.send_robots(MANAGED_ROBOTS if first else MANAGED_ROBOTS.replace(b'Allow', b'allow'))
             elif mode == 'edge_400':                             # the duplicate-Authorization page on robots
                 self.send_edge_400()
+            elif mode == 'reporting':                            # run 38140164568 attempt 2: report-to (and nel) per fetch
+                self.send_robots(extra=[('Report-To', '{"group":"cf-nel","endpoints":[{"url":"https://a.nel.cloudflare.com'
+                                                      '/report/v4?s=%s"}]}' % os.urandom(8).hex()),
+                                        ('NEL', '{"success_fraction":0.0%d,"report_to":"cf-nel"}' % (1 if first else 2))])
+            elif mode == 'x_foo':                                # another header that differs per fetch: still refused
+                self.send_robots(extra=[('X-Foo', os.urandom(4).hex())])
             else:
                 return False
             return True
@@ -325,8 +341,36 @@ def make_handler(kit: FakeKit):
                             inv['used'] -= 1
                             inv['refunds'] += 1
 
+        def propagating(self, a, path) -> bool:
+            """Version propagation (run 38140164568): a signed call reaching an isolate with the previous run's keys gets
+            the fixed 404. flags: admin_404_first=N (the first N signed calls), admin_404_always, flaky_404=[(method,
+            path, skip, times)] (after `skip` such calls, the next `times` of them; path None = any path of that method),
+            state_status=S (/_k/state answers S).
+            Answered = True."""
+            self.signed = True
+            with kit.lock:
+                kit.signed_calls += 1
+                for key in ((self.command, path), (self.command, None)):
+                    kit.per_target[key] = kit.per_target.get(key, 0) + 1
+                kit.admin_log.append((a.group(1), self.command, path, int(a.group(2)), 0))
+                n = kit.signed_calls
+            flaky = any(m == self.command and p in (path, None) and skip < kit.per_target[(m, p)] <= skip + times
+                        for m, p, skip, times in kit.flags.get('flaky_404', ()))
+            if n <= kit.flags.get('admin_404_first', 0) or kit.flags.get('admin_404_always') or flaky:
+                length = int(self.headers.get('Content-Length') or 0)
+                if length:
+                    self.rfile.read(length)                      # drain: the client sends the whole body first
+                self.nf()
+                return True
+            if path == '/_k/state' and kit.flags.get('state_status'):
+                self.send_json(kit.flags['state_status'], {'ok': False, 'error': 'unavailable'})
+                return True
+            return False
+
         def admin(self, path):
             a = ADMIN_RE.match(self.headers.get('Authorization') or '')
+            if a and self.propagating(a, path):
+                return
             routes = [('PUT', r'^/_k/file/([0-9]{1,9})/bundle\.tar$', 'upload', True), ('PUT', r'^/_k/gateway/([0-9]{1,9})$', 'upload', False),
                       ('PUT', r'^/_k/floor$', 'upload', False), ('POST', r'^/_k/invite$', 'gateway', False),
                       ('DELETE', r'^/_k/invite/([A-Za-z0-9_-]{8,64})$', 'gateway', False), ('GET', r'^/_k/state$', 'gateway', False)]
@@ -1110,18 +1154,112 @@ class OverHttp(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def replay(self, **flags):
+    def replay(self, run=None, **flags):
         kit = FakeKit(self.pubs, **flags)
+        # the readiness streak is the real one (10); only the waits are short here
+        kw = dict(big_mib=12, cut_wait=0.4, short_life_ms=2500, ready_spacing=0.0, retry_wait=0.0, log=lambda *_: None)
+        kw.update(run or {})
         with Served(kit) as base:
             client = kc.Client(base, allow_http=True)
-            lines = kc.run_replay(client, kc.Admin(client, self.gate_dir), big_mib=12, cut_wait=0.4, short_life_ms=2500,
-                                  log=lambda *_: None)
+            lines = kc.run_replay(client, kc.Admin(client, self.gate_dir), **kw)
         return kit, lines
 
-    def refused(self, fragment, **flags):
+    def refused(self, fragment, run=None, **flags):
         with self.assertRaises(kc.Refused) as why:
-            self.replay(**flags)
+            self.replay(run, **flags)
         self.assertIn(fragment, str(why.exception))
+        return why.exception
+
+    # -- version propagation (run 38140164568 attempt 1) ---------------------------------------------------------------
+    def test_readiness_waits_out_the_fixed_404_and_needs_ten_200s_in_a_row(self):
+        kit, lines = self.replay(admin_404_first=4)
+        text = '\n'.join(lines)
+        self.assertRegex(text, r'readiness: 10 consecutive signed 200s from /_k/state after 14 tries, 4 404s seen, '
+                               r'[0-9.]+ s')
+        self.assertIn("admin retries on the Worker's fixed 404: 0\n", text + '\n')
+        self.assertEqual(kit.fails, 30)
+        # a 404 inside the run resets it: 3 good, one 404, then 10 more
+        _, lines = self.replay(flaky_404=[('GET', '/_k/state', 3, 1)])
+        self.assertIn('after 14 tries, 1 404s seen', '\n'.join(lines))
+        _, lines = self.replay()
+        self.assertIn('after 10 tries, 0 404s seen', '\n'.join(lines))
+
+    def test_readiness_refuses_a_staging_that_never_serves_this_runs_keys(self):
+        why = self.refused(kc.PROPAGATION + ': no 10 consecutive 200s within 0 s (', {'ready_timeout': 0.3,
+                                                                                       'ready_spacing': 0.01},
+                           admin_404_always=True)
+        self.assertRegex(str(why), r'\(\d+ tries, (\d+) 404s seen, longest run 0\)$')
+        tries, seen = re.search(r'\((\d+) tries, (\d+) 404s', str(why)).groups()
+        self.assertEqual(tries, seen)
+        self.assertGreater(int(tries), 1)
+
+    def test_readiness_refuses_any_other_status_at_once(self):
+        self.refused(kc.PROPAGATION + ': try 1 answered 503 (1 tries, 0 404s seen,', state_status=503)
+
+    def test_readiness_runs_before_the_first_upload(self):
+        kit = FakeKit(self.pubs, admin_404_always=True)
+        with Served(kit) as base, self.assertRaises(kc.Refused):
+            client = kc.Client(base, allow_http=True)
+            kc.run_replay(client, kc.Admin(client, self.gate_dir), big_mib=1, ready_timeout=0.2, ready_spacing=0.01,
+                          log=lambda *_: None)
+        calls = [(m, p) for _, m, p, _, _ in kit.admin_log]
+        self.assertEqual(set(calls[:-1]), {('GET', '/_k/state')})
+        self.assertEqual(calls[-1], ('PUT', '/_k/floor'))              # only the best-effort cleanup after it
+        self.assertEqual(kit.files, {})
+
+    def test_a_2xx_admin_call_that_meets_the_fixed_404_once_is_retried_and_counted(self):
+        # run 38140164568 attempt 1's vector: the identical re-upload (the second PUT of s1) answered the fixed 404
+        kit, lines = self.replay(flaky_404=[('PUT', '/_k/file/900000001/bundle.tar', 1, 1)])
+        text = '\n'.join(lines)
+        self.assertIn("admin retries on the Worker's fixed 404: 1 (identical re-upload)", text)
+        self.assertIn('identical re-upload: 200', text)
+        tss = [ts for _, m, p, ts, _ in kit.admin_log if (m, p) == ('PUT', '/_k/file/900000001/bundle.tar')]
+        self.assertEqual(len(tss), 4)                       # small, re-upload (404), re-upload again, overwrite
+        self.assertLess(tss[1], tss[2])                     # the retry signed a fresh ts
+        # the bound: three retries still pass, the fourth 404 refuses
+        _, lines = self.replay(flaky_404=[('PUT', '/_k/file/900000001/bundle.tar', 1, 3)])
+        self.assertIn("fixed 404: 3 (identical re-upload, identical re-upload, identical re-upload)", '\n'.join(lines))
+        self.refused("identical re-upload: status 404 (the Worker's fixed 404) on 4 tries, expected 200; " + kc.PROPAGATION,
+                     flaky_404=[('PUT', '/_k/file/900000001/bundle.tar', 1, 4)])
+
+    def test_every_2xx_admin_call_takes_the_retry_and_the_replay_keeps_its_ts(self):
+        targets = [('upload small', 'PUT', '/_k/file/900000001/bundle.tar', 0), ('upload big', 'PUT', '/_k/file/900000002/bundle.tar', 0),
+                   ('gateway pair', 'PUT', '/_k/gateway/900000001', 0), ('floor 0', 'PUT', '/_k/floor', 0),
+                   ('invite W', 'POST', '/_k/invite', 0), ('floor up', 'PUT', '/_k/floor', 4),
+                   ('revoke', 'DELETE', None, 0), ('replay first', 'PUT', '/_k/floor', 2)]
+        for label, method, path, skip in targets:
+            with self.subTest(label=label):
+                kit, lines = self.replay(flaky_404=[(method, path, skip, 1)])
+                self.assertIn("fixed 404: 1 (%s)" % label, '\n'.join(lines))
+        # (PUT /_k/floor: floor 0, wrong role, replay first, replay second, ...) the replay vector repeats the ts that
+        # was served, not the one that met the 404
+        floor = [(ts, st) for role, m, p, ts, st in kit.admin_log if (role, m, p) == ('upload', 'PUT', '/_k/floor')]
+        self.assertEqual([st for _, st in floor[:4]], [200, 404, 200, 409])
+        self.assertLess(floor[1][0], floor[2][0])
+        self.assertEqual(floor[2][0], floor[3][0])
+
+    def test_calls_that_expect_a_refusal_get_exactly_one_try(self):
+        # each of these fakes answers the fixed 404 once and the expected answer on a second try: no retry, so refused
+        for label, method, path, skip, fragment in (
+                ('overwrite', 'PUT', '/_k/file/900000001/bundle.tar', 2, 'overwrite: status 404, expected 409'),
+                ('wrong bytes', 'PUT', '/_k/file/900000003/bundle.tar', 0, 'wrong bytes: status 404, expected 422'),
+                ('rollback', 'PUT', '/_k/gateway/900000000', 0, 'gateway rollback: status 404, expected 409'),
+                ('ceiling', 'POST', '/_k/invite', 4, 'ceiling downloads: status 404, expected 422'),
+                ('replay second', 'PUT', '/_k/floor', 3, 'replay second: status 404, expected 409')):
+            with self.subTest(label=label):
+                with self.assertRaises(kc.Refused) as why:
+                    self.replay(flaky_404=[(method, path, skip, 1)])
+                self.assertIn(fragment, str(why.exception))
+        # wrong role (403 or 404 both fine) and stale (404) take what they get: one call each, even on the fixed 404
+        kit, lines = self.replay(flaky_404=[('PUT', '/_k/floor', 1, 1)])        # the wrong-role call meets it
+        log = kit.admin_log
+        self.assertEqual(sum(1 for role, m, p, _, _ in log if (role, m, p) == ('gateway', 'PUT', '/_k/floor')), 1)
+        stale = [st for role, m, p, ts, st in log if (m, p) == ('GET', '/_k/state') and ts < kit.now() - 300000]
+        self.assertEqual(stale, [404])
+        # 10 ready, the stale one, the front reject's zero signature: nothing sent again
+        self.assertEqual(sum(1 for _, m, p, _, _ in log if (m, p) == ('GET', '/_k/state')), 12)
+        self.assertEqual(sum(1 for *_, st in log if st == 409), 3)     # overwrite, rollback, replay second: once each
+        self.assertIn("fixed 404: 0", '\n'.join(lines))
 
     def test_the_replay_passes_against_a_worker_that_follows_the_spec_and_cleans_up(self):
         kit, lines = self.replay()
@@ -1219,6 +1357,16 @@ class OverHttp(unittest.TestCase):
             for body in (b'Hello World!', b'content signals:', b'User-agent', b'condition of accessing'):
                 self.assertNotIn(body.decode(), str(why.exception))                    # a refusal never carries a body
 
+    def test_robots_reporting_headers_may_differ_and_nothing_else(self):
+        # run 38140164568 attempt 2: '"robots, second fetch" differs from "robots": headers differ: report-to'
+        kit, lines = self.replay(robots='reporting')
+        self.assertIn("robots: Cloudflare's managed robots.txt for both fetches, identical", '\n'.join(lines))
+        self.assertEqual(kit.robots_fetches, 2)
+        self.refused('robots: "robots, second fetch" differs from "robots": headers differ: x-foo', robots='x_foo')
+        # the Worker's 404s are held to VARYING alone: a differing report-to on them still refuses
+        self.refused('differs from', report_to_404=True)
+        self.refused('headers differ: report-to', report_to_404=True)
+
     def test_the_managed_robots_page_on_another_label_is_refused(self):
         self.refused('root: status 200, expected 404', managed_robots_on='/')
         self.refused('root: status 200, expected 404', managed_robots_on='/', robots='managed')
@@ -1252,7 +1400,8 @@ class OverHttp(unittest.TestCase):
 
     def test_the_probe_takes_the_same_robots_rows_as_the_replay(self):
         for robots, line in ((None, "robots: the Worker's 404 for both fetches"),
-                             ('managed', "robots: Cloudflare's managed robots.txt for both fetches, identical")):
+                             ('managed', "robots: Cloudflare's managed robots.txt for both fetches, identical"),
+                             ('reporting', "robots: Cloudflare's managed robots.txt for both fetches, identical")):
             kit = FakeKit(self.pubs, **({'robots': robots} if robots else {}))
             with Served(kit) as base:
                 lines = kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
@@ -1260,7 +1409,9 @@ class OverHttp(unittest.TestCase):
             self.assertIn("duplicate Authorization: the Worker's 404 for both cases", '\n'.join(lines))
             self.assertEqual(kit.gate_failures, 5)
         for flags, fragment in (({'robots': 'hello'}, 'lacks marker, content signals'), ({'robots': 'mixed'}, 'answered 404'),
-                                ({'robots': 'differ'}, 'body differs'), ({'managed_robots_on': '/'}, 'differs')):
+                                ({'robots': 'differ'}, 'body differs'), ({'managed_robots_on': '/'}, 'differs'),
+                                ({'robots': 'x_foo'}, 'headers differ: x-foo'),
+                                ({'report_to_404': True}, 'headers differ: report-to')):
             kit = FakeKit(self.pubs, **flags)
             with Served(kit) as base, self.assertRaises(kc.Refused) as why:
                 kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
@@ -1357,6 +1508,40 @@ class FrontRejects(unittest.TestCase):
         with self.assertRaises(kc.Refused) as why:
             kc.fold_edge([('root', nf)] + [(label, nf) for label in kc.DUP_AUTH] + [(kc.ROBOTS[0], nf), (kc.ROBOTS[1], page)])
         self.assertIn('"robots" answered 404, "robots, second fetch" answered 200', str(why.exception))
+
+    def test_only_the_robots_row_ignores_the_reporting_headers(self):
+        def robots(**extra):
+            return kc.Resp(200, [('server', 'cloudflare'), ('content-type', 'text/plain; charset=utf-8')] + list(extra.items()),
+                           MANAGED_ROBOTS, 1)
+
+        def nf(**extra):
+            return kc.Resp(404, [('content-type', 'text/plain')] + list(extra.items()), b'not found\n', 1)
+
+        dup = [(label, nf()) for label in kc.DUP_AUTH]
+        left, verdicts = kc.fold_edge(dup + [(kc.ROBOTS[0], robots(**{'report-to': 'a', 'nel': '1'})),
+                                             (kc.ROBOTS[1], robots(**{'report-to': 'b', 'nel': '2'}))])
+        self.assertEqual([label for label, _ in left], list(kc.DUP_AUTH))
+        self.assertIn('identical', verdicts[1])
+        for other in ('x-foo', 'content-length', 'cache-control'):
+            with self.subTest(header=other), self.assertRaises(kc.Refused) as why:
+                kc.fold_edge(dup + [(kc.ROBOTS[0], robots(**{other: 'a'})), (kc.ROBOTS[1], robots(**{other: 'b'}))])
+            self.assertIn('headers differ: %s' % other, str(why.exception))
+        # a 404 robots pair stays in the list and is held to VARYING alone, as every 404
+        left, _ = kc.fold_edge(dup + [(kc.ROBOTS[0], nf(**{'report-to': 'a'})), (kc.ROBOTS[1], nf(**{'report-to': 'b'}))])
+        with self.assertRaises(kc.Refused) as why:
+            kc.all_identical('404', left)
+        self.assertIn('headers differ: report-to', str(why.exception))
+        self.assertEqual(kc.VARYING, frozenset({'date', 'cf-ray'}))
+        self.assertEqual(kc.EDGE_400_PAGE.varying, kc.VARYING)
+        self.assertEqual(kc.MANAGED_ROBOTS.varying, kc.VARYING | {'report-to', 'nel'})
+
+    def test_worker_404_is_exactly_the_fixed_answer(self):
+        self.assertTrue(kc.worker_404(kc.Resp(404, [('content-type', 'text/plain')], b'not found\n', 1)))
+        for r in (kc.Resp(404, [('content-type', 'text/html')], b'not found\n', 1),
+                  kc.Resp(404, [('content-type', 'text/plain')], b'not found!\n', 1),
+                  kc.Resp(404, [('content-type', 'application/json')], b'{"ok":false}', 1),
+                  kc.Resp(403, [('content-type', 'text/plain')], b'not found\n', 1)):
+            self.assertFalse(kc.worker_404(r))
 
     def test_the_edge_table_is_the_two_rows_and_both_robots_fetches_are_sent(self):
         self.assertEqual(kc.EDGE_OWNED, {kc.DUP_AUTH[0]: kc.EDGE_400_PAGE, kc.DUP_AUTH[1]: kc.EDGE_400_PAGE,

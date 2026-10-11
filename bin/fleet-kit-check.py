@@ -35,7 +35,13 @@ plus the `openssl` binary (3.x: Ed25519 with -rawin) for the throwaway admin key
                       never a report of "off": on script-settings it is only not a refusal.
   replay URL          the kit-serve vectors over HTTP against the STAGING Worker (admin keys from $KIT_GATE_DIR): identical
                       404 bytes, 429 after 30, the cap, release on a cut stream, floor, expiry, revoke, bad sha, overwrite,
-                      gzip, Range, the admin rules. It makes its own invites and cleans them up.
+                      gzip, Range, the admin rules. It makes its own invites and cleans them up. It first waits out
+                      version propagation (run 38140164568 attempt 1: a correctly signed upload met the fixed 404 of an
+                      isolate still on the previous run's keys): 10 consecutive signed 200s from /_k/state, ~1 s apart,
+                      within 120 s; then a 2xx-expecting admin call that meets exactly the Worker's fixed 404 is sent
+                      again with a fresh signature, at most 3 times, ~2 s apart, and the summary prints the count. A key
+                      that never propagates still refuses; calls that expect a refusal, the public requests and the
+                      front rejects get one try.
   probe URL           the hostile probe against PRODUCTION: at most 5 well-formed failures, every answer byte-identical
                       to the first apart from date and cf-ray, one of them with Accept-Encoding: gzip.
                       In both, the EDGE_OWNED front rejects are the exception, by one table (fold_edge): each row may be
@@ -48,7 +54,9 @@ plus the `openssl` binary (3.x: Ed25519 with -rawin) for the throwaway admin key
                       no budget. (2) Two fetches of /robots.txt may both be Cloudflare's managed robots.txt (run
                       38107708369 and the probes after it: an account-level edge feature in front of the Worker's 404);
                       it carries no code, so two identical fetches say nothing about an invite. The owner may switch it
-                      off (AI Crawl Control) to get the Worker's 404 back; both answers pass. Each summary prints one
+                      off (AI Crawl Control) to get the Worker's 404 back; both answers pass. The robots row alone also
+                      lets report-to and nel differ (Cloudflare's per-response reporting headers, run 38140164568
+                      attempt 2); every 404 is still compared on everything but date and cf-ray. Each summary prints one
                       line per row: which labels, which answer.
 
 Nothing here prints an invite code, a key, a token or a response body; it prints vector names, statuses and numbers.
@@ -485,15 +493,15 @@ class Client:
         return resp
 
 
-def norm(resp: Resp):
-    return (resp.status, tuple(sorted((k, v) for k, v in resp.headers if k not in VARYING)), resp.body)
+def norm(resp: Resp, varying: frozenset = VARYING):
+    return (resp.status, tuple(sorted((k, v) for k, v in resp.headers if k not in varying)), resp.body)
 
 
-def differs(a: Resp, b: Resp) -> str:
+def differs(a: Resp, b: Resp, varying: frozenset = VARYING) -> str:
     if a.status != b.status:
         return 'status %d vs %d' % (a.status, b.status)
-    ha = sorted((k, v) for k, v in a.headers if k not in VARYING)
-    hb = sorted((k, v) for k, v in b.headers if k not in VARYING)
+    ha = sorted((k, v) for k, v in a.headers if k not in varying)
+    hb = sorted((k, v) for k, v in b.headers if k not in varying)
     if ha != hb:
         names = sorted({k for k, _ in set(ha) ^ set(hb)})
         return 'headers differ: %s' % ', '.join(names)
@@ -520,11 +528,13 @@ def check_fixed_answer(label: str, resp: Resp, status: int, body: bytes) -> None
             raise Refused('%s: has a %s header' % (label, h))
 
 
-def all_identical(label: str, answers: list[tuple[str, Resp]]) -> None:
+def all_identical(label: str, answers: list[tuple[str, Resp]], varying: frozenset = VARYING) -> None:
+    """Every answer equal to the first by norm(). `varying` is VARYING everywhere but one edge row's own comparison
+    (EdgePage.varying, fold_edge): every 404 identity check takes the default."""
     first_label, first = answers[0]
     for name, resp in answers[1:]:
-        if norm(resp) != norm(first):
-            raise Refused('%s: "%s" differs from "%s": %s' % (label, name, first_label, differs(resp, first)))
+        if norm(resp, varying) != norm(first, varying):
+            raise Refused('%s: "%s" differs from "%s": %s' % (label, name, first_label, differs(resp, first, varying)))
 
 
 # ---- the admin calls ---------------------------------------------------------------------------------------------------
@@ -598,7 +608,8 @@ def get_kit(client: Client, serial, name: str, code: str, extra=()) -> Resp:
 
 # Edge-owned answers: front-reject requests that Cloudflare's edge may answer in front of the Worker, and the page it
 # answers with. Every other front reject must be the Worker's 404; these may be the Worker's 404 (held to it exactly as the
-# others) or the one edge page their row names, the same for every label of the row and identical by norm() (fold_edge).
+# others) or the one edge page their row names, the same for every label of the row and identical by norm() over the row's
+# own varying headers (fold_edge; VARYING, plus EDGE_REPORTING for the robots row only, run 38140164568 attempt 2).
 # An edge page on any label not in EDGE_OWNED is held to the 404 and refuses.
 #
 # (1) The two duplicate-Authorization cases: one with a live code, one with a code nobody holds. Measured, kit-deploy run
@@ -686,10 +697,19 @@ class EdgePage(NamedTuple):
     page: str                               # the edge page they may answer with instead of the Worker's 404
     misses: Callable[[Resp], list[str]]
     marker: bytes                           # describe() says only whether the answer holds this
+    varying: frozenset = VARYING            # the headers this row's edge pages may differ in (fold_edge's comparison only)
 
 
 EDGE_400_PAGE = EdgePage('duplicate Authorization', 'cases', "Cloudflare's edge 400", edge_400_misses, b'400 Bad Request')
-MANAGED_ROBOTS = EdgePage('robots', 'fetches', "Cloudflare's managed robots.txt", managed_robots_misses, ROBOTS_FIRST_LINE)
+# Cloudflare's per-response reporting headers (Reporting API endpoints, Network Error Logging). Measured, kit-deploy run
+# 38140164568 attempt 2 (release 721bb8a): every vector passed up to the robots row, which refused '"robots, second fetch"
+# differs from "robots": headers differ: report-to'. The managed robots.txt is the edge's page and these headers are the
+# edge's per-response metadata about it, not its content; the page itself (status, every other header, the bytes) is still
+# held identical across both fetches. Ignored by the robots row's own comparison ONLY: VARYING is unchanged, so every 404
+# identity check (the Worker's answers, the front rejects among them) still refuses a 404 that carries a differing one.
+EDGE_REPORTING = frozenset({'report-to', 'nel'})
+MANAGED_ROBOTS = EdgePage('robots', 'fetches', "Cloudflare's managed robots.txt", managed_robots_misses, ROBOTS_FIRST_LINE,
+                          VARYING | EDGE_REPORTING)
 EDGE_OWNED = {DUP_AUTH[0]: EDGE_400_PAGE, DUP_AUTH[1]: EDGE_400_PAGE, ROBOTS[0]: MANAGED_ROBOTS, ROBOTS[1]: MANAGED_ROBOTS}
 
 
@@ -706,7 +726,8 @@ def describe(resp: Resp, marker: bytes) -> str:
 def fold_edge(answers: list[tuple[str, Resp]]) -> tuple[list[tuple[str, Resp]], list[str]]:
     """Judge front_rejects' edge-owned answers, row by row of EDGE_OWNED, and return (the answers left to hold to the 404,
     one verdict line per row). Every label of a row the Worker's 404: they stay in the list (the caller holds them to the
-    404 and to the others). Every label of a row that row's edge page, identical by norm(): they leave the list. Anything
+    404 and to the others). Every label of a row that row's edge page, identical by norm() over the row's own varying
+    headers (page.varying: VARYING, plus EDGE_REPORTING for robots; never wider for a 404): they leave the list. Anything
     else (a mix, another page, differing answers) is a refusal naming the row and what is missing, never a body. Every
     answer whose label is in no row is passed through untouched."""
     taken: set[str] = set()
@@ -728,7 +749,7 @@ def fold_edge(answers: list[tuple[str, Resp]]) -> tuple[list[tuple[str, Resp]], 
             if misses:
                 raise Refused("%s: status %d, neither the Worker's 404 nor %s page (lacks %s; %s)"
                               % (label, resp.status, page.page, ', '.join(misses), describe(resp, page.marker)))
-        all_identical(name, group)
+        all_identical(name, group, page.varying)
         taken.update(want)
         verdicts.append('%s: %s for both %s, identical (%s)' % (page.name, page.page, page.each, labels))
     return [(label, resp) for label, resp in answers if label not in taken], verdicts
@@ -771,12 +792,81 @@ def front_rejects(client: Client, good_code: str) -> list[tuple[str, Resp]]:
 
 # ---- the staging replay ------------------------------------------------------------------------------------------------
 
+# Version propagation. Measured, kit-deploy run 38140164568 (release 721bb8a), attempt 1: the settings gate passed; the
+# replay's upload small, upload big and upload other each answered 200 (signed admin PUTs with this run's throwaway upload
+# key), then "identical re-upload" (the same signed PUT shape, the small bytes to s1 again) answered 404: "REFUSED identical
+# re-upload: status 404, expected 200". kit/worker.js answers an AUTHENTICATED admin call only with JSON; its fixed 404
+# (text/plain, "not found\n") comes only from the unauthenticated paths (no route, bad or absent auth, ts skew > SKEW_MS,
+# key var not set, bad signature, KIT_DISABLED). Attempt 2 (same commit, fresh throwaway keys) passed that vector and every
+# one after it up to the robots row (EDGE_REPORTING). The reading: every run deploys staging with NEW throwaway admin keys
+# (vars), then `wrangler secret put INVITE_PEPPER` makes another version; for a while after, some requests still reach
+# isolates running the previous version, whose KIT_UP_PUB / KIT_GW_PUB are the previous run's keys, so a correctly signed
+# call answers the fixed 404. Two answers to it:
+#   (1) wait_ready: before the first admin vector, READY_STREAK consecutive signed 200s from /_k/state (the gateway role:
+#       the one role ADMIN_ROUTES allows there; both keys arrive in the same deploy's vars), READY_SPACING apart, within
+#       READY_TIMEOUT; a 404 resets the streak, any other status refuses at once. A streak shows that this run's keys are
+#       being served, not that no old isolate is left: hence (2).
+#   (2) run_replay's ok_call: an admin call that EXPECTS 2xx and gets exactly the Worker's fixed 404 is sent again, with a
+#       fresh ts and signature, up to RETRY_MAX times, RETRY_WAIT apart, then judged as usual. The count is printed in the
+#       summary: a non-zero count is a measurement, never hidden. What the retry cannot hide: a key that never propagates,
+#       a wrong signature, a disabled Worker, a stale clock: each answers the fixed 404 every time and still refuses
+#       (after RETRY_MAX + 1 tries). What it could hide: a Worker that 404s a well-signed call at most RETRY_MAX times in a
+#       row and then serves it; the count says how often that happened. Calls that expect a non-2xx (stale ts -> 404,
+#       wrong role -> 403, replay -> 409, overwrite -> 409, wrong bytes -> 422, rollback -> 409, the ceilings -> 422), the
+#       public /v1/kit requests and the front rejects get exactly one try.
+READY_STREAK = 10
+READY_SPACING = 1.0         # seconds between readiness tries
+READY_TIMEOUT = 120.0       # seconds for the whole streak
+RETRY_MAX = 3               # extra tries of a 2xx-expecting admin call that met the Worker's fixed 404
+RETRY_WAIT = 2.0            # seconds between those tries
+PROPAGATION = "staging is not serving this run's admin keys (version propagation)"
+
+
+def worker_404(resp: Resp) -> bool:
+    """Exactly kit/worker.js fixed(404): status 404, text/plain, body "not found\n". The only 404 an admin call can meet,
+    and it never comes from an authenticated one."""
+    return resp.status == 404 and (resp.header('content-type') or '').startswith('text/plain') and resp.body == NOT_FOUND
+
+
+def wait_ready(admin: Admin, *, streak: int = READY_STREAK, spacing: float = READY_SPACING, timeout: float = READY_TIMEOUT,
+               sleep=time.sleep, clock=time.monotonic) -> tuple[Resp, str]:
+    """Signed GET /_k/state (gateway role) until `streak` consecutive 200 JSON answers; a 404 resets the run, any other
+    status refuses, no streak within `timeout` seconds refuses. Returns (the last answer, the summary line)."""
+    t0 = clock()
+    tries = seen404 = run = best = 0
+    while True:
+        r = admin.call('gateway', 'GET', '/_k/state')
+        tries += 1
+        if r.status == 404:
+            seen404 += 1
+            run = 0
+        elif r.status == 200:
+            admin_json('readiness try %d' % tries, r, 200)
+            run += 1
+            best = max(best, run)
+        else:
+            raise Refused('%s: try %d answered %d (%d tries, %d 404s seen, %.1f s)'
+                          % (PROPAGATION, tries, r.status, tries, seen404, clock() - t0))
+        if run >= streak:
+            return r, ('readiness: %d consecutive signed 200s from /_k/state after %d tries, %d 404s seen, %.1f s'
+                       % (streak, tries, seen404, clock() - t0))
+        if clock() - t0 > timeout:
+            raise Refused('%s: no %d consecutive 200s within %d s (%d tries, %d 404s seen, longest run %d)'
+                          % (PROPAGATION, streak, timeout, tries, seen404, best))
+        sleep(spacing)
+
+
 def det_bytes(label: str, n: int) -> bytes:
     return hashlib.shake_256(('fleet-kit-staging:%s' % label).encode()).digest(n)
 
 
 def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: float = 5.0, small_bytes: int = 65536,
-               short_life_ms: int = 12000, ready_timeout: float = 90, sleep=time.sleep, log=say) -> list[str]:
+               short_life_ms: int = 12000, ready_streak: int = READY_STREAK, ready_spacing: float = READY_SPACING,
+               ready_timeout: float = READY_TIMEOUT, retry_max: int = RETRY_MAX, retry_wait: float = RETRY_WAIT,
+               sleep=time.sleep, log=say) -> list[str]:
+    """The staging replay. Waits out version propagation first (wait_ready) and sends a 2xx-expecting admin call again
+    on the Worker's fixed 404 (ok_call, at most retry_max times, counted in the summary); see the Version propagation
+    note above (run 38140164568 attempts 1 and 2)."""
     s1, s2, s3, s4, s5, gser = (S_BASE + i for i in (1, 2, 3, 4, 5, 1))
     small = det_bytes('s1', small_bytes)
     other = det_bytes('s5', small_bytes)
@@ -788,6 +878,23 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
     fails = 0                                          # well-formed failures spent at the gate, as the replay counts them
     vectors = 0
     m: dict = {}
+    retries: list[str] = []                            # one entry per extra try ok_call made, by label
+
+    def ok_call(label: str, send: Callable[[], Resp], status: int = 200) -> tuple[dict, Resp]:
+        """send() is one fresh signed call (a new ts and signature each time). Only the Worker's fixed 404 is retried."""
+        assert 200 <= status < 300, 'ok_call is for calls that expect success'
+        r = send()
+        for _ in range(retry_max):
+            if not worker_404(r):
+                break
+            retries.append(label)
+            log("retry %s: the Worker's fixed 404 to a signed call (version propagation)" % label)
+            sleep(retry_wait)
+            r = send()
+        if worker_404(r) and retry_max:
+            raise Refused("%s: status 404 (the Worker's fixed 404) on %d tries, expected %d; %s"
+                          % (label, retry_max + 1, status, PROPAGATION))
+        return admin_json(label, r, status), r
 
     def vector(label: str) -> None:
         nonlocal vectors
@@ -815,27 +922,20 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
             raise Refused('%s: the bytes are not the uploaded bytes' % label)
 
     try:
-        # A fresh deploy takes a moment to reach every edge: wait until the gateway key answers.
-        deadline = time.monotonic() + ready_timeout
-        while True:
-            r = admin.call('gateway', 'GET', '/_k/state')
-            if r.status == 200:
-                break
-            if time.monotonic() > deadline:
-                raise Refused('the staging Worker did not answer an admin call (last status %d)' % r.status)
-            sleep(3)
+        # A fresh deploy takes a while to reach every isolate (run 38140164568): wait for a streak of this run's keys.
+        r, m['ready'] = wait_ready(admin, streak=ready_streak, spacing=ready_spacing, timeout=ready_timeout, sleep=sleep)
+        log(m['ready'])
         state = admin_json('state', r, 200)
         offset = state['now'] - int(time.time() * 1000)
 
         # -- uploads (upload role) ------------------------------------------------------------------------------------
         for label, serial, data in (('upload small', s1, small), ('upload big', s2, big), ('upload other', s5, other)):
             vector(label)
-            d = admin_json(label, _put_bundle(admin, serial, data))
+            d, _ = ok_call(label, lambda serial=serial, data=data: _put_bundle(admin, serial, data))
             if d.get('sha256') != sha256_hex(data) or d.get('size') != len(data):
                 raise Refused('%s: R2 holds other bytes than were sent' % label)
         vector('identical re-upload')
-        r = _put_bundle(admin, s1, small)
-        admin_json('identical re-upload', r, 200)
+        _, r = ok_call('identical re-upload', lambda: _put_bundle(admin, s1, small))
         m['c_identical'] = r.status
         vector('overwrite refused')
         r = _put_bundle(admin, s1, wrong)
@@ -847,12 +947,12 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
         m['c_wrong_bytes'] = r.status
         vector('gateway pair')
         gbody = jbody({'json': base64.b64encode(gjson).decode(), 'sig': base64.b64encode(gsig).decode()})
-        d = admin_json('gateway pair', admin.call('upload', 'PUT', '/_k/gateway/%d' % gser, gbody), 200)
+        d, _ = ok_call('gateway pair', lambda: admin.call('upload', 'PUT', '/_k/gateway/%d' % gser, gbody))
         if d.get('json', {}).get('sha256') != sha256_hex(gjson) or d.get('sig', {}).get('sha256') != sha256_hex(gsig):
             raise Refused('gateway pair: R2 holds other bytes than were sent')
-        admin_json('gateway pair again', admin.call('upload', 'PUT', '/_k/gateway/%d' % gser, gbody), 200)
+        ok_call('gateway pair again', lambda: admin.call('upload', 'PUT', '/_k/gateway/%d' % gser, gbody))
         admin_json('gateway rollback', admin.call('upload', 'PUT', '/_k/gateway/%d' % (gser - 1), gbody), 409, 'rollback')
-        admin_json('floor 0', admin.call('upload', 'PUT', '/_k/floor', jbody({'floor': 0})), 200)
+        ok_call('floor 0', lambda: admin.call('upload', 'PUT', '/_k/floor', jbody({'floor': 0})))
 
         # -- invites (gateway role) -----------------------------------------------------------------------------------
         def add_invite(label, *, cap, lo, hi, life_ms, status=200, error=None) -> tuple[str, str]:
@@ -860,13 +960,19 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
             code = random_code()
             body = jbody({'ref': ref, 'code': code, 'tier': 'install', 'lo': lo, 'hi': hi,
                           'exp': int(time.time() * 1000) + offset + life_ms, 'cap': cap})
-            r = admin.call('gateway', 'POST', '/_k/invite', body)
-            for _ in range(10):          # 503: the new pepper has not reached this edge yet
-                if r.status != 503 or status != 200:
-                    break
-                sleep(3)
+            def post() -> Resp:
                 r = admin.call('gateway', 'POST', '/_k/invite', body)
-            admin_json(label, r, status, error)
+                for _ in range(10):      # 503: the new pepper has not reached this edge yet
+                    if r.status != 503 or status != 200:
+                        break
+                    sleep(3)
+                    r = admin.call('gateway', 'POST', '/_k/invite', body)
+                return r
+
+            if status == 200:
+                ok_call(label, post)
+            else:                        # a ceiling: expects a refusal, one try
+                admin_json(label, post(), status, error)
             if status == 200:
                 refs.append(ref)
             return code, ref
@@ -893,10 +999,15 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
         r = admin.call('gateway', 'GET', '/_k/state', ts=int(time.time() * 1000) - 10 * 60 * 1000)
         seen404.append(('admin stale', expect('admin stale', r, 404)))
         vector('admin: replay')
-        ts = admin.next_ts('upload')
         fbody = jbody({'floor': 0})
-        admin_json('replay first', admin.call('upload', 'PUT', '/_k/floor', fbody, ts=ts), 200)
-        admin_json('replay second', admin.call('upload', 'PUT', '/_k/floor', fbody, ts=ts), 409, 'replay')
+        first_ts = {}
+
+        def replay_first() -> Resp:      # a retry signs a fresh ts; the second send repeats the one that was served
+            first_ts['ts'] = admin.next_ts('upload')
+            return admin.call('upload', 'PUT', '/_k/floor', fbody, ts=first_ts['ts'])
+
+        ok_call('replay first', replay_first)
+        admin_json('replay second', admin.call('upload', 'PUT', '/_k/floor', fbody, ts=first_ts['ts']), 409, 'replay')
 
         # -- the public vectors ---------------------------------------------------------------------------------------
         vector('download, headers and bytes')
@@ -909,9 +1020,9 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
         download('W gateway.json', get_kit(client, s1, 'gateway.json', code_w), gjson)
         download('W gateway.json.sig', get_kit(client, s1, 'gateway.json.sig', code_w), gsig)
         vector('floor')
-        admin_json('floor up', admin.call('upload', 'PUT', '/_k/floor', jbody({'floor': s2})), 200)
+        ok_call('floor up', lambda: admin.call('upload', 'PUT', '/_k/floor', jbody({'floor': s2})))
         gate_404('below the floor', get_kit(client, s1, 'bundle.tar', code_w))
-        admin_json('floor down', admin.call('upload', 'PUT', '/_k/floor', jbody({'floor': 0})), 200)
+        ok_call('floor down', lambda: admin.call('upload', 'PUT', '/_k/floor', jbody({'floor': 0})))
         vector('out of range, absent file, bad-sha upload left nothing')
         gate_404('serial out of range', get_kit(client, s5, 'bundle.tar', code_w))
         gate_404('file absent', get_kit(client, s4, 'bundle.tar', code_w))
@@ -926,7 +1037,7 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
         download('W gateway.json after the cap', get_kit(client, s1, 'gateway.json', code_w), gjson)  # never counts
         vector('revoke')
         download('R before revoke', get_kit(client, s1, 'gateway.json', code_r), gjson)
-        admin_json('revoke', admin.call('gateway', 'DELETE', '/_k/invite/%s' % ref_r), 200)
+        ok_call('revoke', lambda: admin.call('gateway', 'DELETE', '/_k/invite/%s' % ref_r))
         gate_404('revoked', get_kit(client, s1, 'gateway.json', code_r))
         vector('front rejects')
         fronts, m['edge'] = fold_edge(front_rejects(client, code_w))
@@ -990,6 +1101,8 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
     ms = [r.ms for _, r in seen404]
     return [
         'kit-deploy staging replay: %d vectors passed' % vectors,
+        '  ' + m['ready'],
+        "  admin retries on the Worker's fixed 404: %d%s" % (len(retries), ' (%s)' % ', '.join(retries) if retries else ''),
         '  404 answers compared: %d, identical' % len(seen404),
         *('  ' + line for line in m['edge']),
         '  429 after %d failures' % m['b429_after'],
