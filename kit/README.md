@@ -113,7 +113,10 @@ Cloudflare's managed robots.txt answers `/robots.txt` with its own 200 page (kit
 the probe take it when two fetches are identical, or the Worker's 404 if the owner switches it off (AI Crawl Control). And
 the edge adds two headers of its own to the Worker's 404 (and `/_k/state`) on staging, `nel` and a `report-to` with a
 per-response token (kit-deploy run 38164673127): the Worker sets neither (`worker.test.js` pins it), and the replay and the probe compare that `report-to`
-without its token (`headers_of`, `cf_nel_rest` in `bin/fleet-kit-check.py`). The note
+without its token (`headers_of`, `cf_nel_rest` in `bin/fleet-kit-check.py`). The production probe holds no key, so before
+its first judged request it waits for ten consecutive fixed 404s of the Worker on an unknown path (`wait_worker`, which
+never reaches the Gate): a probe four seconds after the deploy met the previous version's page (kit-deploy run
+38180769445). Only answers before the streak are excused, and the summary counts them. The note
 lives here, not in `known_differences`, because the vendored file is byte-pinned to the fleet repo and lists kit-serve
 against the Worker, not the edge. To update: copy the
 new file over `vectors/kit_vectors.json`, write the new pin line (`shasum -a 256`, the fleet commit, the path), and
