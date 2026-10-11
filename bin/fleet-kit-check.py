@@ -44,7 +44,11 @@ plus the `openssl` binary (3.x: Ed25519 with -rawin) for the throwaway admin key
                       front rejects get one try.
   probe URL           the hostile probe against PRODUCTION: at most 5 well-formed failures, every answer byte-identical
                       to the first apart from date, cf-ray and the token in Cloudflare's own cf-nel report-to (below),
-                      one of them with Accept-Encoding: gzip.
+                      one of them with Accept-Encoding: gzip. It first waits out version propagation (run 38180769445:
+                      the previous version's page, four seconds after the deploy): 10 consecutive fixed 404s of the
+                      Worker on an unknown path that never reaches the Gate, ~1 s apart, within 120 s. Only answers that
+                      are not the Worker's 404 are excused before that streak, and the summary counts them by status;
+                      the Worker's 404s of the wait are judged with the others; a Worker that never gets there refuses.
                       In both, the EDGE_OWNED front rejects are the exception, by one table (fold_edge): each row may be
                       the Worker's 404 or Cloudflare's page for it, the same for every label of the row and identical.
                       (1) The two duplicate-Authorization requests may both be a page shaped like Cloudflare's edge 400.
@@ -1295,24 +1299,29 @@ def _cleanup(admin: Admin, refs: list[str], log) -> None:
 # at 22:41:56Z and "Hostile probe on production" refused at 22:42:00Z: "robots: status 200, neither the Worker's 404 nor
 # Cloudflare's managed robots.txt page (... server=cloudflare content-type=text/plain;charset=UTF-8 content-length=12 ...)".
 # Before that run production served the dashboard placeholder Worker, whose every answer is 200 "Hello World!" (12 bytes,
-# text/plain;charset=UTF-8): the probe met an edge location still serving the PREVIOUS version. Five minutes later the same
-# probe by hand passed (21 answers, byte-identical, the Worker's 404 on 10 of 10 unknown paths). The probe holds no key, so
-# it cannot use wait_ready's signed call; its readiness is the one thing it can see without one:
+# text/plain;charset=UTF-8): the probe met an edge location still serving the PREVIOUS version. The same probe by hand passed
+# from 22:43:24Z to 22:43:37Z, 88 s after the deploy line (21 answers, byte-identical, cf-nel on 21 of 21; its log is
+# kit-prod-probe-manual-2026-10-12.log). The probe holds no key, so it cannot use wait_ready's signed call; its readiness is
+# the one thing it can see without one:
 #   wait_worker: before the first judged request, GET PROBE_READY_PATH until PROBE_READY_STREAK (= READY_STREAK) consecutive
-#   answers are the Worker's own fixed 404 (worker_404, the one wait_ready's retry uses: status, text/plain, body; headers
-#   such as date, cf-ray and Cloudflare's cf-nel report-to are not part of it, so a per-response token never resets a
-#   streak, and a header fault of the Worker's own 404 is not waited out for 120 s but named by the judged requests),
-#   PROBE_READY_SPACING (= READY_SPACING) apart, within PROBE_READY_TIMEOUT (= READY_TIMEOUT). Any other answer (the
-#   previous version's page, an edge page) resets the streak and is counted, never judged. The path is unknown to the Worker's front (no /_k/ prefix, not /v1/kit/<serial>/
-#   <file>), so it is answered fixed(404) before the invite check and never reaches the Gate: it spends none of the 30 an hour.
-#   What the wait can hide: only answers BEFORE the streak is complete are excused; each is counted and printed in the summary.
-#   It cannot hide a Worker that never serves the fixed 404 (refused at the timeout, naming the tries, how many were not the
-#   fixed 404 and the status, content-type and content-length of the last of them, never a body), and everything after the
-#   streak (the 5 gate requests, the front rejects, robots, the duplicate-Authorization pair) is judged exactly as before:
-#   identical bytes or a refusal. It also does not show that no old location is left; it shows that the locations asked for
-#   PROBE_READY_STREAK answers in a row serve this Worker, which is what the judged requests then repeat. When the previous
-#   version is an older fleet-kit Worker its fixed 404 is identical, so the streak passes at once; it still takes about
-#   PROBE_READY_STREAK x PROBE_READY_SPACING seconds, which is the time propagation gets.
+#   answers are the Worker's own fixed 404, PROBE_READY_SPACING (= READY_SPACING) apart, within PROBE_READY_TIMEOUT
+#   (= READY_TIMEOUT). "The Worker's own fixed 404" is worker_404, the definition run_replay's ok_call retries on: status 404,
+#   text/plain, the body "not found\n". Headers are not part of it, so a per-response token (date, cf-ray, Cloudflare's cf-nel
+#   report-to) never resets a streak and a header fault of a 404 is not waited out for 120 s. Any other answer (the previous
+#   version's page, an edge page, the Worker's own 429 or 503) resets the streak and is counted by status in the summary.
+#   The path is unknown to the Worker's front (no /_k/ prefix, not /v1/kit/<serial>/<file>), so it is answered fixed(404)
+#   before the invite check and never reaches the Gate: it spends none of the 30 an hour.
+#   What the wait can hide: only answers that are NOT the Worker's 404, and only BEFORE the streak is complete. Every answer
+#   that is the Worker's 404 is kept and judged with the rest of the probe (check_fixed_answer on the first, all_identical on the
+#   rest, labelled "readiness try N"), at no extra request: a set-cookie, a location, a content-encoding, a foreign report-to,
+#   another cache-control or content-type on one of them is the same refusal as on any other answer. A Worker that never serves
+#   the fixed 404 is refused at the timeout, naming the tries, how many were not the fixed 404 and the status, content-type and
+#   content-length of the last of them, never a body. Everything after the streak (the 5 gate requests, the front rejects,
+#   robots, the duplicate-Authorization pair) is judged exactly as before. The wait does not show that no old location is left;
+#   it shows that the locations asked for PROBE_READY_STREAK answers in a row serve this Worker, which is what the judged
+#   requests then repeat. When the previous version is an older fleet-kit Worker its fixed 404 is the same, so the streak passes
+#   at once; it still takes (PROBE_READY_STREAK - 1) x PROBE_READY_SPACING = 9 s of spacing plus the requests (12.0 s measured
+#   for the same streak on staging, run 38180769445), which is the time propagation gets.
 PROBE_READY_PATH = '/ready'
 PROBE_READY_STREAK = READY_STREAK
 PROBE_READY_SPACING = READY_SPACING
@@ -1324,24 +1333,37 @@ def _shown(value, limit: int = 64) -> str:
     return ''.join(c if ' ' <= c <= '~' else '?' for c in str(value)[:limit]) if value is not None else '-'
 
 
+class Ready(NamedTuple):
+    tries: int                                  # requests to PROBE_READY_PATH
+    other: int                                  # answers that were not the Worker's fixed 404 (excused, counted)
+    statuses: dict                              # status -> how many of those
+    answers: list                               # [(label, Resp)] every answer that WAS the Worker's 404, to be judged
+    elapsed: float
+
+
 def wait_worker(client: Client, *, streak: int = PROBE_READY_STREAK, spacing: float = PROBE_READY_SPACING,
-                timeout: float = PROBE_READY_TIMEOUT, sleep=time.sleep, clock=time.monotonic) -> tuple[int, int]:
+                timeout: float = PROBE_READY_TIMEOUT, sleep=time.sleep, clock=time.monotonic) -> Ready:
     """GET PROBE_READY_PATH until `streak` consecutive answers are the Worker's fixed 404; any other answer resets the run
-    and is counted. No streak within `timeout` seconds refuses. Returns (tries, answers that were not the fixed 404)."""
+    and is counted by status. No streak within `timeout` seconds refuses. The answers that were the Worker's 404 come back
+    for the caller to judge (run_probe does)."""
     t0 = clock()
     tries = other = run = 0
+    statuses: dict[int, int] = {}
+    kept: list[tuple[str, Resp]] = []
     last = None
     while True:
         r = client.request('GET', PROBE_READY_PATH)
         tries += 1
         if worker_404(r):
             run += 1
+            kept.append(('readiness try %d' % tries, r))
         else:
             other += 1
             run = 0
             last = r
+            statuses[r.status] = statuses.get(r.status, 0) + 1
         if run >= streak:
-            return tries, other
+            return Ready(tries, other, statuses, kept, clock() - t0)
         if clock() - t0 > timeout:
             raise Refused("probe readiness: no %d consecutive fixed 404s of the Worker within %d s (%d tries, %d were not the "
                           "Worker's 404%s)" % (streak, timeout, tries, other, '' if last is None else
@@ -1361,9 +1383,9 @@ def run_probe(client: Client, *, log=say, ready_streak: int = PROBE_READY_STREAK
     duplicate-Authorization pair (run 38102844541; here both of its codes are unknown, so it shows only that two unknown
     codes get the same answer) and the two /robots.txt fetches (run 38107708369: Cloudflare's managed robots.txt, or the
     Worker's 404 once the owner switches that off). Before the first of them it waits for the Worker's own 404 to be what
-    production answers (wait_worker, run 38180769445: the previous version was still being served), and says so in the summary."""
-    tries, not_ready = wait_worker(client, streak=ready_streak, spacing=ready_spacing, timeout=ready_timeout, sleep=sleep,
-                                   clock=clock)
+    production answers (wait_worker, run 38180769445: the previous version was still being served), judges the 404s it
+    met with the rest, and says what it excused (statuses only) in the summary."""
+    ready = wait_worker(client, streak=ready_streak, spacing=ready_spacing, timeout=ready_timeout, sleep=sleep, clock=clock)
     code = random_code()
     spent = 0
     answers: list[tuple[str, Resp]] = []
@@ -1386,11 +1408,13 @@ def run_probe(client: Client, *, log=say, ready_streak: int = PROBE_READY_STREAK
             raise Refused('probe: "%s" answered %d' % (label, resp.status))
         log('probe %s -> %d' % (label, resp.status))
     check_fixed_answer('probe first answer', answers[0][1], 404, NOT_FOUND)
-    all_identical('probe', answers)
+    all_identical('probe', answers + ready.answers)         # the Worker's 404s of the wait are judged too, after the others
     ms = [r.ms for _, r in answers]
+    kinds = ', '.join('%d x%d' % (st, n) for st, n in sorted(ready.statuses.items()))
     return [
         'kit-deploy production probe: %d answers, byte-identical, %d reached the gate' % (len(answers), spent),
-        "  ready after %d tries (%d answers were not this Worker's 404)" % (tries, not_ready),
+        "  ready after %d tries, %.1f s (%d answers were not this Worker's 404%s; the %d that were are judged with the rest)"
+        % (ready.tries, ready.elapsed, ready.other, ': ' + kinds if kinds else '', len(ready.answers)),
         '  wall clock ms: p50 %d, max %d' % (statistics.median(ms), max(ms)),
         '  ' + cf_nel_line(answers),
         *('  ' + line for line in edge),
