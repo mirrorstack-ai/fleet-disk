@@ -415,17 +415,44 @@ class Judges(unittest.TestCase):
             self.assertEqual(len(out), 1, (obs, out))
             self.assertTrue(out[0].startswith('settings: observability is not off ('), out)
 
-    def test_script_settings_null_with_settings_explicit_off_is_refused_naming_script_settings(self):
-        self.assertEqual(self.judge(script_settings={'observability': None}),
-                         ['script-settings: observability is not off (observability: null)'])
+    def test_script_settings_null_is_the_stored_off_and_passes_only_beside_the_worker_explicit_off(self):  # rules (b), (d)
+        # run 38099981335: the off PATCH echoed observability and tail_consumers as null; that is how script-settings
+        # stores them, so it is not a refusal there, and not a report either: the GA worker read carries the proof
+        stored = {'observability': None, 'tail_consumers': None}
+        self.assertEqual(self.judge(script_settings=stored), [])
+        self.assertEqual(self.judge(script_settings=stored, worker={'observability': None}),
+                         ['worker: observability is not off (observability: null)'])
+        self.assertEqual(self.judge(script_settings=stored, worker={'observability': self.GONE}),
+                         ['worker: observability not reported'])
+        self.assertEqual(self.judge(script_settings=stored, worker={'observability': {'enabled': True}}),
+                         ['worker: observability is not off (observability on: enabled)'])
+        self.assertEqual(self.judge(script_settings=stored, worker={'observability': {'enabled': False,
+                                                                                      'logs': {'enabled': True}}}),
+                         ['worker: observability is not off (observability on: logs.enabled)'])
+        self.assertEqual(self.judge(script_settings=stored, worker=self.GONE), ['worker: did not answer'])
+        self.assertEqual(self.judge(script_settings=stored, worker={'tail_consumers': None}),
+                         ['worker: tail_consumers not reported'])
+        # script-settings' null tail list is no report of []: with settings silent, only the worker's [] carries it
+        self.assertEqual(self.judge(settings=self.GONE, script_settings=stored, worker={'tail_consumers': self.GONE}),
+                         ['tail_consumers: not reported (script-settings, worker)', 'worker: tail_consumers not reported'])
+
+    def test_a_null_observability_is_refused_on_every_endpoint_but_script_settings(self):               # rules (a), (c), (d)
+        self.assertEqual(self.judge(settings={'observability': None}),
+                         ['settings: observability is not off (observability: null)'])
+        self.assertEqual(self.judge(script_settings={'observability': None}, settings={'observability': None}),
+                         ['settings: observability is not off (observability: null)'])
+        self.assertEqual(self.judge(script_settings={'observability': None}, worker={'observability': None}),
+                         ['worker: observability is not off (observability: null)'])
 
     def test_script_settings_with_a_flag_on_under_an_enabled_false_is_refused(self):
         self.assertEqual(self.judge(script_settings={'observability': {'enabled': False, 'logs': {'enabled': True}}}),
                          ['script-settings: observability is not off (observability on: logs.enabled)'])
 
-    def test_script_settings_must_report_an_explicit_off(self):                                         # rule (b)
+    def test_script_settings_must_answer_and_say_observability(self):                                  # rule (b)
         self.assertEqual(self.judge(script_settings={'observability': self.GONE}),
                          ['script-settings: observability not reported'])
+        self.assertEqual(self.judge(script_settings={'observability': self.GONE, 'tail_consumers': None}),
+                         ['script-settings: observability not reported'])     # a missing key is never the stored null
         self.assertEqual(self.judge(script_settings=self.GONE), ['script-settings: did not answer'])
 
     def test_the_worker_read_must_answer_and_report_an_explicit_off(self):                              # rule (d)
@@ -511,7 +538,8 @@ class Judges(unittest.TestCase):
         self.assertEqual(why({'logs': {'enabled': False}}), 'observability.enabled: missing')
         self.assertEqual(why({'enabled': None}), 'observability.enabled: not false')
         self.assertEqual(why({'enabled': 'false', 'head_sampling_rate': 1}), 'observability.enabled: not false')
-        self.assertEqual(why(None), 'observability: null')
+        self.assertEqual(self.judge(settings={'observability': None}),     # script-settings' null is its stored off (b)
+                         ['settings: observability is not off (observability: null)'])
         self.assertEqual(why([]), 'observability: not an object (list)')
         self.assertEqual(why('on'), 'observability: not an object (str)')
 
@@ -534,7 +562,8 @@ class Judges(unittest.TestCase):
 
     def test_old_verdicts_hold_on_every_endpoint(self):
         for ep in ('settings', 'script_settings', 'worker'):
-            for obs, refused in [({'enabled': False}, False), ({'enabled': True}, True), ({}, True), (None, True), ([], True),
+            for obs, refused in [({'enabled': False}, False), ({'enabled': True}, True), ({}, True), ([], True),
+                                 (None, ep != 'script_settings'),          # rule (b): script-settings' stored off
                                  ({'enabled': False, 'logs': {'enabled': True}}, True), ({'enabled': 0}, True),
                                  ({'enabled': False, 'logs': {'enabled': False}}, False)]:
                 out = self.judge(**{ep: {'observability': obs}})
@@ -685,12 +714,26 @@ class Judges(unittest.TestCase):
             self.assertIsInstance(out, kc.Refused, obs)
             self.assertIn(why, str(out))
 
-    def test_the_settings_gate_refuses_a_null_from_script_settings_by_name(self):
-        # run 38095547741 read observability: null from an endpoint the old unlabelled gate did not name (script-settings
-        # by the schema: only it may answer null). Inferred, not measured; a null there is now refused by name.
-        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/script-settings': {'observability': None, 'logpush': False}}))
-        self.assertIsInstance(out, kc.Refused)
-        self.assertEqual(str(out), 'settings of fleet-kit: script-settings: observability is not off (observability: null)')
+    def test_the_settings_gate_takes_script_settings_null_only_beside_the_worker_explicit_off(self):
+        # run 38099981335: settings-off's PATCH of the all-off record echoed observability and tail_consumers as null,
+        # the form script-settings stores them in; the GA worker read is the explicit-off proof
+        stored = {'observability': None, 'logpush': False, 'tail_consumers': None}
+        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/script-settings': stored}))
+        self.assertEqual(out, {'worker': 'fleet-kit', 'sources': 3})
+        worker = lambda **kw: {k: v for k, v in {**self.WORKER_READ, **kw}.items() if v != 'ABSENT'}  # noqa: E731
+        for read, why in ((worker(observability=None), 'worker: observability is not off (observability: null)'),
+                          (worker(observability='ABSENT'), 'worker: observability not reported'),
+                          (worker(observability={'enabled': True}), 'worker: observability is not off (observability on: enabled)'),
+                          (worker(tail_consumers=None), 'worker: tail_consumers not reported'),
+                          (403, 'worker: did not answer')):
+            out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/script-settings': stored, '/worker': read}))
+            self.assertIsInstance(out, kc.Refused, why)
+            self.assertEqual(str(out), 'settings of fleet-kit: ' + why)
+        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/script-settings': {'logpush': False, 'tail_consumers': None}}))
+        self.assertEqual(str(out), 'settings of fleet-kit: script-settings: observability not reported')
+        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/script-settings': stored,
+                                                     '/settings': {'observability': None, 'logpush': False}}))
+        self.assertEqual(str(out), 'settings of fleet-kit: settings: observability is not off (observability: null)')
 
     def test_the_settings_gate_refuses_a_network_failure_and_names_a_bad_answer(self):
         for exc in (urllib.error.URLError('down'), TimeoutError(), ValueError('bad json')):
@@ -786,7 +829,10 @@ class SettingsOff(unittest.TestCase):
     def test_the_request_is_a_patch_of_exactly_the_off_record_as_json(self):
         rc, out, sent = self.run_cli((200, {'success': True, 'result': self.ECHO}))
         self.assertEqual(rc, 0, out)
-        self.assertIn('settings-off of fleet-kit-staging: observability off', out)
+        # the success line claims only what the echo measures (an accepted PATCH), never "off ... echoed back"
+        self.assertIn('settings-off of fleet-kit-staging: PATCH accepted', out)
+        self.assertIn("the settings gate's GA read is the proof", out)
+        self.assertNotIn('echoed back', out)
         self.assertEqual(len(sent), 1)
         req = sent[0]
         self.assertEqual(req.get_method(), 'PATCH')
@@ -796,10 +842,24 @@ class SettingsOff(unittest.TestCase):
         self.assertEqual(json.loads(req.data), {'observability': kc.OBSERVABILITY_OFF, 'logpush': False, 'tail_consumers': []})
         self.assertEqual(json.loads(req.data), kc.SETTINGS_OFF)
 
-    def test_an_echo_with_null_tail_consumers_or_logpush_is_refused(self):
-        # we wrote [] and false; null is never off (the gate's rule), so an echo of null is named, not passed
-        self.refused((200, {'success': True, 'result': dict(self.ECHO, tail_consumers=None)}), 'tail_consumers echoed null')
+    def test_the_measured_echo_of_null_observability_and_tail_passes_but_a_null_logpush_does_not(self):
+        # run 38099981335 (release 1944de0): this PATCH answered 200 success true and echoed observability: null,
+        # tail_consumers: null, logpush: false, the stored form of the off record it had just written
+        for echo in ({'observability': None, 'logpush': False, 'tail_consumers': None, 'tags': []},
+                     dict(self.ECHO, observability=None), dict(self.ECHO, tail_consumers=None)):
+            rc, out, _ = self.run_cli((200, {'success': True, 'result': echo}))
+            self.assertEqual(rc, 0, (echo, out))
         self.refused((200, {'success': True, 'result': dict(self.ECHO, logpush=None)}), 'logpush echoed null')
+        self.refused((200, {'success': True, 'result': dict(self.ECHO, observability=None, tail_consumers=None,
+                                                            logpush=None)}), 'the echo is not off: logpush echoed null')
+        # the stored null is no licence for a missing key or for an observability that is on
+        self.refused((200, {'success': True, 'result': {'logpush': False, 'tail_consumers': None}}), 'observability not echoed')
+        self.refused((200, {'success': True, 'result': {'observability': None, 'logpush': False}}), 'tail_consumers not echoed')
+        self.refused((200, {'success': True, 'result': dict(self.ECHO, observability={'enabled': True}, tail_consumers=None)}),
+                     'the echo is not off: observability on: enabled')
+        self.refused((200, {'success': True, 'result': dict(self.ECHO, observability={'enabled': False, 'logs': {'enabled': True}},
+                                                            tail_consumers=None)}),
+                     'the echo is not off: observability on: logs.enabled')
 
     def test_an_http_error_or_a_status_other_than_200_is_refused(self):
         for code in (400, 403, 404, 500):
@@ -822,7 +882,6 @@ class SettingsOff(unittest.TestCase):
 
     def test_an_echo_that_is_not_off_is_refused_by_key_never_by_value(self):
         echo = lambda **kw: (200, {'success': True, 'result': {**self.ECHO, **kw}})  # noqa: E731
-        self.refused(echo(observability=None), 'the echo is not off: observability: null')
         self.refused(echo(observability={'enabled': True, 'destinations': ['acct-SECRET']}), 'observability on: enabled')
         self.refused(echo(observability={'enabled': False, 'logs': {'enabled': True}}), 'observability on: logs.enabled')
         self.refused(echo(observability={}), 'observability.enabled: missing')
@@ -1109,6 +1168,34 @@ def jobs(text: str) -> dict[str, str]:
     return {parts[i]: parts[i + 1] for i in range(1, len(parts), 2)}
 
 
+# `wrangler secret put` is deliberately not counted: staging's throwaway pepper sits between settings-off and its gate
+# (the order test pins it there), and whether it makes a new Worker version is not measured. The gate does not rest on
+# this order for safety: its GA worker read must itself be an explicit off object. Do not widen this to `secret put`
+# without moving the pepper step.
+DEPLOYS = re.compile(r'wrangler (?:deploy|versions (?:deploy|upload)|rollback)\b')
+
+
+def gate_faults(deploy_job: str) -> list[str]:
+    """For each settings gate step in a deploy job's text (comments stripped): what is wrong with its order, [] = fine.
+    The settings-off step for the same Worker must come before it with no deploy step between the two."""
+    steps = re.split(r'(?m)^(?=      - )', deploy_job)
+    faults, gates = [], []
+    for i, step in enumerate(steps):
+        m = re.search(r'fleet-kit-check\.py settings ([\w-]+)$', step, re.M)
+        if not m:
+            continue
+        gates.append(m.group(1))
+        off = re.compile(r'fleet-kit-check\.py settings-off %s$' % re.escape(m.group(1)), re.M)
+        before = [j for j in range(i) if off.search(steps[j])]
+        if not before:
+            faults.append('%s: no settings-off before its gate' % m.group(1))
+        elif any(DEPLOYS.search(s) for s in steps[before[-1] + 1:i]):
+            faults.append('%s: a deploy between settings-off and its gate' % m.group(1))
+    if gates != ['fleet-kit-staging', 'fleet-kit']:
+        faults.append('settings gates: %s' % gates)
+    return faults
+
+
 class Workflow(unittest.TestCase):
     JOBS = jobs(WF)
 
@@ -1198,6 +1285,33 @@ class Workflow(unittest.TestCase):
         self.assertIn('settings fleet-kit\n', d)
         self.assertIn('settings-off fleet-kit-staging\n', d)
         self.assertIn('settings-off fleet-kit\n', d)
+
+    def test_each_settings_gate_runs_after_its_own_off_write_with_no_deploy_between(self):
+        # the stated protocol: settings-off, then its gate, no deploy between. script-settings answers null whether or
+        # not the off record was written (run 38095547741 read null before any off write; 38099981335 echoed null right
+        # after it), so this order does not make the null proof of anything: the gate's GA worker read carries the proof.
+        # On staging the throwaway pepper's `wrangler secret put` is the one tolerated step between the two (DEPLOYS
+        # does not count it; the order test above pins the pepper there); assert it is the only one.
+        d = jobs(CODE)['deploy']
+        self.assertEqual(gate_faults(d), [])
+        steps0 = re.split(r'(?m)^(?=      - )', d)
+        i_off = next(i for i, s in enumerate(steps0) if '- name: Observability off, staging\n' in s)
+        i_gate = next(i for i, s in enumerate(steps0) if '- name: Settings gate, staging\n' in s)
+        between = steps0[i_off + 1:i_gate]
+        self.assertEqual(len(between), 1, between)
+        self.assertIn('wrangler secret put INVITE_PEPPER --env staging', between[0])
+        # positive proof the check bites, on crafted orders of the same steps
+        steps = re.split(r'(?m)^(?=      - )', d)
+        at = lambda name: next(i for i, s in enumerate(steps) if '- name: ' + name + '\n' in s)  # noqa: E731
+        swapped = list(steps)
+        p, o = at('Deploy production'), at('Observability off, production')
+        swapped[p], swapped[o] = swapped[o], swapped[p]
+        self.assertEqual(gate_faults(''.join(swapped)), ['fleet-kit: a deploy between settings-off and its gate'])
+        dropped = [s for i, s in enumerate(steps) if i != at('Observability off, staging')]
+        self.assertEqual(gate_faults(''.join(dropped)), ['fleet-kit-staging: no settings-off before its gate'])
+        g = at('Settings gate, staging')
+        extra = steps[:g] + ['      - run: npx --no-install wrangler versions deploy --env staging\n'] + steps[g:]
+        self.assertEqual(gate_faults(''.join(extra)), ['fleet-kit-staging: a deploy between settings-off and its gate'])
 
     def test_the_pepper_is_made_once_piped_and_never_echoed(self):
         d = self.JOBS['deploy']
