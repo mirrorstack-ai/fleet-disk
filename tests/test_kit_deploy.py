@@ -318,47 +318,104 @@ class Judges(unittest.TestCase):
             with self.assertRaises(kc.Refused):
                 kc.secret_names(bad)
 
-    GOOD = {'observability': {'enabled': False}, 'logpush': False, 'tail_consumers': []}
+    OFF = {'enabled': False}
+    GOOD = {'settings': {'observability': OFF, 'logpush': False, 'tail_consumers': []},
+            'script-settings': {'observability': OFF, 'logpush': False, 'tail_consumers': None},
+            'worker': {'observability': OFF, 'logpush': False, 'tail_consumers': [], 'name': 'fleet-kit'}}
     SUB = {'enabled': True, 'previews_enabled': False}
+    GONE = object()     # judge(): drop that endpoint (it did not answer) or that key (the endpoint did not report it)
 
-    def test_good_settings_pass(self):
-        self.assertEqual(kc.judge_settings([self.GOOD], self.SUB), [])
-        self.assertEqual(kc.judge_settings([self.GOOD, {'logpush': False, 'tail_consumers': None}], self.SUB), [])
-        # each guarded key is read back by some blob; they need not be the same blob
-        self.assertEqual(kc.judge_settings([{'observability': {'enabled': False, 'logs': {'enabled': False}}},
-                                            {'logpush': False, 'tail_consumers': []}], self.SUB), [])
-        self.assertEqual(kc.judge_settings([{'observability': {'enabled': False}, 'tail_consumers': None},
-                                            {'logpush': False}], self.SUB), [])
+    def judge(self, sub=None, **eps):
+        """judge_settings over GOOD with per-endpoint changes: script_settings={'observability': None} merges keys into
+        that endpoint's blob (GONE as a value drops the key), script_settings=GONE drops the whole endpoint."""
+        blobs = {k: dict(v) for k, v in self.GOOD.items()}
+        for name, change in eps.items():
+            ep = name.replace('_', '-')
+            self.assertIn(ep, blobs)
+            if change is self.GONE:
+                del blobs[ep]
+                continue
+            for k, v in change.items():
+                if v is self.GONE:
+                    blobs[ep].pop(k, None)
+                else:
+                    blobs[ep][k] = v
+        return kc.judge_settings(blobs, dict(self.SUB, **(sub or {})))
+
+    def test_all_three_explicit_off_pass(self):
+        self.assertEqual(self.judge(), [])
+        full = dict(kc.OBSERVABILITY_OFF)
+        self.assertEqual(self.judge(settings={'observability': full}, script_settings={'observability': full},
+                                    worker={'observability': full}), [])
+        # the GA schema's nullable issues and its other non-`enabled` keys are not "on"
+        ga = {'enabled': False, 'head_sampling_rate': 1, 'issues': None, 'redact_query_string': False,
+              'logs': {'enabled': False, 'destinations': [], 'invocation_logs': True, 'persist': True}}
+        self.assertEqual(self.judge(worker={'observability': ga}), [])
+
+    def test_settings_may_omit_observability_or_not_answer_when_the_other_two_are_off(self):
+        self.assertEqual(self.judge(settings={'observability': self.GONE}), [])                         # rule (c)
+        self.assertEqual(self.judge(settings=self.GONE), [])
+
+    def test_settings_reporting_observability_is_held_to_off(self):
+        for obs in (None, {'enabled': True}, {}, {'enabled': False, 'logs': {'enabled': True}}, 'off'):  # rules (a), (c)
+            out = self.judge(settings={'observability': obs})
+            self.assertEqual(len(out), 1, (obs, out))
+            self.assertTrue(out[0].startswith('settings: observability is not off ('), out)
+
+    def test_script_settings_null_with_settings_explicit_off_is_refused_naming_script_settings(self):
+        self.assertEqual(self.judge(script_settings={'observability': None}),
+                         ['script-settings: observability is not off (observability: null)'])
+
+    def test_script_settings_with_a_flag_on_under_an_enabled_false_is_refused(self):
+        self.assertEqual(self.judge(script_settings={'observability': {'enabled': False, 'logs': {'enabled': True}}}),
+                         ['script-settings: observability is not off (observability on: logs.enabled)'])
+
+    def test_script_settings_must_report_an_explicit_off(self):                                         # rule (b)
+        self.assertEqual(self.judge(script_settings={'observability': self.GONE}),
+                         ['script-settings: observability not reported'])
+        self.assertEqual(self.judge(script_settings=self.GONE), ['script-settings: did not answer'])
+
+    def test_the_worker_read_must_answer_and_report_an_explicit_off(self):                              # rule (d)
+        self.assertEqual(self.judge(worker=self.GONE), ['worker: did not answer'])
+        self.assertEqual(self.judge(worker={'observability': self.GONE}), ['worker: observability not reported'])
+        self.assertEqual(self.judge(worker={'observability': None}),
+                         ['worker: observability is not off (observability: null)'])
+        self.assertEqual(self.judge(worker={'observability': {'enabled': True}}),
+                         ['worker: observability is not off (observability on: enabled)'])
+
+    def test_the_worker_read_is_held_to_the_logpush_and_tail_rules(self):                               # rule (e)
+        self.assertEqual(self.judge(worker={'logpush': True}), ['worker: logpush is on'])
+        self.assertEqual(self.judge(worker={'tail_consumers': [{'name': 'x'}]}), ['worker: tail consumers: 1'])
+        # the worker read alone can be the one that reports them
+        self.assertEqual(self.judge(settings=self.GONE, script_settings={'logpush': self.GONE, 'tail_consumers': self.GONE}), [])
 
     def test_a_guarded_key_nobody_reports_is_refused_not_passed(self):
-        obs = {'observability': {'enabled': False}}
-        self.assertEqual(kc.judge_settings([obs], self.SUB), ['logpush: not reported', 'tail_consumers: not reported'])
-        self.assertEqual(kc.judge_settings([dict(obs, logpush=False)], self.SUB), ['tail_consumers: not reported'])
-        self.assertEqual(kc.judge_settings([dict(obs, tail_consumers=[])], self.SUB), ['logpush: not reported'])
-        # present but not a clean value is a named failure, not a pass
-        self.assertEqual(kc.judge_settings([dict(obs, tail_consumers=None, logpush=None)], self.SUB), ['logpush: not reported'])
-        self.assertEqual(kc.judge_settings([dict(obs, tail_consumers=None, logpush='yes')], self.SUB), ['logpush is on'])
+        gone = {'logpush': self.GONE, 'tail_consumers': self.GONE}
+        self.assertEqual(self.judge(settings=gone, script_settings=gone, worker=gone),
+                         ['logpush: not reported (settings, script-settings, worker)',
+                          'tail_consumers: not reported (settings, script-settings, worker)'])
+        # present but not a clean value is a named failure, not a pass; null logpush says nothing
+        nul = {'logpush': None}
+        self.assertEqual(self.judge(settings=nul, script_settings=nul, worker=nul),
+                         ['logpush: not reported (settings, script-settings, worker)'])
+        self.assertEqual(self.judge(settings={'logpush': 'yes'}), ['settings: logpush is on'])
 
-    def test_each_bad_setting_is_named(self):
-        def bad(blob=None, sub=None):
-            return kc.judge_settings([dict(self.GOOD, **(blob or {}))], dict(self.SUB, **(sub or {})))
-        self.assertIn('observability is not off', bad({'observability': {'enabled': True}}))
-        self.assertIn('observability is not off', bad({'observability': {'enabled': False, 'logs': {'enabled': True}}}))
-        self.assertIn('observability is not off', bad({'observability': {}}))
-        self.assertIn('observability is not off', bad({'observability': None}))
-        self.assertIn('tail consumers: 1', bad({'tail_consumers': [{'service': 'x'}]}))
-        self.assertIn('logpush is on', bad({'logpush': True}))
-        self.assertIn('workers.dev is not on', bad(sub={'enabled': False}))
-        self.assertIn('workers.dev is not on', bad(sub={'enabled': None}))
-        self.assertIn('preview URLs are not off', bad(sub={'previews_enabled': True}))
-        self.assertIn('preview URLs are not off', kc.judge_settings([self.GOOD], {'enabled': True}))  # unknown is not off
+    def test_each_bad_setting_is_named_with_its_endpoint(self):
+        self.assertIn('settings: tail consumers: 1', self.judge(settings={'tail_consumers': [{'service': 'x'}]}))
+        self.assertIn('script-settings: tail consumers: unreadable', self.judge(script_settings={'tail_consumers': 'x'}))
+        self.assertIn('script-settings: logpush is on', self.judge(script_settings={'logpush': True}))
+        self.assertIn('workers.dev is not on', self.judge(sub={'enabled': False}))
+        self.assertIn('workers.dev is not on', self.judge(sub={'enabled': None}))
+        self.assertIn('preview URLs are not off', self.judge(sub={'previews_enabled': True}))
+        self.assertIn('preview URLs are not off', kc.judge_settings(self.GOOD, {'enabled': True}))  # unknown is not off
 
     def test_a_refused_observability_names_what_is_on_and_nothing_else(self):
         def why(obs):
-            out = kc.judge_settings([dict(self.GOOD, observability=obs)], self.SUB)
-            self.assertEqual(out[0], 'observability is not off')       # the old element, byte-identical, first
-            self.assertEqual(len(out), 2, out)                         # plus exactly one detail
-            return out[1]
+            out = self.judge(script_settings={'observability': obs})
+            self.assertEqual(len(out), 1, out)                         # exactly one line, naming the endpoint
+            head = 'script-settings: observability is not off ('
+            self.assertTrue(out[0].startswith(head) and out[0].endswith(')'), out)
+            return out[0][len(head):-1]
         self.assertEqual(why({'enabled': True}), 'observability on: enabled')
         self.assertEqual(why({'enabled': False, 'issues': {'enabled': True}, 'logs': {'enabled': True, 'persist': True},
                               'traces': {'enabled': False}}), 'observability on: issues.enabled, logs.enabled')
@@ -374,47 +431,42 @@ class Judges(unittest.TestCase):
         self.assertEqual(why('on'), 'observability: not an object (str)')
 
     def test_the_detail_never_carries_a_value_from_the_read_back(self):
-        out = kc.judge_settings([dict(self.GOOD, observability={'enabled': False, 'head_sampling_rate': 0.4242,
-                                                                 'logs': {'enabled': True, 'destinations': ['acct-SECRET']}})],
-                                self.SUB)
-        self.assertEqual(out, ['observability is not off', 'observability on: logs.enabled'])
-        self.assertEqual(kc.judge_settings([dict(self.GOOD, observability='acct-SECRET')], self.SUB),
-                         ['observability is not off', 'observability: not an object (str)'])
+        out = self.judge(worker={'observability': {'enabled': False, 'head_sampling_rate': 0.4242,
+                                                   'logs': {'enabled': True, 'destinations': ['acct-SECRET']}}})
+        self.assertEqual(out, ['worker: observability is not off (observability on: logs.enabled)'])
+        self.assertEqual(self.judge(settings={'observability': 'acct-SECRET'}),
+                         ['settings: observability is not off (observability: not an object (str))'])
 
     def test_the_detail_line_is_escaped_and_capped(self):
-        out = kc.judge_settings([dict(self.GOOD, observability={'enabled': False, 'a\nb::error::x': {'enabled': True}})],
-                                self.SUB)
-        self.assertEqual(out, ['observability is not off', 'observability on: a\\nb::error::x.enabled'])
+        out = self.judge(settings={'observability': {'enabled': False, 'a\nb::error::x': {'enabled': True}}})
+        self.assertEqual(out, ['settings: observability is not off (observability on: a\\nb::error::x.enabled)'])
         many = {'enabled': False, **{'k%d' % i: {'enabled': True} for i in range(100)}}
-        out = kc.judge_settings([dict(self.GOOD, observability=many)], self.SUB)
-        self.assertEqual(out[0], 'observability is not off')
-        self.assertIn('(+92 more)', out[1])
-        self.assertLess(len(out[1]), 300)
+        out = self.judge(settings={'observability': many})
+        self.assertIn('(+92 more)', out[0])
+        self.assertLess(len(out[0]), 340)
         long_key = {'enabled': False, 'x' * 5000: {'enabled': True}}
-        self.assertLess(len(kc.judge_settings([dict(self.GOOD, observability=long_key)], self.SUB)[1]), 300)
+        self.assertLess(len(self.judge(settings={'observability': long_key})[0]), 340)
 
-    def test_a_passing_observability_adds_no_detail_and_old_verdicts_hold(self):
-        full_off = {'enabled': False, 'issues': {'enabled': False},
-                    'logs': {'enabled': False, 'invocation_logs': False, 'persist': False},
-                    'traces': {'enabled': False, 'persist': False}}
-        self.assertEqual(kc.judge_settings([dict(self.GOOD, observability=full_off)], self.SUB), [])
-        # a refusal elsewhere adds nothing observability-shaped
-        self.assertEqual(kc.judge_settings([dict(self.GOOD, logpush=True)], self.SUB), ['logpush is on'])
-        # a missing answer keeps its single old element (no "not off" detail: nothing was read back)
-        self.assertEqual(kc.judge_settings([{'logpush': False, 'tail_consumers': []}], self.SUB),
-                         ['observability: no explicit off in the settings read back'])
-        # same refused/passed verdict as before for the old cases
-        for obs, refused in [({'enabled': False}, False), ({'enabled': True}, True), ({}, True), (None, True), ([], True),
-                             ({'enabled': False, 'logs': {'enabled': True}}, True), ({'enabled': 0}, True),
-                             ({'enabled': False, 'logs': {'enabled': False}}, False)]:
-            out = kc.judge_settings([dict(self.GOOD, observability=obs)], self.SUB)
-            self.assertEqual('observability is not off' in out, refused, obs)
+    def test_old_verdicts_hold_on_every_endpoint(self):
+        for ep in ('settings', 'script_settings', 'worker'):
+            for obs, refused in [({'enabled': False}, False), ({'enabled': True}, True), ({}, True), (None, True), ([], True),
+                                 ({'enabled': False, 'logs': {'enabled': True}}, True), ({'enabled': 0}, True),
+                                 ({'enabled': False, 'logs': {'enabled': False}}, False)]:
+                out = self.judge(**{ep: {'observability': obs}})
+                self.assertEqual(any('observability is not off' in b for b in out), refused, (ep, obs))
+        self.assertIn('settings: logpush is on', self.judge(settings={'logpush': True}))  # a refusal elsewhere adds nothing else
+        self.assertEqual(len(self.judge(settings={'logpush': True})), 1)
+        self.assertIn('worker: observability is not off (observability on: enabled)',
+                      self.judge(worker={'observability': {'enabled': True}}))  # any source can veto
 
-    def test_a_missing_observability_answer_is_not_off(self):
-        self.assertEqual(kc.judge_settings([{'logpush': False, 'tail_consumers': []}], self.SUB),
-                         ['observability: no explicit off in the settings read back'])
-        self.assertIn('observability is not off',
-                      kc.judge_settings([self.GOOD, {'observability': {'enabled': True}}], self.SUB))  # any source can veto
+    def test_the_off_constant_is_the_wrangler_jsonc_block_in_both_envs(self):
+        text = (ROOT / 'kit/wrangler.jsonc').read_text(encoding='utf-8')
+        cfg = json.loads('\n'.join(l for l in text.splitlines() if not l.strip().startswith('//')))  # as kit/admin.test.js
+        self.assertEqual(cfg['observability'], kc.OBSERVABILITY_OFF)
+        self.assertEqual(cfg['env']['staging']['observability'], kc.OBSERVABILITY_OFF)
+        self.assertEqual(kc.SETTINGS_OFF, {'observability': cfg['observability'], 'logpush': False, 'tail_consumers': []})
+        self.assertEqual(kc.SETTINGS_OFF, {'observability': cfg['env']['staging']['observability'],
+                                           'logpush': cfg['env']['staging']['logpush'], 'tail_consumers': []})
 
     def test_a_redirect_is_never_followed_and_so_never_carries_the_token(self):
         req = urllib.request.Request('https://api.cloudflare.com/client/v4/x', headers={'Authorization': 'Bearer SECRETTOKEN'})
@@ -448,14 +500,18 @@ class Judges(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+
     ACCOUNT = 'a' * 32
+    WORKER_READ = {'id': 'x', 'name': 'fleet-kit', 'observability': {'enabled': False, 'logs': {'enabled': False}},
+                   'logpush': False, 'tail_consumers': [], 'subdomain': {'enabled': True, 'previews_enabled': False}}
     GOOD_ANSWERS = {'/settings': {'observability': {'enabled': False}, 'logpush': False, 'tail_consumers': []},
-                    '/script-settings': {'logpush': False},
+                    '/script-settings': {'observability': {'enabled': False}, 'logpush': False},
+                    '/worker': WORKER_READ,
                     '/subdomain': {'enabled': True, 'previews_enabled': False}}
 
     def cf(self, answers):
-        """Run check_settings with kc._open replaced; answers maps a path tail to a result dict, an int HTTP code,
-        'fail' (success: false), or an exception. Returns (outcome, urls asked, authorization headers sent)."""
+        """Run check_settings with kc._open replaced; answers maps a path tail ('/worker' = the GA read) to a result dict,
+        an int HTTP code, 'fail' (success: false), or an exception. Returns (outcome, urls asked, authorization headers sent)."""
         asked, auths = [], []
 
         class Reply:
@@ -474,7 +530,9 @@ class Judges(unittest.TestCase):
         def fake_open(req, timeout):
             asked.append(req.full_url)
             auths.append(req.get_header('Authorization'))
-            a = answers['/' + req.full_url.rsplit('/', 1)[-1]]
+            self.assertEqual(req.get_method(), 'GET')
+            key = '/worker' if '/workers/workers/' in req.full_url else '/' + req.full_url.rsplit('/', 1)[-1]
+            a = answers[key]
             if isinstance(a, BaseException):
                 raise a
             if isinstance(a, int):
@@ -493,24 +551,26 @@ class Judges(unittest.TestCase):
         finally:
             kc._open = old
 
-    def test_the_settings_gate_asks_the_three_exact_endpoints_with_the_token(self):
+    def test_the_settings_gate_asks_the_four_exact_endpoints_with_the_token(self):
         out, asked, auths = self.cf(self.GOOD_ANSWERS)
-        base = 'https://api.cloudflare.com/client/v4/accounts/%s/workers/scripts/fleet-kit' % self.ACCOUNT
-        self.assertEqual(asked, [base + '/settings', base + '/script-settings', base + '/subdomain'])
+        api = 'https://api.cloudflare.com/client/v4/accounts/%s/workers/' % self.ACCOUNT
+        base = api + 'scripts/fleet-kit'
+        self.assertEqual(asked, [base + '/settings', base + '/script-settings', api + 'workers/fleet-kit', base + '/subdomain'])
         self.assertEqual(set(auths), {'Bearer TOKEN'})
-        self.assertEqual(out, {'worker': 'fleet-kit', 'sources': 2})
+        self.assertEqual(out, {'worker': 'fleet-kit', 'sources': 3})
 
-    def test_the_settings_gate_tolerates_one_settings_endpoint_failing_but_not_both_or_the_subdomain(self):
-        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/script-settings': 404}))
-        self.assertEqual(out, {'worker': 'fleet-kit', 'sources': 1})
-        # the one endpoint left must still prove everything: /script-settings alone says nothing about tail consumers
-        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/settings': 'fail'}))
-        self.assertIsInstance(out, kc.Refused)
-        self.assertIn('tail_consumers: not reported', str(out))
-        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/settings': 500}))
-        self.assertIsInstance(out, kc.Refused)
-        self.assertIn('tail_consumers: not reported', str(out))
-        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/settings': 500, '/script-settings': 403}))
+    def test_the_settings_gate_tolerates_settings_failing_but_not_script_settings_the_worker_or_the_subdomain(self):
+        for bad in (404, 'fail'):
+            out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/settings': bad}))
+            self.assertEqual(out, {'worker': 'fleet-kit', 'sources': 2}, bad)
+            out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/script-settings': bad}))
+            self.assertIsInstance(out, kc.Refused, bad)
+            self.assertIn('script-settings: did not answer', str(out))
+        for bad in (403, 404, 500, 'fail'):                                    # the GA read: non-200 is a refusal
+            out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/worker': bad}))
+            self.assertIsInstance(out, kc.Refused, bad)
+            self.assertIn('worker: did not answer', str(out))
+        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/settings': 500, '/script-settings': 403, '/worker': 403}))
         self.assertIsInstance(out, kc.Refused)
         self.assertIn('did not answer', str(out))
         for sub in (404, 'fail'):
@@ -518,12 +578,30 @@ class Judges(unittest.TestCase):
             self.assertIsInstance(out, kc.Refused, sub)
             self.assertIn('did not answer', str(out))
 
+    def test_the_settings_gate_refuses_the_worker_read_absent_null_or_on(self):
+        for obs, why in (('ABSENT', 'worker: observability not reported'),
+                         (None, 'worker: observability is not off (observability: null)'),
+                         ({'enabled': True}, 'worker: observability is not off (observability on: enabled)')):
+            read = {k: v for k, v in self.WORKER_READ.items() if k != 'observability'}
+            if obs != 'ABSENT':
+                read['observability'] = obs
+            out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/worker': read}))
+            self.assertIsInstance(out, kc.Refused, obs)
+            self.assertIn(why, str(out))
+
+    def test_the_settings_gate_refuses_the_measured_null_from_script_settings(self):
+        # run 38095547741: the GET answered observability: null. Now refused by name, with the other two explicit off.
+        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/script-settings': {'observability': None, 'logpush': False}}))
+        self.assertIsInstance(out, kc.Refused)
+        self.assertEqual(str(out), 'settings of fleet-kit: script-settings: observability is not off (observability: null)')
+
     def test_the_settings_gate_refuses_a_network_failure_and_names_a_bad_answer(self):
         for exc in (urllib.error.URLError('down'), TimeoutError(), ValueError('bad json')):
-            out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/settings': exc}))
-            self.assertIsInstance(out, kc.Refused, repr(exc))
-        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/script-settings': {'logpush': True}}))
-        self.assertIn('logpush is on', str(out))
+            for ep in ('/settings', '/worker'):
+                out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{ep: exc}))
+                self.assertIsInstance(out, kc.Refused, repr(exc))
+        out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/script-settings': {'observability': {'enabled': False}, 'logpush': True}}))
+        self.assertIn('script-settings: logpush is on', str(out))
         self.assertNotIn('TOKEN', str(out))
 
     def test_cf_get_only_talks_to_the_cloudflare_api_host(self):
@@ -543,6 +621,180 @@ class Judges(unittest.TestCase):
             kc.check_settings('Fleet Kit', 't', 'f' * 32)
         with self.assertRaises(kc.Refused):
             kc.check_settings('fleet-kit', 't', 'short')
+
+
+class SettingsOff(unittest.TestCase):
+    """settings-off: the PATCH of the script-settings record, through the CLI with kc._open replaced."""
+    ACCOUNT = 'b' * 32
+    TOKEN = 'SECRETTOKEN-0123456789'
+    URL = 'https://api.cloudflare.com/client/v4/accounts/%s/workers/scripts/fleet-kit-staging/script-settings' % ACCOUNT
+    ECHO = {'observability': dict(kc.OBSERVABILITY_OFF), 'logpush': False, 'tail_consumers': [], 'tags': []}
+
+    def run_cli(self, answer, worker='fleet-kit-staging', env=None):
+        """answer: (status, body bytes) | (status, doc) | an int HTTP error code | an exception. Returns (rc, output, requests)."""
+        sent = []
+
+        class Reply:
+            def __init__(self, status, raw):
+                self.status, self.raw = status, raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return self.raw
+
+        def fake_open(req, timeout):
+            sent.append(req)
+            if isinstance(answer, BaseException):
+                raise answer
+            if isinstance(answer, int):
+                raise urllib.error.HTTPError(req.full_url, answer, 'x', {}, io.BytesIO(b'{"errors":["BODYSECRET"]}'))
+            status, body = answer
+            return Reply(status, body if isinstance(body, bytes) else json.dumps(body).encode())
+
+        buf = io.StringIO()
+        old, kc._open = kc._open, fake_open
+        environ = {'CLOUDFLARE_API_TOKEN': self.TOKEN, 'CLOUDFLARE_ACCOUNT_ID': self.ACCOUNT} if env is None else env
+        saved = {k: os.environ.get(k) for k in ('CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID')}
+        try:
+            for k in saved:
+                os.environ.pop(k, None)
+            os.environ.update(environ)
+            with redirect_stdout(buf):
+                rc = kc.main(['settings-off', worker])
+        finally:
+            kc._open = old
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        out = buf.getvalue()
+        self.assertNotIn(self.TOKEN, out)                  # no token in any output, pass or refusal
+        self.assertNotIn('SECRET', out.replace('REFUSED', ''))
+        return rc, out, sent
+
+    def refused(self, answer, fragment):
+        rc, out, sent = self.run_cli(answer)
+        self.assertEqual(rc, 1, out)
+        last = out.strip().splitlines()[-1]
+        self.assertTrue(last.startswith('REFUSED settings-off: PATCH script-settings'), last)
+        self.assertIn(fragment, last)
+        return last
+
+    def test_the_request_is_a_patch_of_exactly_the_off_record_as_json(self):
+        rc, out, sent = self.run_cli((200, {'success': True, 'result': self.ECHO}))
+        self.assertEqual(rc, 0, out)
+        self.assertIn('settings-off of fleet-kit-staging: observability off', out)
+        self.assertEqual(len(sent), 1)
+        req = sent[0]
+        self.assertEqual(req.get_method(), 'PATCH')
+        self.assertEqual(req.full_url, self.URL)
+        self.assertEqual(req.get_header('Content-type'), 'application/json')
+        self.assertEqual(req.get_header('Authorization'), 'Bearer ' + self.TOKEN)
+        self.assertEqual(json.loads(req.data), {'observability': kc.OBSERVABILITY_OFF, 'logpush': False, 'tail_consumers': []})
+        self.assertEqual(json.loads(req.data), kc.SETTINGS_OFF)
+
+    def test_an_echo_with_null_tail_consumers_passes(self):
+        rc, out, _ = self.run_cli((200, {'success': True, 'result': dict(self.ECHO, tail_consumers=None)}))
+        self.assertEqual(rc, 0, out)
+
+    def test_an_http_error_or_a_status_other_than_200_is_refused(self):
+        for code in (400, 403, 404, 500):
+            self.refused(code, 'HTTP %d' % code)
+        for status in (201, 202, 204):
+            self.refused((status, {'success': True, 'result': self.ECHO}), 'HTTP %d, not 200' % status)
+
+    def test_a_network_failure_or_a_non_json_answer_is_refused(self):
+        self.refused(urllib.error.URLError('down'), 'failed (URLError)')
+        self.refused(TimeoutError(), 'failed (TimeoutError)')
+        self.refused((200, b'<html>SECRET</html>'), 'failed (JSONDecodeError)')
+        self.refused((200, b'\xff\xfe'), 'failed')
+
+    def test_success_false_or_no_result_is_refused(self):
+        self.refused((200, {'success': False, 'result': self.ECHO}), 'success is not true')
+        self.refused((200, {'result': self.ECHO}), 'success is not true')
+        self.refused((200, [1]), 'success is not true')
+        self.refused((200, {'success': True}), 'no result echoed')
+        self.refused((200, {'success': True, 'result': None}), 'no result echoed')
+
+    def test_an_echo_that_is_not_off_is_refused_by_key_never_by_value(self):
+        echo = lambda **kw: (200, {'success': True, 'result': {**self.ECHO, **kw}})  # noqa: E731
+        self.refused(echo(observability=None), 'the echo is not off: observability: null')
+        self.refused(echo(observability={'enabled': True, 'destinations': ['acct-SECRET']}), 'observability on: enabled')
+        self.refused(echo(observability={'enabled': False, 'logs': {'enabled': True}}), 'observability on: logs.enabled')
+        self.refused(echo(observability={}), 'observability.enabled: missing')
+        self.refused((200, {'success': True, 'result': {'logpush': False, 'tail_consumers': []}}), 'observability not echoed')
+        self.refused(echo(logpush=True), 'logpush is not false')
+        self.refused(echo(logpush=None), 'logpush is not false')
+        self.refused((200, {'success': True, 'result': {'observability': kc.OBSERVABILITY_OFF, 'tail_consumers': []}}),
+                     'logpush is not false')
+        self.refused(echo(tail_consumers=[{'name': 'SECRET-tail'}]), 'tail_consumers is not empty')
+        self.refused((200, {'success': True, 'result': {'observability': kc.OBSERVABILITY_OFF, 'logpush': False}}),
+                     'tail_consumers is not empty')
+
+    def test_a_redirect_is_not_followed(self):
+        """The PATCH goes through kc._OPENER (NoRedirect): a 302 is a refusal and the Location is never asked."""
+        class H(BaseHTTPRequestHandler):
+            seen: list = []
+
+            def do_PATCH(self):
+                H.seen.append((self.command, self.path, self.headers.get('Authorization')))
+                self.send_response(302)
+                self.send_header('Location', '/other')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+            do_GET = do_POST = do_PATCH
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        local = 'http://127.0.0.1:%d/start' % srv.server_address[1]
+
+        def to_local(req, timeout):      # the real opener, pointed at a local server instead of the API
+            moved = urllib.request.Request(local, data=req.data, headers=dict(req.header_items()), method=req.get_method())
+            return kc._OPENER.open(moved, timeout=5)
+        old, kc._open = kc._open, to_local
+        buf = io.StringIO()
+        try:
+            os.environ['CLOUDFLARE_API_TOKEN'], os.environ['CLOUDFLARE_ACCOUNT_ID'] = self.TOKEN, self.ACCOUNT
+            with redirect_stdout(buf):
+                rc = kc.main(['settings-off', 'fleet-kit-staging'])
+        finally:
+            kc._open = old
+            os.environ.pop('CLOUDFLARE_API_TOKEN', None)
+            os.environ.pop('CLOUDFLARE_ACCOUNT_ID', None)
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(rc, 1)
+        self.assertIn('HTTP 302', buf.getvalue())
+        self.assertNotIn(self.TOKEN, buf.getvalue())
+        self.assertEqual(H.seen, [('PATCH', '/start', 'Bearer ' + self.TOKEN)])     # /other was never asked for
+
+    def test_bad_ids_a_bad_host_or_no_credentials_send_nothing(self):
+        for worker in ('Fleet Kit', 'x' * 64, 'a/b'):
+            rc, out, sent = self.run_cli((200, {'success': True, 'result': self.ECHO}), worker=worker)
+            self.assertEqual((rc, sent), (1, []), worker)
+        rc, out, sent = self.run_cli((200, {}), env={'CLOUDFLARE_API_TOKEN': self.TOKEN, 'CLOUDFLARE_ACCOUNT_ID': 'short'})
+        self.assertEqual((rc, sent), (1, []))
+        rc, out, sent = self.run_cli((200, {}), env={'CLOUDFLARE_ACCOUNT_ID': self.ACCOUNT})
+        self.assertEqual((rc, sent), (1, []))
+        self.assertIn('settings-off: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are needed', out)
+        old = kc.CF_API
+        for bad in ('http://api.cloudflare.com/client/v4', 'https://api.cloudflare.com.evil.example/client/v4'):
+            kc.CF_API = bad
+            try:
+                rc, out, sent = self.run_cli((200, {'success': True, 'result': self.ECHO}))
+            finally:
+                kc.CF_API = old
+            self.assertEqual((rc, sent), (1, []), bad)
+            self.assertIn('not api.cloudflare.com over https', out)
 
 
 @unittest.skipUnless(HAVE_ED25519, 'needs an openssl with Ed25519 -rawin')
@@ -803,10 +1055,10 @@ class Workflow(unittest.TestCase):
         self.assertNotRegex(deploy.split('\n    steps:\n')[0], r'secrets\.|CLOUDFLARE')  # not job-level
         steps = re.split(r'(?m)^      - ', deploy.split('\n    steps:\n')[1])
         with_token = [s for s in steps if 'CLOUDFLARE_API_TOKEN' in s]
-        self.assertEqual(len(with_token), 7)
-        self.assertEqual(WF.count('${{ secrets.CLOUDFLARE_API_TOKEN }}'), 7)
-        self.assertEqual(WF.count('${{ vars.CLOUDFLARE_ACCOUNT_ID }}'), 7)
-        self.assertEqual(re.findall(r'secrets\.(\w+)', WF), ['CLOUDFLARE_API_TOKEN'] * 7)
+        self.assertEqual(len(with_token), 9)
+        self.assertEqual(WF.count('${{ secrets.CLOUDFLARE_API_TOKEN }}'), 9)
+        self.assertEqual(WF.count('${{ vars.CLOUDFLARE_ACCOUNT_ID }}'), 9)
+        self.assertEqual(re.findall(r'secrets\.(\w+)', WF), ['CLOUDFLARE_API_TOKEN'] * 9)
         for s in steps:
             if 'npm ci' in s or 'replay' in s or 'probe' in s or 'make the' in s.lower():
                 self.assertNotIn('CLOUDFLARE_API_TOKEN', s)   # the install, the replay and the probe never hold the token
@@ -815,8 +1067,9 @@ class Workflow(unittest.TestCase):
 
     def test_the_order_is_staging_replay_settings_pepper_production_settings_probe(self):
         d = self.JOBS['deploy']
-        marks = ['Deploy staging', 'staging INVITE_PEPPER', 'Settings gate, staging', 'Replay', 'INVITE_PEPPER once',
-                 'Deploy production', 'Settings gate, production', 'Hostile probe']
+        marks = ['Deploy staging', 'Observability off, staging', 'staging INVITE_PEPPER', 'Settings gate, staging', 'Replay',
+                 'INVITE_PEPPER once', 'Deploy production', 'Observability off, production', 'Settings gate, production',
+                 'Hostile probe']
         at = [d.index(x) for x in marks]
         self.assertEqual(at, sorted(at), marks)
         self.assertIn('wrangler deploy --env staging', d)
@@ -825,6 +1078,8 @@ class Workflow(unittest.TestCase):
         self.assertIn('--var "KIT_GW_PUB:$KIT_GW_PUB" --var "KIT_UP_PUB:$KIT_UP_PUB"', d)
         self.assertIn('settings fleet-kit-staging', d)
         self.assertIn('settings fleet-kit\n', d)
+        self.assertIn('settings-off fleet-kit-staging\n', d)
+        self.assertIn('settings-off fleet-kit\n', d)
 
     def test_the_pepper_is_made_once_piped_and_never_echoed(self):
         d = self.JOBS['deploy']
@@ -961,6 +1216,17 @@ class WorkflowStructure(unittest.TestCase):
             self.assertNotIn('env', step)                       # no token on either
         self.assertIn('settings fleet-kit-staging', self.named('Settings gate, staging')['run'])
         self.assertRegex(self.named('Settings gate, production')['run'].strip(), r'settings fleet-kit$')
+
+    def test_observability_off_runs_right_after_each_deploy_with_the_settings_env_and_before_its_gate(self):
+        names = [s.get('name', '') for s in self.steps]
+        for env, worker in (('staging', 'fleet-kit-staging'), ('production', 'fleet-kit')):
+            off, gate = self.named('Observability off, %s' % env), self.named('Settings gate, %s' % env)
+            self.assertEqual(off['run'].strip(), 'python3 bin/fleet-kit-check.py settings-off %s' % worker)
+            self.assertEqual(off['env'], gate['env'])                                       # same env, no new secret
+            self.assertEqual(sorted(off), ['env', 'name', 'run'])
+            at = names.index(off['name'])
+            self.assertEqual(names[at - 1], self.named('Deploy %s' % env)['name'], env)   # right after the deploy
+            self.assertLess(at, names.index(gate['name']), env)
 
 
 if __name__ == '__main__':
