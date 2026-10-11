@@ -11,20 +11,26 @@ plus the `openssl` binary (3.x: Ed25519 with -rawin) for the throwaway admin key
   settings-off WORKER write the off record explicitly: PATCH .../workers/scripts/WORKER/script-settings with the JSON
                       {observability: OBSERVABILITY_OFF, logpush: false, tail_consumers: []} (OBSERVABILITY_OFF is
                       kit/wrangler.jsonc's block, a test holds them equal), and refuse unless the API answers 200, success
-                      true, and echoes each of the three keys back off (null or a missing key is a refusal, named). Why a
-                      deploy alone is not trusted: wrangler 4.149's first deploy of a Worker (the kit has a DO migration)
-                      takes the PUT path and never PATCHes script-settings, and a later deploy's PATCH of it swallows every
-                      error. Staging had been deployed before (run 38076806590); run 38095547741 then read
-                      `observability: null` from an endpoint the old unlabelled gate did not name (script-settings, by the
-                      schema: only it may answer null). What null means is undocumented, so it is never off. Whether this
-                      write changes what the API answers is not yet measured: the next live run is that measurement.
+                      true, and echoes all three keys: logpush exactly false, observability the off object or null,
+                      tail_consumers [] or null (a missing key, a null logpush or anything else is a refusal, named).
+                      Measured, run 38099981335 (release 1944de0): this PATCH answered 200 success true and echoed
+                      `observability: null` and `tail_consumers: null` (logpush false), so the script-settings record
+                      stores the all-off block and the empty list as null; its schema (workers_script-settings-item) makes
+                      both nullable on that endpoint only. That null is accepted as the stored form of what was just
+                      written, there and nowhere else; the explicit-off proof is the GA read in `settings`. Why a deploy
+                      alone is not trusted: wrangler 4.149's first deploy of a Worker (the kit has a DO migration) takes
+                      the PUT path and never PATCHes script-settings, and a later deploy's PATCH of it swallows every
+                      error (run 38095547741 read that null back from script-settings after a deploy, before this write).
   settings WORKER     read the Worker's settings back from the Cloudflare API (token and account id from the environment)
                       from three endpoints (.../scripts/WORKER/settings, .../scripts/WORKER/script-settings and the GA
-                      .../workers/workers/WORKER) and refuse by judge_settings' rules: script-settings and the GA worker
-                      read must each answer and report observability explicitly off; settings may stay silent on it but
-                      never say anything else; the GA read must report `tail_consumers: []` and `logpush: false`, and any
-                      endpoint that reports either otherwise refuses; workers.dev on, preview URLs off. A refusal names
-                      the endpoint and key paths, never a value. Null is never a report of "off".
+                      .../workers/workers/WORKER) and refuse by judge_settings' rules. The GA worker read is the
+                      explicit-off proof: it must answer with observability an explicit off object (its schema requires
+                      the key, non-null), `tail_consumers: []` and `logpush: false`. script-settings must answer with
+                      observability the off object or null (null is how it stores the off record settings-off just wrote,
+                      run 38099981335; a missing key refuses); settings may stay silent on it but never say anything
+                      else, null included. Any endpoint that reports tail consumers or logpush otherwise refuses;
+                      workers.dev on, preview URLs off. A refusal names the endpoint and key paths, never a value. Null is
+                      never a report of "off": on script-settings it is only not a refusal.
   replay URL          the kit-serve vectors over HTTP against the STAGING Worker (admin keys from $KIT_GATE_DIR): identical
                       404 bytes, 429 after 30, the cap, release on a cut stream, floor, expiry, revoke, bad sha, overwrite,
                       gzip, Range, the admin rules. It makes its own invites and cleans them up.
@@ -72,6 +78,9 @@ SETTINGS_OFF = {'observability': OBSERVABILITY_OFF, 'logpush': False, 'tail_cons
 # The settings gate's endpoints, by label. script-settings and the GA worker read MUST report an explicit off; settings'
 # schema makes observability optional there, so it may stay silent (but never say anything but off).
 MUST_REPORT_OFF = ('script-settings', 'worker')
+# The one endpoint whose observability/tail_consumers null is the stored all-off form (run 38099981335: the off PATCH
+# echoed both as null; its schema makes them nullable there only). Not off, not a report: only not a refusal.
+STORES_OFF_AS_NULL = 'script-settings'
 FAILURE_BUDGET_PER_SOURCE = 30          # kit/gate-core.js LIMITS.perSource
 PROBE_MAX_FAILURES = 5                  # the hostile probe may spend at most this much of production's hourly budget
 # Worker sources that ship (everything else in kit/ is a test or a test stand-in).
@@ -224,21 +233,30 @@ def judge_settings(blobs: dict[str, dict], subdomain: dict) -> list[str]:
     'script-settings' = GET .../scripts/W/script-settings, 'worker' = the GA GET .../workers/workers/W) to the `result`
     object it answered; an endpoint that did not answer is not in it. The rules:
       (a) on ANY endpoint, an `observability` that is present but is not an object with every `enabled` in it exactly
-          false (and logs/traces/issues of the schema's shape) is a refusal, null included (null is undocumented, so it
-          is never off and never "says nothing");
-      (b) script-settings MUST answer and report an explicit off (absent = "script-settings: observability not reported");
+          false (and logs/traces/issues of the schema's shape) is a refusal, null included, with the one exception in (b);
+      (b) script-settings MUST answer, and its `observability` must be the explicit off object or null (a missing key =
+          "script-settings: observability not reported"). Its null is the stored all-off form, measured: run 38099981335's
+          settings-off PATCH of the all-off block answered 200 success true and echoed observability and tail_consumers
+          as null, and that endpoint's schema (workers_script-settings-item) alone makes them nullable. The workflow runs
+          settings-off before this gate with no deploy step between (a test holds that; on staging the throwaway pepper's
+          `wrangler secret put` does sit between), so the null read here is the record we just wrote. It is not a
+          report of off: (d) carries the proof;
       (c) settings may omit `observability` (its schema makes it optional), but if present it is held to (a);
-      (d) the GA worker read MUST answer and report an explicit off (its schema requires the key);
+      (d) the GA worker read MUST answer and report an explicit off object (its schema requires the key, non-null): it is
+          the explicit-off proof, and the pass needs it whatever script-settings says;
       (e) `tail_consumers` an empty list and `logpush` an explicit false on every blob that reports them; null on either
-          is "not reported" (it never counts as a report, and the next rule needs one). The GA worker read MUST report
-          both (its schema requires them, non-null): `tail_consumers: []` and `logpush: false`, else a refusal;
+          is "not reported" (never a report, never a refusal; on script-settings it is the stored form of [], (b)). The
+          GA worker read MUST report both (its schema requires them, non-null): `tail_consumers: []` and
+          `logpush: false`, else a refusal;
       (f) the subdomain: workers.dev on, preview URLs explicitly off.
     Every detail names the endpoint and key paths, never a value. A missing answer is never a pass."""
     bad = []
     tail_seen = logpush_seen = tail_bad = logpush_bad = False
     for ep, blob in blobs.items():
-        if 'observability' in blob:                                            # (a), (c)
-            if not _observability_off(blob['observability']):
+        if 'observability' in blob:                                            # (a), (b), (c)
+            if blob['observability'] is None and ep == STORES_OFF_AS_NULL:
+                pass                                # (b): the stored off record; not off by itself, (d) is the proof
+            elif not _observability_off(blob['observability']):
                 bad.append('%s: observability is not off (%s)' % (ep, _why_observability_on(blob['observability'])))
         elif ep in MUST_REPORT_OFF:                                            # (b), (d)
             bad.append('%s: observability not reported' % ep)
@@ -338,25 +356,33 @@ def check_settings(worker: str, token: str, account: str) -> dict:
 
 
 def _echo_not_off(echo: dict) -> list[str]:
-    """What in settings-off's echoed result is not the off record (key names only, never a value)."""
+    """What in settings-off's echoed result is not the off record (key names only, never a value). Every key must be
+    echoed. `observability: null` and `tail_consumers: null` are accepted as script-settings' stored form of what this
+    PATCH just wrote, measured: run 38099981335 sent the all-off block and [] and got 200 success true with both echoed
+    as null (the endpoint's schema, workers_script-settings-item, makes them nullable there only). A present non-null
+    observability is held to the same off judge as the gate; logpush must echo exactly false (that run echoed false),
+    null included as a refusal. This echo is not the explicit-off proof: the settings gate's GA read is."""
     bad = []
     if 'observability' not in echo:
         bad.append('observability not echoed')
-    elif not _observability_off(echo['observability']):
+    elif echo['observability'] is not None and not _observability_off(echo['observability']):
         bad.append(_why_observability_on(echo['observability']))
-    for key, off, word in (('logpush', False, 'is not false'), ('tail_consumers', [], 'is not empty')):
+    for key, off, word, stored_null in (('logpush', False, 'is not false', False),
+                                        ('tail_consumers', [], 'is not empty', True)):
         if key not in echo:
             bad.append('%s not echoed' % key)
-        elif echo[key] is None:                     # null is never off: the record was written as false / []
-            bad.append('%s echoed null' % key)
+        elif echo[key] is None:
+            if not stored_null:                     # logpush was echoed false: its null would be something else
+                bad.append('%s echoed null' % key)
         elif echo[key] != off or (key == 'logpush' and echo[key] is not False):
             bad.append('%s %s' % (key, word))
     return bad
 
 
 def settings_off(worker: str, token: str, account: str) -> dict:
-    """PATCH SETTINGS_OFF to the script-settings record and hold the echo to the same explicit-off judge. Passes only on
-    HTTP 200, `success: true` and an echo that is off; everything else is refused, naming the endpoint, never a body."""
+    """PATCH SETTINGS_OFF to the script-settings record and hold the echo to the same explicit-off judge (its stored null
+    aside, _echo_not_off). Passes only on HTTP 200, `success: true` and an echo that is off; everything else is refused,
+    naming the endpoint, never a body."""
     _check_ids('settings-off', worker, account)
     where = 'settings-off: PATCH script-settings'
     path = '/accounts/%s/workers/scripts/%s/script-settings' % (account, worker)
