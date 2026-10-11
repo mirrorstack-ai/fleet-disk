@@ -38,6 +38,10 @@ plus the `openssl` binary (3.x: Ed25519 with -rawin) for the throwaway admin key
                       gzip, Range, the admin rules. It makes its own invites and cleans them up.
   probe URL           the hostile probe against PRODUCTION: at most 5 well-formed failures, every answer byte-identical
                       to the first apart from date and cf-ray, one of them with Accept-Encoding: gzip.
+                      In both, the two duplicate-Authorization requests (a live code and an unknown one; the probe has
+                      no live code) are the one exception: they may both be Cloudflare's edge 400 page instead of the
+                      404, identical to each other, because the edge answers them before the Worker runs (run
+                      38102844541): the same page for a live and an unknown code tells nothing and spends no budget.
 
 Nothing here prints an invite code, a key, a token or a response body; it prints vector names, statuses and numbers.
 Exit 0 passed, 1 refused (the reason is the last line), 2 usage.
@@ -583,9 +587,52 @@ def get_kit(client: Client, serial, name: str, code: str, extra=()) -> Resp:
     return client.request('GET', '/v1/kit/%s/%s' % (serial, name), [('Authorization', 'FleetInvite ' + code)] + list(extra))
 
 
+# The two duplicate-Authorization cases: one with a live code, one with a code nobody holds. Measured, kit-deploy run
+# 38102844541 (release 4830f2a): the replay refused "two authorization headers: status 400, expected 404", and a probe of
+# the staging Worker with a fake code answered ONE Authorization header with the Worker's 404 (text/plain, 10 bytes,
+# cache-control no-store, no-transform, body "not found\n") and TWO identical ones with Cloudflare's own edge page (status
+# 400, server cloudflare, text/html, 155 bytes, "<html> ... 400 Bad Request ... cloudflare"). kit/worker.js has no 400 on
+# /v1/kit (a combined "a, b" value would be its 404), so the edge answers before the Worker runs. The uniform 404 exists so
+# that no answer tells a live invite from a dead one; an edge answer that is byte-identical for a live and an unknown code
+# tells nothing either, and since the Worker never sees the request it spends no budget. So the pair is taken as the
+# Worker's 404 for both or the identical edge 400 for both, and nothing else (fold_dup_auth).
+DUP_AUTH = ('two authorization headers', 'two authorization headers, unknown code')
+WORKER_CACHE = 'no-store, no-transform'    # the Worker's own cache-control on every answer; the edge page never has it
+
+
+def edge_400(resp: Resp) -> bool:
+    """Cloudflare's edge 400 page, not anything the Worker could have made (run 38102844541's probe)."""
+    return (resp.status == 400 and resp.header('server') == 'cloudflare'
+            and (resp.header('content-type') or '').startswith('text/html')
+            and b'400 Bad Request' in (resp.body or b'') and resp.header('cache-control') != WORKER_CACHE)
+
+
+def fold_dup_auth(answers: list[tuple[str, Resp]]) -> tuple[list[tuple[str, Resp]], str]:
+    """Judge front_rejects' two DUP_AUTH answers together and return (the answers left to hold to the 404, a verdict
+    line). Both the Worker's 404: they stay in the list (the caller holds them to the 404 and to the others). Both
+    Cloudflare's edge 400, identical by norm(): they leave the list. Anything else is a refusal naming the vector, never a
+    body. Every other answer is passed through untouched."""
+    dup = [(label, resp) for label, resp in answers if label in DUP_AUTH]
+    rest = [(label, resp) for label, resp in answers if label not in DUP_AUTH]
+    if sorted(label for label, _ in dup) != sorted(DUP_AUTH):
+        raise Refused('duplicate authorization: the cases sent are not exactly %s' % ', '.join(DUP_AUTH))
+    (la, a), (lb, b) = dup
+    if a.status != b.status:
+        raise Refused('duplicate authorization: "%s" answered %d, "%s" answered %d' % (la, a.status, lb, b.status))
+    if a.status == 404:
+        return answers, "duplicate Authorization: the Worker's 404 for both cases"
+    for label, resp in dup:
+        if not edge_400(resp):
+            raise Refused("%s: status %d, neither the Worker's 404 nor Cloudflare's edge 400 page" % (label, resp.status))
+    all_identical('duplicate authorization', dup)
+    return rest, "duplicate Authorization: Cloudflare's edge 400 for both cases, identical (the Worker never ran)"
+
+
 def front_rejects(client: Client, good_code: str) -> list[tuple[str, Resp]]:
-    """Requests the front answers with the one 404 before any database touch (so they spend no budget)."""
+    """Requests the front answers with the one 404 before any database touch (so they spend no budget). The two DUP_AUTH
+    cases may instead be stopped by Cloudflare's edge before the Worker: fold_dup_auth judges them."""
     ok_auth = ('Authorization', 'FleetInvite ' + good_code)
+    unknown_auth = ('Authorization', 'FleetInvite ' + random_code())
     p = '/v1/kit/900000001/bundle.tar'
     cases = [
         ('POST', 'POST', p, [ok_auth], b''),
@@ -600,7 +647,9 @@ def front_rejects(client: Client, good_code: str) -> list[tuple[str, Resp]]:
         ('forbidden symbol', 'GET', p, [('Authorization', 'FleetInvite 0' + good_code[1:])], None),
         ('wrong scheme', 'GET', p, [('Authorization', 'Bearer ' + good_code)], None),
         ('no authorization', 'GET', p, [], None),
-        ('two authorization headers', 'GET', p, [ok_auth, ok_auth], None),
+        (DUP_AUTH[0], 'GET', p, [ok_auth, ok_auth], None),
+        # the same shape with a code nobody holds: what makes an edge 400 for the pair acceptable is that it is identical
+        (DUP_AUTH[1], 'GET', p, [unknown_auth, unknown_auth], None),
         ('root', 'GET', '/', [], None),
         ('v1 kit root', 'GET', '/v1/kit/', [ok_auth], None),
         ('robots', 'GET', '/robots.txt', [], None),
@@ -771,7 +820,8 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
         admin_json('revoke', admin.call('gateway', 'DELETE', '/_k/invite/%s' % ref_r), 200)
         gate_404('revoked', get_kit(client, s1, 'gateway.json', code_r))
         vector('front rejects')
-        for label, resp in front_rejects(client, code_w):
+        fronts, m['dup_auth'] = fold_dup_auth(front_rejects(client, code_w))
+        for label, resp in fronts:
             expect(label, resp, 404)
             seen404.append((label, resp))
 
@@ -832,6 +882,7 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
     return [
         'kit-deploy staging replay: %d vectors passed' % vectors,
         '  404 answers compared: %d, identical' % len(seen404),
+        '  ' + m['dup_auth'],
         '  429 after %d failures' % m['b429_after'],
         '  (a) client cuts: %d, count restored: %d' % (m['a_cuts'], m['a_restored']),
         '  (b) not measurable over HTTP (needs an isolate restart)',
@@ -878,7 +929,7 @@ def _cleanup(admin: Admin, refs: list[str], log) -> None:
 def run_probe(client: Client, *, log=say) -> list[str]:
     """Hostile requests at production: every answer must be the same bytes (date and cf-ray aside). At most
     PROBE_MAX_FAILURES of them reach the gate (each spends one of this source's 30 an hour); the rest are shapes the front
-    answers without touching it."""
+    answers without touching it. The duplicate-Authorization pair is judged by fold_dup_auth (run 38102844541)."""
     code = random_code()
     spent = 0
     answers: list[tuple[str, Resp]] = []
@@ -894,7 +945,8 @@ def run_probe(client: Client, *, log=say) -> list[str]:
     for label, serial, name, extra in gate_cases:
         spent += 1
         answers.append((label, get_kit(client, serial, name, random_code(), extra)))
-    answers.extend(front_rejects(client, code))
+    fronts, dup_auth = fold_dup_auth(front_rejects(client, code))
+    answers.extend(fronts)
     for label, resp in answers:
         if resp.status in (429, 503):
             raise Refused('probe: "%s" answered %d' % (label, resp.status))
@@ -905,6 +957,7 @@ def run_probe(client: Client, *, log=say) -> list[str]:
     return [
         'kit-deploy production probe: %d answers, byte-identical, %d reached the gate' % (len(answers), spent),
         '  wall clock ms: p50 %d, max %d' % (statistics.median(ms), max(ms)),
+        '  ' + dup_auth,
     ]
 
 
