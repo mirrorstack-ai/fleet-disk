@@ -111,6 +111,11 @@ def through_the_real_open(code, call, env):
 
 EDGE_400 = (b'<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n'
             b'<hr><center>cloudflare</center>\r\n</body>\r\n</html>\r\n')
+# Cloudflare's managed robots.txt, as run 38107708369's probes saw its head (the measured page is 1248 bytes)
+MANAGED_ROBOTS = (b'# As a condition of accessing this website, you agree to abide by the following\n# content signals:\n#\n'
+                  b'# search: building a search index and providing search results.\n# ai-input: inputting content into AI models.\n'
+                  b'# ai-train: training or fine-tuning AI models.\n\nUser-agent: *\nContent-Signal: search=yes,ai-train=no\n'
+                  b'Allow: /\n')
 
 
 class FakeKit:
@@ -129,6 +134,7 @@ class FakeKit:
         self.fails = 0
         self.per_source = flags.get('per_source', 30)
         self.gate_failures = 0
+        self.robots_fetches = 0
 
     def now(self) -> int:
         return int(time.time() * 1000)
@@ -188,6 +194,45 @@ def make_handler(kit: FakeKit):
             self.end_headers()
             self.wfile.write(body)
 
+        def send_robots(self, body=MANAGED_ROBOTS, status=200):
+            # Cloudflare's managed robots.txt: an edge page with the Worker's own cache-control, as the probes measured it
+            self.send_response_only(status)
+            self.send_header('Server', 'cloudflare')
+            self.send_header('Date', self.date_time_string())
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store, no-transform')
+            self.send_header('CF-RAY', os.urandom(8).hex())
+            self.end_headers()
+            self.wfile.write(body)
+
+        def robots(self, mode) -> bool:
+            """kit.flags['robots']: how the edge answers /robots.txt. True = answered (else the Worker's 404 follows)."""
+            with kit.lock:
+                kit.robots_fetches += 1
+                first = kit.robots_fetches % 2 == 1
+            if mode == 'managed':
+                self.send_robots()
+            elif mode == 'mixed':                                # the managed page once, the Worker's 404 the other time
+                if not first:
+                    return False
+                self.send_robots()
+            elif mode == 'hello':                                # a dashboard placeholder, not the managed page
+                self.send_robots(b'Hello World!')
+            elif mode == 'no_marker':                            # the page without its first line
+                self.send_robots(MANAGED_ROBOTS.split(b'\n', 1)[1])
+            elif mode == 'no_signals':                           # the first line, but no content signals anywhere
+                self.send_robots(MANAGED_ROBOTS.split(b'\n', 1)[0] + b'\nUser-agent: *\nAllow: /\n')
+            elif mode == 'big':
+                self.send_robots(MANAGED_ROBOTS + b'#' * (64 * 1024))
+            elif mode == 'differ':                               # the managed page, one byte other on the second fetch
+                self.send_robots(MANAGED_ROBOTS if first else MANAGED_ROBOTS.replace(b'Allow', b'allow'))
+            elif mode == 'edge_400':                             # the duplicate-Authorization page on robots
+                self.send_edge_400()
+            else:
+                return False
+            return True
+
         def dup_auth(self, mode, auths) -> bool:
             """kit.flags['dup_auth']: how the edge (or a wrong Worker) answers two Authorization headers. True = answered."""
             live = any(('FleetInvite ' + i['code']) == auths[0] for i in kit.invites.values())
@@ -219,8 +264,12 @@ def make_handler(kit: FakeKit):
 
         def handle_any(self):
             path = self.path
-            if kit.flags.get('edge_robots') and path == '/robots.txt':   # the edge page on a case that is not DUP_AUTH
+            if path == kit.flags.get('edge_400_on'):             # the edge 400 on a label that is not DUP_AUTH
                 return self.send_edge_400()
+            if path == kit.flags.get('managed_robots_on'):       # the managed robots page on a label that is not robots
+                return self.send_robots()
+            if path == '/robots.txt' and self.robots(kit.flags.get('robots')):
+                return
             dup = self.headers.get_all('Authorization') or []
             if len(dup) == 2 and self.dup_auth(kit.flags.get('dup_auth'), dup):
                 return
@@ -1113,6 +1162,7 @@ class OverHttp(unittest.TestCase):
         self.assertEqual(kit.fails, 30)
         _, lines = self.replay()
         self.assertIn("duplicate Authorization: the Worker's 404 for both cases", '\n'.join(lines))
+        self.assertIn("robots: the Worker's 404 for both fetches (robots; robots, second fetch)", '\n'.join(lines))
 
     def test_the_replay_refuses_any_other_answer_to_the_duplicate_authorization_pair(self):
         for mode, fragment in (('edge_live_only', 'answered 400'),                     # mixed 400 / 404
@@ -1137,8 +1187,41 @@ class OverHttp(unittest.TestCase):
             self.assertNotIn('Bad Request', str(why.exception))                       # a refusal never carries a body
 
     def test_only_the_duplicate_authorization_cases_may_take_the_edge_400(self):
-        self.refused('robots: status 400, expected 404', edge_robots=True)
-        self.refused('robots: status 400, expected 404', edge_robots=True, dup_auth='edge')
+        self.refused('root: status 400, expected 404', edge_400_on='/')
+        self.refused('root: status 400, expected 404', edge_400_on='/', dup_auth='edge')
+        self.refused("robots: status 400, neither the Worker's 404 nor Cloudflare's managed robots.txt page (lacks status, "
+                     "content-type, marker, content signals;", robots='edge_400')
+
+    def test_the_replay_takes_cloudflares_managed_robots_txt_when_both_fetches_are_identical(self):
+        kit, lines = self.replay(robots='managed')
+        text = '\n'.join(lines)
+        self.assertIn("robots: Cloudflare's managed robots.txt for both fetches, identical (robots; robots, second fetch)",
+                      text)
+        self.assertIn("duplicate Authorization: the Worker's 404 for both cases", text)
+        self.assertEqual(kit.robots_fetches, 2)
+        self.assertEqual(kit.fails, 30)
+        _, lines = self.replay(robots='managed', dup_auth='edge')        # both rows on their edge pages, one line each
+        text = '\n'.join(lines)
+        self.assertIn("duplicate Authorization: Cloudflare's edge 400 for both cases, identical", text)
+        self.assertIn("robots: Cloudflare's managed robots.txt for both fetches, identical", text)
+
+    def test_the_replay_refuses_any_other_robots_answer_and_names_what_is_missing_never_the_body(self):
+        for mode, fragment in (('mixed', 'robots: "robots" answered 200, "robots, second fetch" answered 404'),
+                               ('hello', "robots: status 200, neither the Worker's 404 nor Cloudflare's managed robots.txt "
+                                         "page (lacks marker, content signals; server=cloudflare"),
+                               ('no_marker', 'page (lacks marker; '),
+                               ('no_signals', 'page (lacks content signals; '),
+                               ('big', 'page (lacks size; '),
+                               ('differ', 'robots: "robots, second fetch" differs from "robots": body differs')):
+            with self.subTest(mode=mode), self.assertRaises(kc.Refused) as why:
+                self.replay(robots=mode)
+            self.assertIn(fragment, str(why.exception))
+            for body in (b'Hello World!', b'content signals:', b'User-agent', b'condition of accessing'):
+                self.assertNotIn(body.decode(), str(why.exception))                    # a refusal never carries a body
+
+    def test_the_managed_robots_page_on_another_label_is_refused(self):
+        self.refused('root: status 200, expected 404', managed_robots_on='/')
+        self.refused('root: status 200, expected 404', managed_robots_on='/', robots='managed')
 
     def test_the_replay_refuses_a_worker_without_the_upload_key(self):
         pubs = dict(self.pubs, upload='')
@@ -1161,7 +1244,23 @@ class OverHttp(unittest.TestCase):
         with Served(kit) as base:
             lines = kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
         self.assertIn("Cloudflare's edge 400 for both cases, identical", '\n'.join(lines))
-        for flags, fragment in (({'dup_auth': 'json400'}, "neither the Worker's 404"), ({'edge_robots': True}, 'differs')):
+        for flags, fragment in (({'dup_auth': 'json400'}, "neither the Worker's 404"), ({'edge_400_on': '/'}, 'differs')):
+            kit = FakeKit(self.pubs, **flags)
+            with Served(kit) as base, self.assertRaises(kc.Refused) as why:
+                kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
+            self.assertIn(fragment, str(why.exception))
+
+    def test_the_probe_takes_the_same_robots_rows_as_the_replay(self):
+        for robots, line in ((None, "robots: the Worker's 404 for both fetches"),
+                             ('managed', "robots: Cloudflare's managed robots.txt for both fetches, identical")):
+            kit = FakeKit(self.pubs, **({'robots': robots} if robots else {}))
+            with Served(kit) as base:
+                lines = kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
+            self.assertIn(line, '\n'.join(lines))
+            self.assertIn("duplicate Authorization: the Worker's 404 for both cases", '\n'.join(lines))
+            self.assertEqual(kit.gate_failures, 5)
+        for flags, fragment in (({'robots': 'hello'}, 'lacks marker, content signals'), ({'robots': 'mixed'}, 'answered 404'),
+                                ({'robots': 'differ'}, 'body differs'), ({'managed_robots_on': '/'}, 'differs')):
             kit = FakeKit(self.pubs, **flags)
             with Served(kit) as base, self.assertRaises(kc.Refused) as why:
                 kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
@@ -1224,8 +1323,29 @@ class FrontRejects(unittest.TestCase):
         page = kc.Resp(400, [('server', 'cloudflare'), ('content-type', 'text/html')], b'400 Bad Request', 1)
         for labels in ((), kc.DUP_AUTH[:1], kc.DUP_AUTH[1:], kc.DUP_AUTH + kc.DUP_AUTH[:1], kc.DUP_AUTH[:1] * 2):
             with self.subTest(labels=labels), self.assertRaises(kc.Refused) as why:
-                kc.fold_dup_auth([('root', page)] + [(label, page) for label in labels])
+                kc.fold_edge([('root', page)] + [(label, page) for label in labels + kc.ROBOTS])
             self.assertIn('not exactly', str(why.exception))
+
+    def test_managed_robots_is_only_cloudflares_page(self):
+        page = kc.Resp(200, [('server', 'cloudflare'), ('content-type', 'text/plain; charset=utf-8')], MANAGED_ROBOTS, 1)
+        self.assertEqual(kc.managed_robots_misses(page), [])
+        for change, misses in (({'status': 404}, ['status']), ({'server': 'nginx'}, ['server']),
+                               ({'content-type': 'text/html'}, ['content-type']),
+                               ({'body': MANAGED_ROBOTS.upper()}, ['marker']),                 # signals case-insensitive
+                               ({'body': b'Hello World!'}, ['marker', 'content signals']),
+                               ({'body': MANAGED_ROBOTS + b'#' * 65536}, ['size'])):
+            hdrs = dict(page.headers)
+            hdrs.update({k: v for k, v in change.items() if k not in ('status', 'body')})
+            r = kc.Resp(change.get('status', 200), list(hdrs.items()), change.get('body', page.body), 1)
+            self.assertEqual(kc.managed_robots_misses(r), misses, change)
+
+    def test_the_edge_table_is_the_two_rows_and_both_robots_fetches_are_sent(self):
+        self.assertEqual(kc.EDGE_OWNED, {kc.DUP_AUTH[0]: kc.EDGE_400_PAGE, kc.DUP_AUTH[1]: kc.EDGE_400_PAGE,
+                                         'robots': kc.MANAGED_ROBOTS, 'robots, second fetch': kc.MANAGED_ROBOTS})
+        rec = self.Recorder()
+        answers = kc.front_rejects(rec, '2345678923')
+        self.assertEqual([path for label, path in answers if label in kc.ROBOTS], ['/robots.txt', '/robots.txt'])
+        self.assertTrue(set(kc.EDGE_OWNED) <= {label for label, _ in answers})
 
     def test_the_lowercase_case_is_always_a_malformed_code_even_for_an_all_digit_code(self):
         class Recorder:

@@ -38,12 +38,18 @@ plus the `openssl` binary (3.x: Ed25519 with -rawin) for the throwaway admin key
                       gzip, Range, the admin rules. It makes its own invites and cleans them up.
   probe URL           the hostile probe against PRODUCTION: at most 5 well-formed failures, every answer byte-identical
                       to the first apart from date and cf-ray, one of them with Accept-Encoding: gzip.
-                      In both, the two duplicate-Authorization requests are the one exception: they may both be a page
-                      shaped like Cloudflare's edge 400 instead of the 404, identical to each other. The replay sends
-                      them for gateway.json, which its live code still opens, so the pair is live against unknown; the
-                      probe has no live code, so its pair is unknown against unknown. A staging probe (the one behind
-                      run 38102844541) saw the edge page for two Authorization headers: the same page for a live and an
-                      unknown code tells nothing, and the replay's 429 count shows that it spent no budget.
+                      In both, the EDGE_OWNED front rejects are the exception, by one table (fold_edge): each row may be
+                      the Worker's 404 or Cloudflare's page for it, the same for every label of the row and identical.
+                      (1) The two duplicate-Authorization requests may both be a page shaped like Cloudflare's edge 400.
+                      The replay sends them for gateway.json, which its live code still opens, so the pair is live
+                      against unknown; the probe has no live code, so its pair is unknown against unknown. A staging
+                      probe (the one behind run 38102844541) saw the edge page for two Authorization headers: the same
+                      page for a live and an unknown code tells nothing, and the replay's 429 count shows that it spent
+                      no budget. (2) Two fetches of /robots.txt may both be Cloudflare's managed robots.txt (run
+                      38107708369 and the probes after it: an account-level edge feature in front of the Worker's 404);
+                      it carries no code, so two identical fetches say nothing about an invite. The owner may switch it
+                      off (AI Crawl Control) to get the Worker's 404 back; both answers pass. Each summary prints one
+                      line per row: which labels, which answer.
 
 Nothing here prints an invite code, a key, a token or a response body; it prints vector names, statuses and numbers.
 Exit 0 passed, 1 refused (the reason is the last line), 2 usage.
@@ -70,6 +76,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Callable, NamedTuple
 
 ALPHABET = '23456789CFGHJMPQRVWX'      # the invite alphabet (N02): 10 symbols of it
 NOT_FOUND = b'not found\n'
@@ -589,7 +596,12 @@ def get_kit(client: Client, serial, name: str, code: str, extra=()) -> Resp:
     return client.request('GET', '/v1/kit/%s/%s' % (serial, name), [('Authorization', 'FleetInvite ' + code)] + list(extra))
 
 
-# The two duplicate-Authorization cases: one with a live code, one with a code nobody holds. Measured, kit-deploy run
+# Edge-owned answers: front-reject requests that Cloudflare's edge may answer in front of the Worker, and the page it
+# answers with. Every other front reject must be the Worker's 404; these may be the Worker's 404 (held to it exactly as the
+# others) or the one edge page their row names, the same for every label of the row and identical by norm() (fold_edge).
+# An edge page on any label not in EDGE_OWNED is held to the 404 and refuses.
+#
+# (1) The two duplicate-Authorization cases: one with a live code, one with a code nobody holds. Measured, kit-deploy run
 # 38102844541 (release 4830f2a): the replay refused "two authorization headers: status 400, expected 404", and a probe of
 # the staging Worker with a fake code answered ONE Authorization header with the Worker's 404 (text/plain, 10 bytes,
 # cache-control no-store, no-transform, body "not found\n") and TWO identical ones with Cloudflare's own edge page (status
@@ -598,10 +610,27 @@ def get_kit(client: Client, serial, name: str, code: str, extra=()) -> Resp:
 # tells a live invite from a dead one; an answer that is byte-identical for a live and an unknown code tells nothing either.
 # That the pair spent no budget is not read off the page: the replay's 429 count (served != left) holds it. The live case
 # asks for gateway.json, which the replay's live code still opens after its bundle.tar cap is spent, so a front that took
-# the first header would answer 200 there and the pair would differ. So the pair is taken as the Worker's 404 for both or
-# the identical edge-shaped 400 for both, and nothing else (fold_dup_auth).
+# the first header would answer 200 there and the pair would differ.
+#
+# (2) /robots.txt, fetched twice. Measured, kit-deploy run 38107708369 (release af2f722): the replay passed every vector up
+# to the front rejects, the duplicate-Authorization pair included, then refused "robots: status 200, expected 404". The
+# coordinator's probes of fleet-kit-staging.mirrorstack-fleet.workers.dev then: every other front-reject path (POST, PUT,
+# no auth, Bearer, /, /v1/kit/, /_k/state unsigned and zero-signature, PUT /_k/file/1/bundle.tar unsigned, /favicon.ico,
+# /.well-known/security.txt) answered the Worker's 404 (text/plain, 10 bytes); GET /robots.txt answered 200, server
+# cloudflare, content-type "text/plain; charset=utf-8", content-length 1248, cache-control "no-store, no-transform", a body
+# starting with ROBOTS_FIRST_LINE and "# content signals:", byte-identical across two fetches. That is Cloudflare's
+# managed robots.txt (the Content Signals Policy), an account-level edge feature that replaces an origin 404 for
+# /robots.txt; kit/worker.js has no 200 outside /v1/kit and no such text, so the page is the edge's. Its cache-control
+# equals the Worker's, so that header proves nothing either way and is not judged. The page carries no code and no serial,
+# so it can say nothing about an invite as long as it is the same page every time: the two fetches must be identical. The
+# owner may switch the managed robots.txt off (Cloudflare dashboard, AI Crawl Control) to get the Worker's 404 back; both
+# answers are accepted. Production (fleet-kit) served only a dashboard "Hello World!" placeholder when this was written;
+# once the pipeline deploys it, its probe meets the same page and takes it by the same row.
 DUP_AUTH = ('two authorization headers', 'two authorization headers, unknown code')
-WORKER_CACHE = 'no-store, no-transform'    # the Worker's own cache-control on every answer; the probed edge page did not carry it
+ROBOTS = ('robots', 'robots, second fetch')
+WORKER_CACHE = 'no-store, no-transform'    # the Worker's own cache-control on every answer; the probed edge 400 did not carry it
+ROBOTS_FIRST_LINE = b'# As a condition of accessing this website, you agree to abide by the following'
+ROBOTS_MAX_BYTES = 64 * 1024               # the measured page is 1248 bytes
 
 
 def edge_400_misses(resp: Resp) -> list[str]:
@@ -627,42 +656,83 @@ def edge_400(resp: Resp) -> bool:
     return not edge_400_misses(resp)
 
 
-def describe(resp: Resp) -> str:
+def managed_robots_misses(resp: Resp) -> list[str]:
+    """The properties of Cloudflare's managed robots.txt (run 38107708369's probes) this answer lacks. The Worker answers
+    nothing but its 404 outside /v1/kit and has no such text, so a 200 with this first line is the edge's page."""
+    body = resp.body or b''
+    misses = []
+    if resp.status != 200:
+        misses.append('status')
+    if resp.header('server') != 'cloudflare':
+        misses.append('server')
+    if not (resp.header('content-type') or '').startswith('text/plain'):
+        misses.append('content-type')
+    if not body.startswith(ROBOTS_FIRST_LINE):
+        misses.append('marker')
+    if b'content signals' not in body.lower():
+        misses.append('content signals')
+    if len(body) > ROBOTS_MAX_BYTES:
+        misses.append('size')
+    return misses
+
+
+class EdgePage(NamedTuple):
+    name: str                               # what a verdict and a refusal call the labels of the row
+    each: str                               # what one of those labels is: a case, a fetch
+    page: str                               # the edge page they may answer with instead of the Worker's 404
+    misses: Callable[[Resp], list[str]]
+    marker: bytes                           # describe() says only whether the answer holds this
+
+
+EDGE_400_PAGE = EdgePage('duplicate Authorization', 'cases', "Cloudflare's edge 400", edge_400_misses, b'400 Bad Request')
+MANAGED_ROBOTS = EdgePage('robots', 'fetches', "Cloudflare's managed robots.txt", managed_robots_misses, ROBOTS_FIRST_LINE)
+EDGE_OWNED = {DUP_AUTH[0]: EDGE_400_PAGE, DUP_AUTH[1]: EDGE_400_PAGE, ROBOTS[0]: MANAGED_ROBOTS, ROBOTS[1]: MANAGED_ROBOTS}
+
+
+def describe(resp: Resp, marker: bytes) -> str:
     """The non-secret head of an answer, for a refusal: never a body, only whether it holds the edge page's marker."""
     def h(name):
         v = resp.header(name)
         return '-' if v is None else v[:60]
     return 'server=%s content-type=%s content-length=%s cache-control=%s marker=%s' % (
         h('server'), h('content-type'), h('content-length'), h('cache-control'),
-        'yes' if b'400 Bad Request' in (resp.body or b'') else 'no')
+        'yes' if marker in (resp.body or b'') else 'no')
 
 
-def fold_dup_auth(answers: list[tuple[str, Resp]]) -> tuple[list[tuple[str, Resp]], str]:
-    """Judge front_rejects' two DUP_AUTH answers together and return (the answers left to hold to the 404, a verdict
-    line). Both the Worker's 404: they stay in the list (the caller holds them to the 404 and to the others). Both
-    Cloudflare's edge 400, identical by norm(): they leave the list. Anything else is a refusal naming the vector, never a
-    body. Every other answer is passed through untouched."""
-    dup = [(label, resp) for label, resp in answers if label in DUP_AUTH]
-    rest = [(label, resp) for label, resp in answers if label not in DUP_AUTH]
-    if sorted(label for label, _ in dup) != sorted(DUP_AUTH):
-        raise Refused('duplicate authorization: the cases sent are not exactly %s' % ', '.join(DUP_AUTH))
-    (la, a), (lb, b) = dup
-    if a.status != b.status:
-        raise Refused('duplicate authorization: "%s" answered %d, "%s" answered %d' % (la, a.status, lb, b.status))
-    if a.status == 404:
-        return answers, "duplicate Authorization: the Worker's 404 for both cases"
-    for label, resp in dup:
-        misses = edge_400_misses(resp)
-        if misses:
-            raise Refused("%s: status %d, neither the Worker's 404 nor Cloudflare's edge 400 page (lacks %s; %s)"
-                          % (label, resp.status, ', '.join(misses), describe(resp)))
-    all_identical('duplicate authorization', dup)
-    return rest, "duplicate Authorization: Cloudflare's edge 400 for both cases, identical"
+def fold_edge(answers: list[tuple[str, Resp]]) -> tuple[list[tuple[str, Resp]], list[str]]:
+    """Judge front_rejects' edge-owned answers, row by row of EDGE_OWNED, and return (the answers left to hold to the 404,
+    one verdict line per row). Every label of a row the Worker's 404: they stay in the list (the caller holds them to the
+    404 and to the others). Every label of a row that row's edge page, identical by norm(): they leave the list. Anything
+    else (a mix, another page, differing answers) is a refusal naming the row and what is missing, never a body. Every
+    answer whose label is in no row is passed through untouched."""
+    taken: set[str] = set()
+    verdicts = []
+    for page in dict.fromkeys(EDGE_OWNED.values()):
+        want = [label for label, p in EDGE_OWNED.items() if p is page]
+        group = [(label, resp) for label, resp in answers if label in want]
+        name = page.name.lower()
+        if sorted(label for label, _ in group) != sorted(want):
+            raise Refused('%s: the cases sent are not exactly %s' % (name, ', '.join(want)))
+        if len({resp.status for _, resp in group}) > 1:
+            raise Refused('%s: %s' % (name, ', '.join('"%s" answered %d' % (label, resp.status) for label, resp in group)))
+        labels = '; '.join(want)
+        if group[0][1].status == 404:
+            verdicts.append("%s: the Worker's 404 for both %s (%s)" % (page.name, page.each, labels))
+            continue
+        for label, resp in group:
+            misses = page.misses(resp)
+            if misses:
+                raise Refused("%s: status %d, neither the Worker's 404 nor %s page (lacks %s; %s)"
+                              % (label, resp.status, page.page, ', '.join(misses), describe(resp, page.marker)))
+        all_identical(name, group)
+        taken.update(want)
+        verdicts.append('%s: %s for both %s, identical (%s)' % (page.name, page.page, page.each, labels))
+    return [(label, resp) for label, resp in answers if label not in taken], verdicts
 
 
 def front_rejects(client: Client, good_code: str) -> list[tuple[str, Resp]]:
-    """Requests the front answers with the one 404 before any database touch (so they spend no budget). The two DUP_AUTH
-    cases may instead be stopped by Cloudflare's edge before the Worker: fold_dup_auth judges them."""
+    """Requests the front answers with the one 404 before any database touch (so they spend no budget). The EDGE_OWNED
+    labels may instead be answered by Cloudflare's edge before the Worker: fold_edge judges them."""
     ok_auth = ('Authorization', 'FleetInvite ' + good_code)
     unknown_auth = ('Authorization', 'FleetInvite ' + random_code())
     p = '/v1/kit/900000001/bundle.tar'
@@ -685,7 +755,9 @@ def front_rejects(client: Client, good_code: str) -> list[tuple[str, Resp]]:
         (DUP_AUTH[1], 'GET', g, [unknown_auth, unknown_auth], None),
         ('root', 'GET', '/', [], None),
         ('v1 kit root', 'GET', '/v1/kit/', [ok_auth], None),
-        ('robots', 'GET', '/robots.txt', [], None),
+        # Cloudflare's managed robots.txt may answer here (run 38107708369); two fetches, held identical to each other
+        (ROBOTS[0], 'GET', '/robots.txt', [], None),
+        (ROBOTS[1], 'GET', '/robots.txt', [], None),
         ('admin unsigned state', 'GET', '/_k/state', [], None),
         ('admin unsigned put', 'PUT', '/_k/file/1/bundle.tar', [], b'abc'),
         ('admin zero signature', 'GET', '/_k/state', [('Authorization', 'KitAdmin gateway %d %s' % (int(time.time() * 1000), '0' * 128))], None),
@@ -853,7 +925,7 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
         admin_json('revoke', admin.call('gateway', 'DELETE', '/_k/invite/%s' % ref_r), 200)
         gate_404('revoked', get_kit(client, s1, 'gateway.json', code_r))
         vector('front rejects')
-        fronts, m['dup_auth'] = fold_dup_auth(front_rejects(client, code_w))
+        fronts, m['edge'] = fold_edge(front_rejects(client, code_w))
         for label, resp in fronts:
             expect(label, resp, 404)
             seen404.append((label, resp))
@@ -915,7 +987,7 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
     return [
         'kit-deploy staging replay: %d vectors passed' % vectors,
         '  404 answers compared: %d, identical' % len(seen404),
-        '  ' + m['dup_auth'],
+        *('  ' + line for line in m['edge']),
         '  429 after %d failures' % m['b429_after'],
         '  (a) client cuts: %d, count restored: %d' % (m['a_cuts'], m['a_restored']),
         '  (b) not measurable over HTTP (needs an isolate restart)',
@@ -962,8 +1034,10 @@ def _cleanup(admin: Admin, refs: list[str], log) -> None:
 def run_probe(client: Client, *, log=say) -> list[str]:
     """Hostile requests at production: every answer must be the same bytes (date and cf-ray aside). At most
     PROBE_MAX_FAILURES of them reach the gate (each spends one of this source's 30 an hour); the rest are shapes the front
-    answers without touching it. The duplicate-Authorization pair is judged by fold_dup_auth (run 38102844541); here both
-    of its codes are unknown, so it shows only that two unknown codes get the same answer."""
+    answers without touching it. The EDGE_OWNED answers are judged by fold_edge, by the same table as the replay: the
+    duplicate-Authorization pair (run 38102844541; here both of its codes are unknown, so it shows only that two unknown
+    codes get the same answer) and the two /robots.txt fetches (run 38107708369: Cloudflare's managed robots.txt, or the
+    Worker's 404 once the owner switches that off)."""
     code = random_code()
     spent = 0
     answers: list[tuple[str, Resp]] = []
@@ -979,7 +1053,7 @@ def run_probe(client: Client, *, log=say) -> list[str]:
     for label, serial, name, extra in gate_cases:
         spent += 1
         answers.append((label, get_kit(client, serial, name, random_code(), extra)))
-    fronts, dup_auth = fold_dup_auth(front_rejects(client, code))
+    fronts, edge = fold_edge(front_rejects(client, code))
     answers.extend(fronts)
     for label, resp in answers:
         if resp.status in (429, 503):
@@ -991,7 +1065,7 @@ def run_probe(client: Client, *, log=say) -> list[str]:
     return [
         'kit-deploy production probe: %d answers, byte-identical, %d reached the gate' % (len(answers), spent),
         '  wall clock ms: p50 %d, max %d' % (statistics.median(ms), max(ms)),
-        '  ' + dup_auth,
+        *('  ' + line for line in edge),
     ]
 
 

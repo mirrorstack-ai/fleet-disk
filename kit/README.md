@@ -108,7 +108,9 @@ exact headers and bytes. Its `DIVERGES` list holds any vector the Worker answers
 never weakened); what the hosts do not share is the file's `known_differences`, never asserted. One answer neither host
 gives on the live host: Cloudflare's edge answers a doubled Authorization header with its own 400 page before the Worker
 (the staging probe behind kit-deploy run 38102844541), so the Worker's 404 for it is pinned only here, through the
-harness; the staging replay takes the edge page for that pair (`fold_dup_auth` in `bin/fleet-kit-check.py`). The note
+harness; the staging replay takes the edge page for that pair (`fold_edge` in `bin/fleet-kit-check.py`). Likewise
+Cloudflare's managed robots.txt answers `/robots.txt` with its own 200 page (kit-deploy run 38107708369); the replay and
+the probe take it when two fetches are identical, or the Worker's 404 if the owner switches it off (AI Crawl Control). The note
 lives here, not in `known_differences`, because the vendored file is byte-pinned to the fleet repo and lists kit-serve
 against the Worker, not the edge. To update: copy the
 new file over `vectors/kit_vectors.json`, write the new pin line (`shasum -a 256`, the fleet commit, the path), and
