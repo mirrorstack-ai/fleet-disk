@@ -345,7 +345,9 @@ def make_handler(kit: FakeKit):
             """Version propagation (run 38140164568): a signed call reaching an isolate with the previous run's keys gets
             the fixed 404. flags: admin_404_first=N (the first N signed calls), admin_404_always, flaky_404=[(method,
             path, skip, times)] (after `skip` such calls, the next `times` of them; path None = any path of that method),
-            state_status=S (/_k/state answers S).
+            state_status=S (/_k/state answers S), state_not_json=N (the Nth signed /_k/state call answers a 200 that is
+            not JSON), foreign_404=[(method, path, skip, times, kind)] (as flaky_404, but a 404 that is NOT the Worker's
+            fixed one: kind 'html' = a text/html page, 'bang' = text/plain "not found!\\n").
             Answered = True."""
             self.signed = True
             with kit.lock:
@@ -356,6 +358,20 @@ def make_handler(kit: FakeKit):
                 n = kit.signed_calls
             flaky = any(m == self.command and p in (path, None) and skip < kit.per_target[(m, p)] <= skip + times
                         for m, p, skip, times in kit.flags.get('flaky_404', ()))
+            foreign = next((kind for m, p, skip, times, kind in kit.flags.get('foreign_404', ())
+                            if m == self.command and p in (path, None) and skip < kit.per_target[(m, p)] <= skip + times), None)
+            if foreign:
+                length = int(self.headers.get('Content-Length') or 0)
+                if length:
+                    self.rfile.read(length)
+                if foreign == 'html':
+                    self.send_fixed(404, b'<html><body>404 Not Found</body></html>', 'text/html')
+                else:
+                    self.send_fixed(404, b'not found!\n')
+                return True
+            if path == '/_k/state' and kit.per_target[(self.command, path)] == kit.flags.get('state_not_json'):
+                self.send_fixed(200, b'ok\n')
+                return True
             if n <= kit.flags.get('admin_404_first', 0) or kit.flags.get('admin_404_always') or flaky:
                 length = int(self.headers.get('Content-Length') or 0)
                 if length:
@@ -1194,7 +1210,26 @@ class OverHttp(unittest.TestCase):
         self.assertGreater(int(tries), 1)
 
     def test_readiness_refuses_any_other_status_at_once(self):
-        self.refused(kc.PROPAGATION + ': try 1 answered 503 (1 tries, 0 404s seen,', state_status=503)
+        why = self.refused("readiness: try 1 answered 503, expected 200 or the Worker's fixed 404 (1 tries, 0 404s seen,",
+                           state_status=503)
+        self.assertNotIn(kc.PROPAGATION, str(why))      # a 503 is a Gate or platform fault, not a key in flight
+
+    def test_readiness_spaces_its_tries_and_checks_each_200_is_json(self):
+        rec: list[float] = []
+
+        def sleep(s):
+            rec.append(s)
+            time.sleep(s)
+        # distinct values, so the replay's other sleeps (cut_wait, late, the 503 loop) cannot be mistaken for them
+        run = {'ready_spacing': 0.0011, 'retry_wait': 0.0022, 'sleep': sleep}
+        self.replay(run)
+        self.assertEqual(rec.count(0.0011), 9)          # 10 tries, a wait between each pair, none after the streak
+        self.assertEqual(rec.count(0.0022), 0)
+        rec.clear()
+        self.replay(run, admin_404_first=2)             # 2 404s then 10 200s: a wait after every try but the last
+        self.assertEqual(rec.count(0.0011), 11)
+        # a 200 that is not JSON mid-streak refuses, even though its status is right
+        self.refused('readiness try 5: the reply is not JSON', state_not_json=5)
 
     def test_readiness_runs_before_the_first_upload(self):
         kit = FakeKit(self.pubs, admin_404_always=True)
@@ -1221,6 +1256,36 @@ class OverHttp(unittest.TestCase):
         self.assertIn("fixed 404: 3 (identical re-upload, identical re-upload, identical re-upload)", '\n'.join(lines))
         self.refused("identical re-upload: status 404 (the Worker's fixed 404) on 4 tries, expected 200; " + kc.PROPAGATION,
                      flaky_404=[('PUT', '/_k/file/900000001/bundle.tar', 1, 4)])
+
+    def test_each_retry_waits_retry_wait(self):
+        rec: list[float] = []
+
+        def sleep(s):
+            rec.append(s)
+            time.sleep(s)
+        run = {'ready_spacing': 0.0011, 'retry_wait': 0.0022, 'sleep': sleep}
+        self.replay(run, flaky_404=[('PUT', '/_k/file/900000001/bundle.tar', 1, 2)])
+        self.assertEqual(rec.count(0.0022), 2)          # one wait per counted retry
+        rec.clear()
+        with self.assertRaises(kc.Refused):
+            self.replay(run, flaky_404=[('PUT', '/_k/file/900000001/bundle.tar', 1, 4)])
+        self.assertEqual(rec.count(0.0022), 3)          # retry_max waits, none after the last refused try
+
+    def test_only_the_workers_exact_404_is_retried(self):
+        # a 404 to a signed 2xx call that is not kit/worker.js fixed(404) is not propagation: one try, no retry, refused
+        for kind in ('html', 'bang'):
+            with self.subTest(kind=kind):
+                with self.assertRaises(kc.Refused) as why:
+                    self.replay(foreign_404=[('PUT', '/_k/file/900000001/bundle.tar', 1, 1, kind)])
+                self.assertIn('identical re-upload: status 404, expected 200', str(why.exception))
+                self.assertNotIn(kc.PROPAGATION, str(why.exception))
+        kit = FakeKit(self.pubs, foreign_404=[('PUT', '/_k/file/900000001/bundle.tar', 1, 1, 'bang')])
+        with Served(kit) as base, self.assertRaises(kc.Refused):
+            client = kc.Client(base, allow_http=True)
+            kc.run_replay(client, kc.Admin(client, self.gate_dir), big_mib=1, ready_spacing=0.0, retry_wait=0.0,
+                          log=lambda *_: None)
+        tss = [ts for _, m, p, ts, _ in kit.admin_log if (m, p) == ('PUT', '/_k/file/900000001/bundle.tar')]
+        self.assertEqual(len(tss), 2)                   # small, then the re-upload once: never sent again
 
     def test_every_2xx_admin_call_takes_the_retry_and_the_replay_keeps_its_ts(self):
         targets = [('upload small', 'PUT', '/_k/file/900000001/bundle.tar', 0), ('upload big', 'PUT', '/_k/file/900000002/bundle.tar', 0),

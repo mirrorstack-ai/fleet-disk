@@ -814,6 +814,10 @@ def front_rejects(client: Client, good_code: str) -> list[tuple[str, Resp]]:
 #       row and then serves it; the count says how often that happened. Calls that expect a non-2xx (stale ts -> 404,
 #       wrong role -> 403, replay -> 409, overwrite -> 409, wrong bytes -> 422, rollback -> 409, the ceilings -> 422), the
 #       public /v1/kit requests and the front rejects get exactly one try.
+#   Not covered (possible, never observed): INVITE_PEPPER is its own version after the vars deploy, and each isolate tags
+#   invite codes with its own pepper, so an old isolate can pass readiness and still 404 a public GET for an invite another
+#   isolate made, or give one of the single-try calls above the fixed 404. A refusal of that shape after this change is
+#   that residual, not "the fix did not apply"; its answer would be a pepper-aware readiness (make an invite, read it back).
 READY_STREAK = 10
 READY_SPACING = 1.0         # seconds between readiness tries
 READY_TIMEOUT = 120.0       # seconds for the whole streak
@@ -845,8 +849,9 @@ def wait_ready(admin: Admin, *, streak: int = READY_STREAK, spacing: float = REA
             run += 1
             best = max(best, run)
         else:
-            raise Refused('%s: try %d answered %d (%d tries, %d 404s seen, %.1f s)'
-                          % (PROPAGATION, tries, r.status, tries, seen404, clock() - t0))
+            # not a propagation symptom (only the fixed 404 is one): name the status, blame nothing
+            raise Refused("readiness: try %d answered %d, expected 200 or the Worker's fixed 404 (%d tries, %d 404s seen, "
+                          "%.1f s)" % (tries, r.status, tries, seen404, clock() - t0))
         if run >= streak:
             return r, ('readiness: %d consecutive signed 200s from /_k/state after %d tries, %d 404s seen, %.1f s'
                        % (streak, tries, seen404, clock() - t0))
