@@ -829,7 +829,10 @@ class SettingsOff(unittest.TestCase):
     def test_the_request_is_a_patch_of_exactly_the_off_record_as_json(self):
         rc, out, sent = self.run_cli((200, {'success': True, 'result': self.ECHO}))
         self.assertEqual(rc, 0, out)
-        self.assertIn('settings-off of fleet-kit-staging: observability off', out)
+        # the success line claims only what the echo measures (an accepted PATCH), never "off ... echoed back"
+        self.assertIn('settings-off of fleet-kit-staging: PATCH accepted', out)
+        self.assertIn("the settings gate's GA read is the proof", out)
+        self.assertNotIn('echoed back', out)
         self.assertEqual(len(sent), 1)
         req = sent[0]
         self.assertEqual(req.get_method(), 'PATCH')
@@ -1165,6 +1168,10 @@ def jobs(text: str) -> dict[str, str]:
     return {parts[i]: parts[i + 1] for i in range(1, len(parts), 2)}
 
 
+# `wrangler secret put` is deliberately not counted: staging's throwaway pepper sits between settings-off and its gate
+# (the order test pins it there), and whether it makes a new Worker version is not measured. The gate does not rest on
+# this order for safety: its GA worker read must itself be an explicit off object. Do not widen this to `secret put`
+# without moving the pepper step.
 DEPLOYS = re.compile(r'wrangler (?:deploy|versions (?:deploy|upload)|rollback)\b')
 
 
@@ -1280,10 +1287,19 @@ class Workflow(unittest.TestCase):
         self.assertIn('settings-off fleet-kit\n', d)
 
     def test_each_settings_gate_runs_after_its_own_off_write_with_no_deploy_between(self):
-        # the gate accepts script-settings' null only as the stored form of the off record settings-off just wrote
-        # (run 38099981335); a deploy between the write and the read would make it a null we did not write
+        # the stated protocol: settings-off, then its gate, no deploy between. script-settings answers null whether or
+        # not the off record was written (run 38095547741 read null before any off write; 38099981335 echoed null right
+        # after it), so this order does not make the null proof of anything: the gate's GA worker read carries the proof.
+        # On staging the throwaway pepper's `wrangler secret put` is the one tolerated step between the two (DEPLOYS
+        # does not count it; the order test above pins the pepper there); assert it is the only one.
         d = jobs(CODE)['deploy']
         self.assertEqual(gate_faults(d), [])
+        steps0 = re.split(r'(?m)^(?=      - )', d)
+        i_off = next(i for i, s in enumerate(steps0) if '- name: Observability off, staging\n' in s)
+        i_gate = next(i for i, s in enumerate(steps0) if '- name: Settings gate, staging\n' in s)
+        between = steps0[i_off + 1:i_gate]
+        self.assertEqual(len(between), 1, between)
+        self.assertIn('wrangler secret put INVITE_PEPPER --env staging', between[0])
         # positive proof the check bites, on crafted orders of the same steps
         steps = re.split(r'(?m)^(?=      - )', d)
         at = lambda name: next(i for i, s in enumerate(steps) if '- name: ' + name + '\n' in s)  # noqa: E731
