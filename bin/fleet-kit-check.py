@@ -620,7 +620,8 @@ def get_kit(client: Client, serial, name: str, code: str, extra=()) -> Resp:
 # cloudflare, content-type "text/plain; charset=utf-8", content-length 1248, cache-control "no-store, no-transform", a body
 # starting with ROBOTS_FIRST_LINE and "# content signals:", byte-identical across two fetches. That is Cloudflare's
 # managed robots.txt (the Content Signals Policy), an account-level edge feature that replaces an origin 404 for
-# /robots.txt; kit/worker.js has no 200 outside /v1/kit and no such text, so the page is the edge's. Its cache-control
+# /robots.txt. For /robots.txt the Worker has no answer but its front-check 404 (publicRoute; /_k/ is its only other route
+# and /robots.txt is not under it; kit/worker.test.js pins that 404), so the page is the edge's. Its cache-control
 # equals the Worker's, so that header proves nothing either way and is not judged. The page carries no code and no serial,
 # so it can say nothing about an invite as long as it is the same page every time: the two fetches must be identical. The
 # owner may switch the managed robots.txt off (Cloudflare dashboard, AI Crawl Control) to get the Worker's 404 back; both
@@ -630,7 +631,7 @@ DUP_AUTH = ('two authorization headers', 'two authorization headers, unknown cod
 ROBOTS = ('robots', 'robots, second fetch')
 WORKER_CACHE = 'no-store, no-transform'    # the Worker's own cache-control on every answer; the probed edge 400 did not carry it
 ROBOTS_FIRST_LINE = b'# As a condition of accessing this website, you agree to abide by the following'
-ROBOTS_MAX_BYTES = 64 * 1024               # the measured page is 1248 bytes
+ROBOTS_MAX_BYTES = 4 * 1024                # the measured page is 1248 bytes; room for a policy update, little else
 
 
 def edge_400_misses(resp: Resp) -> list[str]:
@@ -657,8 +658,10 @@ def edge_400(resp: Resp) -> bool:
 
 
 def managed_robots_misses(resp: Resp) -> list[str]:
-    """The properties of Cloudflare's managed robots.txt (run 38107708369's probes) this answer lacks. The Worker answers
-    nothing but its 404 outside /v1/kit and has no such text, so a 200 with this first line is the edge's page."""
+    """The properties of Cloudflare's managed robots.txt (run 38107708369's probes) this answer lacks (empty: it has the
+    page's shape). The shape is not proof of origin: bytes after the first line are not judged beyond the size cap. What
+    rules the Worker out is its source: for /robots.txt it answers only its front-check 404 (kit/worker.test.js pins it).
+    The headers check_fixed_answer refuses on every fixed answer are refused here too."""
     body = resp.body or b''
     misses = []
     if resp.status != 200:
@@ -673,6 +676,7 @@ def managed_robots_misses(resp: Resp) -> list[str]:
         misses.append('content signals')
     if len(body) > ROBOTS_MAX_BYTES:
         misses.append('size')
+    misses.extend('no %s' % h for h in ('content-encoding', 'location', 'set-cookie') if resp.header(h) is not None)
     return misses
 
 

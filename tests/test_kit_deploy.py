@@ -1333,11 +1333,30 @@ class FrontRejects(unittest.TestCase):
                                ({'content-type': 'text/html'}, ['content-type']),
                                ({'body': MANAGED_ROBOTS.upper()}, ['marker']),                 # signals case-insensitive
                                ({'body': b'Hello World!'}, ['marker', 'content signals']),
-                               ({'body': MANAGED_ROBOTS + b'#' * 65536}, ['size'])):
+                               ({'body': MANAGED_ROBOTS + b'#' * 65536}, ['size']),
+                               # trailing bytes past the cap (the measured page is 1248 bytes, the cap 4 KiB)
+                               ({'body': MANAGED_ROBOTS + b'User-agent: *\nDisallow: /x\n' + b'#' * 4096}, ['size']),
+                               ({'location': 'https://evil/'}, ['no location']),
+                               ({'set-cookie': 'a=1'}, ['no set-cookie']),
+                               ({'content-encoding': 'gzip'}, ['no content-encoding'])):
             hdrs = dict(page.headers)
             hdrs.update({k: v for k, v in change.items() if k not in ('status', 'body')})
             r = kc.Resp(change.get('status', 200), list(hdrs.items()), change.get('body', page.body), 1)
             self.assertEqual(kc.managed_robots_misses(r), misses, change)
+
+    def test_the_managed_robots_page_is_refused_on_the_duplicate_authorization_rows(self):
+        page = kc.Resp(200, [('server', 'cloudflare'), ('content-type', 'text/plain; charset=utf-8')], MANAGED_ROBOTS, 1)
+        nf = kc.Resp(404, [('content-type', 'text/plain')], b'not found\n', 1)
+        with self.assertRaises(kc.Refused) as why:
+            kc.fold_edge([('root', nf)] + [(label, page) for label in kc.DUP_AUTH] + [(label, nf) for label in kc.ROBOTS])
+        self.assertIn("neither the Worker's 404 nor Cloudflare's edge 400 page", str(why.exception))
+
+    def test_the_robots_row_refuses_the_worker_404_then_the_managed_page(self):
+        page = kc.Resp(200, [('server', 'cloudflare'), ('content-type', 'text/plain; charset=utf-8')], MANAGED_ROBOTS, 1)
+        nf = kc.Resp(404, [('content-type', 'text/plain')], b'not found\n', 1)
+        with self.assertRaises(kc.Refused) as why:
+            kc.fold_edge([('root', nf)] + [(label, nf) for label in kc.DUP_AUTH] + [(kc.ROBOTS[0], nf), (kc.ROBOTS[1], page)])
+        self.assertIn('"robots" answered 404, "robots, second fetch" answered 200', str(why.exception))
 
     def test_the_edge_table_is_the_two_rows_and_both_robots_fetches_are_sent(self):
         self.assertEqual(kc.EDGE_OWNED, {kc.DUP_AUTH[0]: kc.EDGE_400_PAGE, kc.DUP_AUTH[1]: kc.EDGE_400_PAGE,
