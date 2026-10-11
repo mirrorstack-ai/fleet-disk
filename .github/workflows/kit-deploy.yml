@@ -19,6 +19,8 @@
 # the bucket, no S3 token). The deploy token has no R2 permission, so the settings gate cannot read them. The replay's
 # measurements (b) isolate restart and (d) 100000 requests a day cannot be taken over HTTP and are printed as unmeasured.
 # The pepper is made only on exit 10 of has-secret ("the list parsed and lacks the name"); every other code refuses.
+# Right after each deploy, `settings-off` PATCHes the script-settings record to observability/Logpush/tail off and checks
+# the echo; the settings gate then reads it back from three endpoints (settings, script-settings, the GA worker read).
 name: kit-deploy
 on:
   push:
@@ -89,6 +91,15 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
         run: npx --no-install wrangler deploy --env staging --var "KIT_GW_PUB:$KIT_GW_PUB" --var "KIT_UP_PUB:$KIT_UP_PUB"
+      # wrangler's first deploy (PUT path) never PATCHes the script-level settings record and a later deploy's PATCH of it
+      # swallows errors; run 38095547741 (staging's second deploy) read observability: null back from an endpoint the old
+      # gate did not name. Write the off record explicitly and check its echo; whether that changes the read-back is
+      # measured by the settings gate, not assumed.
+      - name: Observability off, staging
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: python3 bin/fleet-kit-check.py settings-off fleet-kit-staging
       - name: Set the staging INVITE_PEPPER (throwaway, new every run)
         working-directory: kit
         env:
@@ -127,6 +138,11 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
         run: npx --no-install wrangler deploy
+      - name: Observability off, production
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: python3 bin/fleet-kit-check.py settings-off fleet-kit
       - name: Settings gate, production
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

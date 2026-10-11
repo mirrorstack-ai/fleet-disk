@@ -8,11 +8,23 @@ plus the `openssl` binary (3.x: Ed25519 with -rawin) for the throwaway admin key
                       the one thing that writes an invite code somewhere; tests and test stand-ins are not scanned).
   has-secret NAME     stdin = `wrangler secret list --format json`. Exit 0 present, 10 absent (the list parsed and lacks the
                       name; nothing else ever returns 10), 2 anything else (unreadable, a crash, a bad name). Names only.
+  settings-off WORKER write the off record explicitly: PATCH .../workers/scripts/WORKER/script-settings with the JSON
+                      {observability: OBSERVABILITY_OFF, logpush: false, tail_consumers: []} (OBSERVABILITY_OFF is
+                      kit/wrangler.jsonc's block, a test holds them equal), and refuse unless the API answers 200, success
+                      true, and echoes each of the three keys back off (null or a missing key is a refusal, named). Why a
+                      deploy alone is not trusted: wrangler 4.149's first deploy of a Worker (the kit has a DO migration)
+                      takes the PUT path and never PATCHes script-settings, and a later deploy's PATCH of it swallows every
+                      error. Staging had been deployed before (run 38076806590); run 38095547741 then read
+                      `observability: null` from an endpoint the old unlabelled gate did not name (script-settings, by the
+                      schema: only it may answer null). What null means is undocumented, so it is never off. Whether this
+                      write changes what the API answers is not yet measured: the next live run is that measurement.
   settings WORKER     read the Worker's settings back from the Cloudflare API (token and account id from the environment)
-                      and refuse unless each of these is READ BACK, not merely not-seen: observability explicitly off
-                      (nowhere on; a refusal names which keys are on), `tail_consumers` reported as empty, `logpush`
-                      reported as false, workers.dev on, preview URLs off. A key the API does not report is a refusal,
-                      never a pass.
+                      from three endpoints (.../scripts/WORKER/settings, .../scripts/WORKER/script-settings and the GA
+                      .../workers/workers/WORKER) and refuse by judge_settings' rules: script-settings and the GA worker
+                      read must each answer and report observability explicitly off; settings may stay silent on it but
+                      never say anything else; the GA read must report `tail_consumers: []` and `logpush: false`, and any
+                      endpoint that reports either otherwise refuses; workers.dev on, preview URLs off. A refusal names
+                      the endpoint and key paths, never a value. Null is never a report of "off".
   replay URL          the kit-serve vectors over HTTP against the STAGING Worker (admin keys from $KIT_GATE_DIR): identical
                       404 bytes, 429 after 30, the cap, release on a cut stream, floor, expiry, revoke, bad sha, overwrite,
                       gzip, Range, the admin rules. It makes its own invites and cleans them up.
@@ -52,6 +64,14 @@ VARYING = frozenset({'date', 'cf-ray'})  # the only headers that may differ betw
 SECRET_NAME = re.compile(r'[A-Z][A-Z0-9_]{0,63}')
 CF_API = 'https://api.cloudflare.com/client/v4'
 UA = 'fleet-kit-deploy-check/1'
+# kit/wrangler.jsonc's observability block (both envs; a test holds all three equal). settings-off writes exactly this.
+OBSERVABILITY_OFF = {'enabled': False, 'issues': {'enabled': False},
+                     'logs': {'enabled': False, 'invocation_logs': False, 'persist': False},
+                     'traces': {'enabled': False, 'persist': False}}
+SETTINGS_OFF = {'observability': OBSERVABILITY_OFF, 'logpush': False, 'tail_consumers': []}
+# The settings gate's endpoints, by label. script-settings and the GA worker read MUST report an explicit off; settings'
+# schema makes observability optional there, so it may stay silent (but never say anything but off).
+MUST_REPORT_OFF = ('script-settings', 'worker')
 FAILURE_BUDGET_PER_SOURCE = 30          # kit/gate-core.js LIMITS.perSource
 PROBE_MAX_FAILURES = 5                  # the hostile probe may spend at most this much of production's hourly budget
 # Worker sources that ship (everything else in kit/ is a test or a test stand-in).
@@ -146,25 +166,33 @@ def secret_names(text: str) -> set[str]:
     return {x['name'] for x in data}
 
 
-def _enabled_anywhere(node) -> bool:
-    """True if an `enabled: true` sits anywhere under node (observability.logs, .traces, ...). One walker decides."""
-    return bool(_enabled_paths(node))
-
-
-def _enabled_paths(node, prefix='') -> list[str]:
-    """Dotted key paths under node whose `enabled` is true ('enabled', 'logs.enabled', ...). Key names only, no values."""
+def _not_off_paths(node, prefix='') -> list[tuple[str, str]]:
+    """(dotted key path, word) for every `enabled` at any depth under node whose value is not exactly false: 'on' for a
+    literal true, 'not false' for anything else (1, "true", null, an object, a list). Key names and fixed words only."""
     found = []
     if isinstance(node, dict):
         for k, v in node.items():
             path = prefix + ascii(str(k))[1:-1]       # escaped: a key never injects a newline or a log command
-            if k == 'enabled' and v is True:
-                found.append(path)
+            if k == 'enabled':
+                if v is not False:
+                    found.append((path, 'on' if v is True else 'not false'))
             else:
-                found += _enabled_paths(v, path + '.')
+                found += _not_off_paths(v, path + '.')
     elif isinstance(node, list):
         for i, v in enumerate(node):
-            found += _enabled_paths(v, '%s[%d].' % (prefix[:-1], i))
+            found += _not_off_paths(v, '%s[%d].' % (prefix[:-1], i))
     return found
+
+
+def _observability_faults(obs: dict) -> list[tuple[str, str]]:
+    """Why an observability object is not off, as (key path, word): `enabled` missing at the top, any `enabled` not exactly
+    false at any depth, and a present `logs`/`traces` that is not an object or an `issues` that is neither an object nor
+    null (the schema's shapes; a string there cannot be judged off)."""
+    faults = [] if 'enabled' in obs else [('enabled', 'missing')]
+    for key, nullable in (('logs', False), ('traces', False), ('issues', True)):
+        if key in obs and not isinstance(obs[key], dict) and not (nullable and obs[key] is None):
+            faults.append((key, 'not an object'))
+    return faults + _not_off_paths(obs)
 
 
 def _why_observability_on(obs) -> str:
@@ -173,46 +201,74 @@ def _why_observability_on(obs) -> str:
         return 'observability: null'
     if not isinstance(obs, dict):
         return 'observability: not an object (%s)' % type(obs).__name__
-    on = _enabled_paths(obs)
-    if on:
-        shown = ', '.join(p if len(p) <= 80 else p[:77] + '...' for p in on[:8])
-        return 'observability on: ' + shown + (' (+%d more)' % (len(on) - 8) if len(on) > 8 else '')
-    return 'observability.enabled: missing' if 'enabled' not in obs else 'observability.enabled: not false'
+    faults = _observability_faults(obs)
+    if not faults:
+        return 'observability: not off'               # unreachable while _observability_off uses the same faults
+    cut = lambda p: p if len(p) <= 80 else p[:77] + '...'   # noqa: E731
+    shown = faults[:8]
+    on = [cut(p) for p, w in shown if w == 'on']
+    parts = (['observability on: ' + ', '.join(on)] if on else []) + \
+            ['observability.%s: %s' % (cut(p), w) for p, w in shown if w != 'on']
+    return '; '.join(parts) + (' (+%d more)' % (len(faults) - 8) if len(faults) > 8 else '')
 
 
-def judge_settings(blobs: list[dict], subdomain: dict) -> list[str]:
-    """Why these settings are refused ([] = fine). `blobs` are the `result` objects of the settings endpoints that
-    answered. Every guarded key that is reported is held to its value, and each must be reported (a positive read-back) by
-    at least one blob: observability.enabled an explicit false and no `enabled: true` under it (a missing answer is not off:
-    new Workers default to ON; a refusal also names the key paths that are on, never their values),
-    `tail_consumers` an empty list (or an explicit null), `logpush` an explicit false. Absence is never a pass."""
+def _observability_off(obs) -> bool:
+    """The one explicit-off judge (the gate and settings-off's echo both use it): an object whose `enabled` is exactly
+    false, with every `enabled` under it exactly false and logs/traces/issues of the schema's shape. null, a missing
+    `enabled`, a truthy non-boolean anywhere, or anything else is not off."""
+    return isinstance(obs, dict) and not _observability_faults(obs)
+
+
+def judge_settings(blobs: dict[str, dict], subdomain: dict) -> list[str]:
+    """Why these settings are refused ([] = fine). `blobs` maps an endpoint label ('settings' = GET .../scripts/W/settings,
+    'script-settings' = GET .../scripts/W/script-settings, 'worker' = the GA GET .../workers/workers/W) to the `result`
+    object it answered; an endpoint that did not answer is not in it. The rules:
+      (a) on ANY endpoint, an `observability` that is present but is not an object with every `enabled` in it exactly
+          false (and logs/traces/issues of the schema's shape) is a refusal, null included (null is undocumented, so it
+          is never off and never "says nothing");
+      (b) script-settings MUST answer and report an explicit off (absent = "script-settings: observability not reported");
+      (c) settings may omit `observability` (its schema makes it optional), but if present it is held to (a);
+      (d) the GA worker read MUST answer and report an explicit off (its schema requires the key);
+      (e) `tail_consumers` an empty list and `logpush` an explicit false on every blob that reports them; null on either
+          is "not reported" (it never counts as a report, and the next rule needs one). The GA worker read MUST report
+          both (its schema requires them, non-null): `tail_consumers: []` and `logpush: false`, else a refusal;
+      (f) the subdomain: workers.dev on, preview URLs explicitly off.
+    Every detail names the endpoint and key paths, never a value. A missing answer is never a pass."""
     bad = []
-    explicit_off = tail_seen = logpush_seen = False
-    for blob in blobs:
-        if 'observability' in blob:
-            obs = blob['observability']
-            if isinstance(obs, dict) and obs.get('enabled') is False and not _enabled_anywhere(obs):
-                explicit_off = True
-            else:
-                bad.append('observability is not off')
-                bad.append(_why_observability_on(obs))
-        if 'tail_consumers' in blob:
+    tail_seen = logpush_seen = tail_bad = logpush_bad = False
+    for ep, blob in blobs.items():
+        if 'observability' in blob:                                            # (a), (c)
+            if not _observability_off(blob['observability']):
+                bad.append('%s: observability is not off (%s)' % (ep, _why_observability_on(blob['observability'])))
+        elif ep in MUST_REPORT_OFF:                                            # (b), (d)
+            bad.append('%s: observability not reported' % ep)
+        if 'tail_consumers' in blob:                                           # (e)
             tails = blob['tail_consumers']
-            if tails is None or tails == []:
+            if tails == []:
                 tail_seen = True
-            else:
-                bad.append('tail consumers: %s' % (len(tails) if isinstance(tails, list) else 'unreadable'))
+            elif tails is not None:                 # null says nothing, like logpush's: it is never "no consumers"
+                tail_bad = True
+                bad.append('%s: tail consumers: %s' % (ep, len(tails) if isinstance(tails, list) else 'unreadable'))
         if 'logpush' in blob:
             if blob['logpush'] is False:
                 logpush_seen = True
             elif blob['logpush'] is not None:       # null says nothing: it stays "not reported" below
-                bad.append('logpush is on')
-    if not explicit_off and 'observability is not off' not in bad:
-        bad.append('observability: no explicit off in the settings read back')
-    if not tail_seen and not any(b.startswith('tail consumers') for b in bad):
-        bad.append('tail_consumers: not reported')
-    if not logpush_seen and 'logpush is on' not in bad:
-        bad.append('logpush: not reported')
+                logpush_bad = True
+                bad.append('%s: logpush is on' % ep)
+    for ep in MUST_REPORT_OFF:                                                 # (b), (d): an endpoint that did not answer
+        if ep not in blobs:
+            bad.append('%s: did not answer' % ep)
+    worker = blobs.get('worker')
+    if worker is not None:                                                     # (e): the GA read reports both, non-null
+        if worker.get('tail_consumers') is None:
+            bad.append('worker: tail_consumers not reported')
+        if worker.get('logpush') is None:
+            bad.append('worker: logpush not reported')
+    asked = ', '.join(blobs) or 'no endpoint'
+    if not tail_seen and not tail_bad:
+        bad.append('tail_consumers: not reported (%s)' % asked)
+    if not logpush_seen and not logpush_bad:
+        bad.append('logpush: not reported (%s)' % asked)
     if subdomain.get('enabled') is not True:
         bad.append('workers.dev is not on')
     if subdomain.get('previews_enabled') is not False:
@@ -234,32 +290,44 @@ def _open(req, timeout):
     return _OPENER.open(req, timeout=timeout)
 
 
-def cf_get(path: str, token: str) -> dict | None:
+def _cf_url(path: str, verb: str) -> str:
+    """CF_API + path, refused unless it is api.cloudflare.com over https (the token goes nowhere else)."""
     url = urllib.parse.urlsplit(CF_API + path)
     if url.scheme != 'https' or url.hostname != 'api.cloudflare.com':
-        raise Refused('settings: the API host is not api.cloudflare.com over https')
-    req = urllib.request.Request(CF_API + path, headers={'Authorization': 'Bearer ' + token, 'User-Agent': UA})
+        raise Refused('%s: the API host is not api.cloudflare.com over https' % verb)
+    return CF_API + path
+
+
+def _check_ids(verb: str, worker: str, account: str) -> None:
+    if not re.fullmatch(r'[a-z0-9-]{1,63}', worker) or not re.fullmatch(r'[0-9a-f]{32}', account):
+        raise Refused('%s: worker name or account id malformed' % verb)
+
+
+def cf_get(path: str, token: str, label: str | None = None) -> dict | None:
+    label = label or path.rsplit('/', 1)[-1]
+    req = urllib.request.Request(_cf_url(path, 'settings'), headers={'Authorization': 'Bearer ' + token, 'User-Agent': UA})
     try:
         with _open(req, 30) as resp:
             doc = json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        say('settings: GET %s -> HTTP %d' % (path.rsplit('/', 1)[-1], e.code))
+        say('settings: GET %s -> HTTP %d' % (label, e.code))
         e.close()
         return None
     except (urllib.error.URLError, ValueError, TimeoutError) as e:
-        raise Refused('settings: GET %s failed (%s)' % (path.rsplit('/', 1)[-1], type(e).__name__)) from None
+        raise Refused('settings: GET %s failed (%s)' % (label, type(e).__name__)) from None
     if not isinstance(doc, dict) or doc.get('success') is not True or not isinstance(doc.get('result'), dict):
-        say('settings: GET %s -> success is not true' % path.rsplit('/', 1)[-1])
+        say('settings: GET %s -> success is not true' % label)
         return None
     return doc['result']
 
 
 def check_settings(worker: str, token: str, account: str) -> dict:
-    if not re.fullmatch(r'[a-z0-9-]{1,63}', worker) or not re.fullmatch(r'[0-9a-f]{32}', account):
-        raise Refused('settings: worker name or account id malformed')
+    _check_ids('settings', worker, account)
     base = '/accounts/%s/workers/scripts/%s' % (account, worker)
-    # Two endpoints carry the script settings; either may answer, and neither may say anything bad.
-    blobs = [b for b in (cf_get(base + '/settings', token), cf_get(base + '/script-settings', token)) if b is not None]
+    # Three endpoints carry the script settings, each labelled for judge_settings (which says which must answer).
+    asked = (('settings', base + '/settings'), ('script-settings', base + '/script-settings'),
+             ('worker', '/accounts/%s/workers/workers/%s' % (account, worker)))     # GA getWorker: worker_id may be the name
+    blobs = {label: b for label, path in asked if (b := cf_get(path, token, label)) is not None}
     sub = cf_get(base + '/subdomain', token)
     if not blobs or sub is None:
         raise Refused('settings: the API did not answer (%d settings, subdomain %s)' % (len(blobs), 'yes' if sub else 'no'))
@@ -267,6 +335,53 @@ def check_settings(worker: str, token: str, account: str) -> dict:
     if bad:
         raise Refused('settings of %s: %s' % (worker, '; '.join(bad)))
     return {'worker': worker, 'sources': len(blobs)}
+
+
+def _echo_not_off(echo: dict) -> list[str]:
+    """What in settings-off's echoed result is not the off record (key names only, never a value)."""
+    bad = []
+    if 'observability' not in echo:
+        bad.append('observability not echoed')
+    elif not _observability_off(echo['observability']):
+        bad.append(_why_observability_on(echo['observability']))
+    for key, off, word in (('logpush', False, 'is not false'), ('tail_consumers', [], 'is not empty')):
+        if key not in echo:
+            bad.append('%s not echoed' % key)
+        elif echo[key] is None:                     # null is never off: the record was written as false / []
+            bad.append('%s echoed null' % key)
+        elif echo[key] != off or (key == 'logpush' and echo[key] is not False):
+            bad.append('%s %s' % (key, word))
+    return bad
+
+
+def settings_off(worker: str, token: str, account: str) -> dict:
+    """PATCH SETTINGS_OFF to the script-settings record and hold the echo to the same explicit-off judge. Passes only on
+    HTTP 200, `success: true` and an echo that is off; everything else is refused, naming the endpoint, never a body."""
+    _check_ids('settings-off', worker, account)
+    where = 'settings-off: PATCH script-settings'
+    path = '/accounts/%s/workers/scripts/%s/script-settings' % (account, worker)
+    req = urllib.request.Request(_cf_url(path, 'settings-off'), data=jbody(SETTINGS_OFF), method='PATCH',
+                                 headers={'Authorization': 'Bearer ' + token, 'User-Agent': UA,
+                                          'Content-Type': 'application/json'})
+    try:
+        with _open(req, 30) as resp:
+            if resp.status != 200:
+                raise Refused('%s -> HTTP %d, not 200' % (where, resp.status))
+            doc = json.loads(resp.read())
+    except urllib.error.HTTPError as e:              # NoRedirect: a 3xx lands here too, never followed
+        code = e.code
+        e.close()
+        raise Refused('%s -> HTTP %d' % (where, code)) from None
+    except (OSError, ValueError, http.client.HTTPException) as e:  # URLError and timeouts are OSErrors; non-JSON a ValueError
+        raise Refused('%s failed (%s)' % (where, type(e).__name__)) from None
+    if not isinstance(doc, dict) or doc.get('success') is not True:
+        raise Refused('%s -> success is not true' % where)
+    if not isinstance(doc.get('result'), dict):
+        raise Refused('%s -> no result echoed' % where)
+    bad = _echo_not_off(doc['result'])
+    if bad:
+        raise Refused('%s -> the echo is not off: %s' % (where, '; '.join(bad)))
+    return {'worker': worker}
 
 
 # ---- the HTTP client ---------------------------------------------------------------------------------------------------
@@ -790,7 +905,7 @@ def has_secret(name: str) -> int:
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     sub = ap.add_subparsers(dest='cmd', required=True)
-    for name in ('keys', 'console', 'has-secret', 'settings', 'replay', 'probe'):
+    for name in ('keys', 'console', 'has-secret', 'settings-off', 'settings', 'replay', 'probe'):
         sub.add_parser(name).add_argument('arg')
     args = ap.parse_args(argv)
     try:
@@ -804,11 +919,21 @@ def main(argv: list[str]) -> int:
             say('no console call in the Worker sources')
         elif args.cmd == 'has-secret':
             return has_secret(args.arg)
-        elif args.cmd == 'settings':
+        elif args.cmd in ('settings', 'settings-off'):
             token, account = os.environ.get('CLOUDFLARE_API_TOKEN', ''), os.environ.get('CLOUDFLARE_ACCOUNT_ID', '')
             if not token or not account:
-                raise Refused('settings: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are needed')
-            info = check_settings(args.arg, token, account)
+                raise Refused('%s: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are needed' % args.cmd)
+            try:
+                if args.cmd == 'settings-off':
+                    settings_off(args.arg, token, account)
+                    say('settings-off of %s: observability off, no Logpush, no tail consumer written and echoed back'
+                        % args.arg)
+                    return 0
+                info = check_settings(args.arg, token, account)
+            except Refused:
+                raise
+            except Exception as e:  # noqa: BLE001 - a dropped read or a too-deep JSON is a named refusal, not a traceback
+                raise Refused('%s failed (%s)' % (args.cmd, type(e).__name__)) from None
             say('settings of %s: observability off, no tail consumer, no Logpush, workers.dev on, previews off (%d sources)'
                 % (info['worker'], info['sources']))
         elif args.cmd == 'replay':
