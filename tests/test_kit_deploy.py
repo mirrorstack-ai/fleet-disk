@@ -156,8 +156,13 @@ def make_handler(kit: FakeKit):
         def log_message(self, *a):
             pass
 
-        def send_fixed(self, status, body, ctype='text/plain'):
-            self.send_response(status)
+        def send_fixed(self, status, body, ctype='text/plain', server=None):
+            if server:                                           # as the live host: every answer there says cloudflare
+                self.send_response_only(status)
+                self.send_header('Server', server)
+                self.send_header('Date', self.date_time_string())
+            else:
+                self.send_response(status)
             self.send_header('Content-Type', ctype)
             self.send_header('Cache-Control', 'no-store, no-transform')
             self.send_header('Content-Length', str(len(body)))
@@ -200,10 +205,11 @@ def make_handler(kit: FakeKit):
                 self.send_edge_400(server='nginx')
             elif mode == 'other_404':                            # a 404 for both, but not the Worker's one answer
                 self.send_fixed(404, b'not found!\n')
-            elif mode == 'json400':
-                self.send_json(400, {'ok': False, 'error': 'bad-request'})
+            elif mode == 'json400':                              # Worker-made 400s, with the live host's server header
+                self.send_fixed(400, json.dumps({'ok': False, 'error': 'bad-request'}).encode(), 'application/json',
+                                server='cloudflare')
             elif mode == 'text400':
-                self.send_fixed(400, b'400 Bad Request\n')
+                self.send_fixed(400, b'400 Bad Request\n', server='cloudflare')
             else:
                 return False
             return True
@@ -222,6 +228,8 @@ def make_handler(kit: FakeKit):
                 return self.admin(path)
             m = TARGET_RE.match(path)
             auths = self.headers.get_all('Authorization') or []
+            if kit.flags.get('dup_auth') == 'first_header':      # a wrong front: it takes the first of two headers
+                auths = auths[:1]
             c = CODE_RE.match(auths[0]) if len(auths) == 1 else None
             if self.command != 'GET' or not m or not c:
                 if kit.flags.get('front_spends') and self.command != 'GET':
@@ -1108,10 +1116,15 @@ class OverHttp(unittest.TestCase):
 
     def test_the_replay_refuses_any_other_answer_to_the_duplicate_authorization_pair(self):
         for mode, fragment in (('edge_live_only', 'answered 400'),                     # mixed 400 / 404
-                               ('json400', "neither the Worker's 404 nor Cloudflare's edge 400 page"),
-                               ('text400', "neither the Worker's 404 nor Cloudflare's edge 400 page"),
-                               ('edge_worker_cache', "neither the Worker's 404 nor Cloudflare's edge 400 page"),
-                               ('edge_not_cloudflare', "neither the Worker's 404 nor Cloudflare's edge 400 page"),
+                               # the refusal names what the answer lacks; server=cloudflare on these, as on the live host
+                               ('json400', "edge 400 page (lacks content-type, cache-control, marker; server=cloudflare "
+                                           "content-type=application/json"),
+                               ('text400', "edge 400 page (lacks content-type, cache-control; server=cloudflare "
+                                           "content-type=text/plain"),
+                               ('edge_worker_cache', "edge 400 page (lacks cache-control;"),
+                               ('edge_not_cloudflare', "edge 400 page (lacks server; server=nginx"),
+                               # a front that took the first header: the live code opens gateway.json, the unknown does not
+                               ('first_header', '"two authorization headers" answered 200'),
                                ('edge_len', 'headers differ: content-length'),
                                ('edge_body', 'body differs'),
                                ('other_404', 'differs')):                              # a 404 pair is still held to the 404
@@ -1182,7 +1195,11 @@ class FrontRejects(unittest.TestCase):
 
     def test_both_duplicate_cases_send_two_identical_headers_one_live_one_unknown(self):
         rec = self.Recorder()
-        labels = [label for label, _ in kc.front_rejects(rec, '2345678923')]
+        answers = kc.front_rejects(rec, '2345678923')
+        labels = [label for label, _ in answers]
+        # gateway.json: the replay's live code still opens it at this point (bundle.tar's cap is spent by then)
+        for label in kc.DUP_AUTH:
+            self.assertEqual(answers[labels.index(label)][1], '/v1/kit/900000001/gateway.json')
         self.assertEqual(kc.DUP_AUTH, ('two authorization headers', 'two authorization headers, unknown code'))
         live, unknown = (rec.sent[labels.index(label)] for label in kc.DUP_AUTH)
         self.assertEqual(live, [('Authorization', 'FleetInvite 2345678923')] * 2)
@@ -1201,6 +1218,14 @@ class FrontRejects(unittest.TestCase):
             hdrs.update({k: v for k, v in change.items() if k not in ('status', 'body')})
             r = kc.Resp(change.get('status', 400), list(hdrs.items()), change.get('body', page.body), 1)
             self.assertFalse(kc.edge_400(r), change)
+            self.assertEqual(kc.edge_400_misses(r), [{'body': 'marker'}.get(k, k) for k in change], change)
+
+    def test_the_fold_refuses_unless_both_duplicate_cases_are_there_once(self):
+        page = kc.Resp(400, [('server', 'cloudflare'), ('content-type', 'text/html')], b'400 Bad Request', 1)
+        for labels in ((), kc.DUP_AUTH[:1], kc.DUP_AUTH[1:], kc.DUP_AUTH + kc.DUP_AUTH[:1], kc.DUP_AUTH[:1] * 2):
+            with self.subTest(labels=labels), self.assertRaises(kc.Refused) as why:
+                kc.fold_dup_auth([('root', page)] + [(label, page) for label in labels])
+            self.assertIn('not exactly', str(why.exception))
 
     def test_the_lowercase_case_is_always_a_malformed_code_even_for_an_all_digit_code(self):
         class Recorder:

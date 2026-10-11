@@ -105,6 +105,11 @@ a separate test hands the Worker a raw dot-segment URL.
 `vectors.test.js` fails if the copy changed without the pin, then sends every answer, header, counter and budget
 vector as a request through the real Worker front and Gate, and compares the status and, for every 404 and 429, the
 exact headers and bytes. Its `DIVERGES` list holds any vector the Worker answers differently (skipped with the reason,
-never weakened); what the hosts do not share is the file's `known_differences`, never asserted. To update: copy the
+never weakened); what the hosts do not share is the file's `known_differences`, never asserted. One answer neither host
+gives on the live host: Cloudflare's edge answers a doubled Authorization header with its own 400 page before the Worker
+(the staging probe behind kit-deploy run 38102844541), so the Worker's 404 for it is pinned only here, through the
+harness; the staging replay takes the edge page for that pair (`fold_dup_auth` in `bin/fleet-kit-check.py`). The note
+lives here, not in `known_differences`, because the vendored file is byte-pinned to the fleet repo and lists kit-serve
+against the Worker, not the edge. To update: copy the
 new file over `vectors/kit_vectors.json`, write the new pin line (`shasum -a 256`, the fleet commit, the path), and
 run `node --test kit/`.
