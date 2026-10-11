@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
 import importlib.util
 import io
 import json
@@ -54,6 +55,58 @@ CODE_RE = re.compile(r'^FleetInvite ([23456789CFGHJMPQRVWX]{10})$')
 TARGET_RE = re.compile(r'^/v1/kit/([0-9]{1,9})/(bundle\.tar|gateway\.json|gateway\.json\.sig)$')
 ADMIN_RE = re.compile(r'^KitAdmin (upload|gateway) ([1-9][0-9]{12,15}) ([0-9a-f]{128})$')
 SPKI_PREFIX = bytes.fromhex('302a300506032b6570032100')
+
+
+class _Redirector(BaseHTTPRequestHandler):
+    """Answers every request with `code` and a Location to /other; records (method, path, Authorization)."""
+    code = 302
+    seen: list = []
+
+    def do_PATCH(self):
+        type(self).seen.append((self.command, self.path, self.headers.get('Authorization')))
+        self.send_response(type(self).code)
+        self.send_header('Location', '/other')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+    do_GET = do_POST = do_PATCH
+
+    def log_message(self, *a):
+        pass
+
+
+def through_the_real_open(code, call, env):
+    """Run call() with the REAL kc._open in the path: only kc._OPENER is wrapped, its open() rewrites the URL to a local
+    server answering `code` + Location and delegates to the real NoRedirect opener. Any HTTPS connect is refused (so a
+    mutation that bypasses _OPENER fails here instead of reaching the API). Returns (result, requests seen, HTTPS tries)."""
+    H = type('H', (_Redirector,), {'code': code, 'seen': []})
+    srv = ThreadingHTTPServer(('127.0.0.1', 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    local = 'http://127.0.0.1:%d/start' % srv.server_address[1]
+    real, https_tries = kc._OPENER, []
+
+    class Wrapped:
+        def open(self, req, timeout=None):
+            moved = urllib.request.Request(local, data=req.data, headers=dict(req.header_items()), method=req.get_method())
+            return real.open(moved, timeout=5)
+
+    def no_https(conn, *a, **k):
+        https_tries.append(conn.host)
+        raise ConnectionRefusedError('no network in tests')
+    old_connect = http.client.HTTPSConnection.connect
+    saved = {k: os.environ.get(k) for k in env}
+    kc._OPENER, http.client.HTTPSConnection.connect = Wrapped(), no_https
+    try:
+        os.environ.update(env)
+        return call(), H.seen, https_tries
+    finally:
+        kc._OPENER, http.client.HTTPSConnection.connect = real, old_connect
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        srv.shutdown()
+        srv.server_close()
 
 
 class FakeKit:
@@ -393,12 +446,44 @@ class Judges(unittest.TestCase):
         gone = {'logpush': self.GONE, 'tail_consumers': self.GONE}
         self.assertEqual(self.judge(settings=gone, script_settings=gone, worker=gone),
                          ['logpush: not reported (settings, script-settings, worker)',
-                          'tail_consumers: not reported (settings, script-settings, worker)'])
-        # present but not a clean value is a named failure, not a pass; null logpush says nothing
+                          'tail_consumers: not reported (settings, script-settings, worker)',
+                          'worker: logpush not reported', 'worker: tail_consumers not reported'])
+        # present but not a clean value is a named failure, not a pass; null says nothing, on either key
         nul = {'logpush': None}
         self.assertEqual(self.judge(settings=nul, script_settings=nul, worker=nul),
-                         ['logpush: not reported (settings, script-settings, worker)'])
+                         ['logpush: not reported (settings, script-settings, worker)', 'worker: logpush not reported'])
+        nul = {'tail_consumers': None}
+        self.assertEqual(self.judge(settings=nul, script_settings=nul, worker=nul),
+                         ['tail_consumers: not reported (settings, script-settings, worker)',
+                          'worker: tail_consumers not reported'])
         self.assertEqual(self.judge(settings={'logpush': 'yes'}), ['settings: logpush is on'])
+
+    def test_the_worker_read_must_report_tail_and_logpush_itself_never_null(self):                       # rule (e)
+        for key in ('tail_consumers', 'logpush'):
+            self.assertEqual(self.judge(worker={key: self.GONE}), ['worker: %s not reported' % key])
+            self.assertEqual(self.judge(worker={key: None}), ['worker: %s not reported' % key])
+        # a null in script-settings counts for nothing: settings silent too, so only the worker's [] / false carry it
+        self.assertEqual(self.judge(settings=self.GONE, script_settings={'tail_consumers': None, 'logpush': None}), [])
+        self.assertEqual(self.judge(settings=self.GONE, script_settings={'tail_consumers': None},
+                                    worker={'tail_consumers': self.GONE, 'logpush': self.GONE}),
+                         ['tail_consumers: not reported (script-settings, worker)',
+                          'worker: logpush not reported', 'worker: tail_consumers not reported'])
+
+    def test_a_truthy_non_boolean_enabled_or_a_wrong_shape_is_never_off(self):                       # rule (a)
+        for sub in ('logs', 'traces', 'issues'):
+            for v in (1, 'true', 'True', 'yes', {'x': 1}, [1], None, 0, 'false', 2.0, {}):
+                out = self.judge(script_settings={'observability': {'enabled': False, sub: {'enabled': v}}})
+                self.assertEqual(out, ['script-settings: observability is not off (observability.%s.enabled: not false)'
+                                       % sub], (sub, v))
+        for sub in ('logs', 'traces'):
+            for v in ('on', None, [], 1):
+                self.assertEqual(self.judge(worker={'observability': {'enabled': False, sub: v}}),
+                                 ['worker: observability is not off (observability.%s: not an object)' % sub], (sub, v))
+        self.assertEqual(self.judge(worker={'observability': {'enabled': False, 'issues': 'on'}}),
+                         ['worker: observability is not off (observability.issues: not an object)'])
+        self.assertEqual(self.judge(worker={'observability': {'enabled': False, 'issues': None}}), [])  # schema: nullable
+        self.assertEqual(self.judge(worker={'observability': {'enabled': False, 'logs': {'destinations': [{'enabled': 1}]}}}),
+                         ['worker: observability is not off (observability.logs.destinations[0].enabled: not false)'])
 
     def test_each_bad_setting_is_named_with_its_endpoint(self):
         self.assertIn('settings: tail consumers: 1', self.judge(settings={'tail_consumers': [{'service': 'x'}]}))
@@ -500,6 +585,17 @@ class Judges(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_the_real_get_path_goes_through_the_no_redirect_opener(self):
+        """cf_get with the REAL kc._open: a 302/307 is answered as a non-answer, /other is never asked, the token goes
+        once. Stock urllib follows a GET redirect and re-sends Authorization, so this fails if _open bypasses _OPENER."""
+        for code in (301, 302, 303, 307, 308):
+            with redirect_stdout(io.StringIO()) as buf:
+                got, seen, https = through_the_real_open(code, lambda: kc.cf_get('/x/settings', 'SECRETTOKEN'), {})
+            self.assertIsNone(got, code)
+            self.assertEqual((seen, https), ([('GET', '/start', 'Bearer SECRETTOKEN')], []), code)
+            self.assertIn('HTTP %d' % code, buf.getvalue())
+            self.assertNotIn('SECRETTOKEN', buf.getvalue())
+
 
     ACCOUNT = 'a' * 32
     WORKER_READ = {'id': 'x', 'name': 'fleet-kit', 'observability': {'enabled': False, 'logs': {'enabled': False}},
@@ -589,8 +685,9 @@ class Judges(unittest.TestCase):
             self.assertIsInstance(out, kc.Refused, obs)
             self.assertIn(why, str(out))
 
-    def test_the_settings_gate_refuses_the_measured_null_from_script_settings(self):
-        # run 38095547741: the GET answered observability: null. Now refused by name, with the other two explicit off.
+    def test_the_settings_gate_refuses_a_null_from_script_settings_by_name(self):
+        # run 38095547741 read observability: null from an endpoint the old unlabelled gate did not name (script-settings
+        # by the schema: only it may answer null). Inferred, not measured; a null there is now refused by name.
         out, *_ = self.cf(dict(self.GOOD_ANSWERS, **{'/script-settings': {'observability': None, 'logpush': False}}))
         self.assertIsInstance(out, kc.Refused)
         self.assertEqual(str(out), 'settings of fleet-kit: script-settings: observability is not off (observability: null)')
@@ -699,9 +796,10 @@ class SettingsOff(unittest.TestCase):
         self.assertEqual(json.loads(req.data), {'observability': kc.OBSERVABILITY_OFF, 'logpush': False, 'tail_consumers': []})
         self.assertEqual(json.loads(req.data), kc.SETTINGS_OFF)
 
-    def test_an_echo_with_null_tail_consumers_passes(self):
-        rc, out, _ = self.run_cli((200, {'success': True, 'result': dict(self.ECHO, tail_consumers=None)}))
-        self.assertEqual(rc, 0, out)
+    def test_an_echo_with_null_tail_consumers_or_logpush_is_refused(self):
+        # we wrote [] and false; null is never off (the gate's rule), so an echo of null is named, not passed
+        self.refused((200, {'success': True, 'result': dict(self.ECHO, tail_consumers=None)}), 'tail_consumers echoed null')
+        self.refused((200, {'success': True, 'result': dict(self.ECHO, logpush=None)}), 'logpush echoed null')
 
     def test_an_http_error_or_a_status_other_than_200_is_refused(self):
         for code in (400, 403, 404, 500):
@@ -730,52 +828,72 @@ class SettingsOff(unittest.TestCase):
         self.refused(echo(observability={}), 'observability.enabled: missing')
         self.refused((200, {'success': True, 'result': {'logpush': False, 'tail_consumers': []}}), 'observability not echoed')
         self.refused(echo(logpush=True), 'logpush is not false')
-        self.refused(echo(logpush=None), 'logpush is not false')
+        self.refused(echo(logpush=0), 'logpush is not false')
         self.refused((200, {'success': True, 'result': {'observability': kc.OBSERVABILITY_OFF, 'tail_consumers': []}}),
-                     'logpush is not false')
+                     'logpush not echoed')
         self.refused(echo(tail_consumers=[{'name': 'SECRET-tail'}]), 'tail_consumers is not empty')
+        self.refused(echo(tail_consumers={}), 'tail_consumers is not empty')
         self.refused((200, {'success': True, 'result': {'observability': kc.OBSERVABILITY_OFF, 'logpush': False}}),
-                     'tail_consumers is not empty')
+                     'tail_consumers not echoed')
+        self.refused(echo(observability={'enabled': False, 'logs': {'enabled': 'true'}}),
+                     'observability.logs.enabled: not false')
 
     def test_a_redirect_is_not_followed(self):
-        """The PATCH goes through kc._OPENER (NoRedirect): a 302 is a refusal and the Location is never asked."""
-        class H(BaseHTTPRequestHandler):
-            seen: list = []
-
-            def do_PATCH(self):
-                H.seen.append((self.command, self.path, self.headers.get('Authorization')))
-                self.send_response(302)
-                self.send_header('Location', '/other')
-                self.send_header('Content-Length', '0')
-                self.end_headers()
-            do_GET = do_POST = do_PATCH
-
-            def log_message(self, *a):
-                pass
-
-        srv = ThreadingHTTPServer(('127.0.0.1', 0), H)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        local = 'http://127.0.0.1:%d/start' % srv.server_address[1]
-
-        def to_local(req, timeout):      # the real opener, pointed at a local server instead of the API
-            moved = urllib.request.Request(local, data=req.data, headers=dict(req.header_items()), method=req.get_method())
-            return kc._OPENER.open(moved, timeout=5)
-        old, kc._open = kc._open, to_local
-        buf = io.StringIO()
-        try:
-            os.environ['CLOUDFLARE_API_TOKEN'], os.environ['CLOUDFLARE_ACCOUNT_ID'] = self.TOKEN, self.ACCOUNT
+        """The PATCH through the REAL kc._open: a 302/307 is a refusal and the Location is never asked. Stock urllib never
+        follows a PATCH redirect either (it raises), so this test alone cannot tell NoRedirect is there; the GET test
+        (test_the_real_get_path_goes_through_the_no_redirect_opener) is the one that does."""
+        env = {'CLOUDFLARE_API_TOKEN': self.TOKEN, 'CLOUDFLARE_ACCOUNT_ID': self.ACCOUNT}
+        for code in (302, 307):
+            buf = io.StringIO()
             with redirect_stdout(buf):
-                rc = kc.main(['settings-off', 'fleet-kit-staging'])
+                rc, seen, https = through_the_real_open(code, lambda: kc.main(['settings-off', 'fleet-kit-staging']), env)
+            self.assertEqual(rc, 1, code)
+            self.assertIn('HTTP %d' % code, buf.getvalue())
+            self.assertNotIn(self.TOKEN, buf.getvalue())
+            self.assertEqual((seen, https), ([('PATCH', '/start', 'Bearer ' + self.TOKEN)], []), code)  # /other never asked
+
+    def test_a_dropped_read_or_a_too_deep_answer_is_a_named_refusal_on_both_verbs(self):
+        class Reply:
+            status = 200
+
+            def __init__(self, what):
+                self.what = what
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                if isinstance(self.what, BaseException):
+                    raise self.what
+                return self.what
+        env = {'CLOUDFLARE_API_TOKEN': self.TOKEN, 'CLOUDFLARE_ACCOUNT_ID': self.ACCOUNT}
+        saved = {k: os.environ.get(k) for k in env}
+        old = kc._open
+        try:
+            os.environ.update(env)
+            for what, name in ((http.client.IncompleteRead(b'x' * 10, 5), 'IncompleteRead'),
+                               (ConnectionResetError(), 'ConnectionResetError'),
+                               (http.client.RemoteDisconnected('x'), 'RemoteDisconnected'),
+                               (b'[' * 200000 + b']' * 200000, 'RecursionError')):
+                for cmd in ('settings', 'settings-off'):
+                    kc._open = lambda req, timeout, what=what: Reply(what)
+                    buf = io.StringIO()
+                    with redirect_stdout(buf):
+                        rc = kc.main([cmd, 'fleet-kit-staging'])
+                    last = buf.getvalue().strip().splitlines()[-1]
+                    self.assertEqual(rc, 1, (cmd, name))
+                    self.assertTrue(last.startswith('REFUSED %s' % cmd) and last.endswith('(%s)' % name), (cmd, last))
+                    self.assertNotIn(self.TOKEN, buf.getvalue())
         finally:
             kc._open = old
-            os.environ.pop('CLOUDFLARE_API_TOKEN', None)
-            os.environ.pop('CLOUDFLARE_ACCOUNT_ID', None)
-            srv.shutdown()
-            srv.server_close()
-        self.assertEqual(rc, 1)
-        self.assertIn('HTTP 302', buf.getvalue())
-        self.assertNotIn(self.TOKEN, buf.getvalue())
-        self.assertEqual(H.seen, [('PATCH', '/start', 'Bearer ' + self.TOKEN)])     # /other was never asked for
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
     def test_bad_ids_a_bad_host_or_no_credentials_send_nothing(self):
         for worker in ('Fleet Kit', 'x' * 64, 'a/b'):
