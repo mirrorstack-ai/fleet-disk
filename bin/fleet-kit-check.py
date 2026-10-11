@@ -62,13 +62,15 @@ plus the `openssl` binary (3.x: Ed25519 with -rawin) for the throwaway admin key
                       then refused '404: "below the floor" differs from "admin stale": headers differ: report-to'; the
                       coordinator's probe of 6 Worker 404s on staging found the edge now adds a constant `nel` and a
                       `report-to` whose endpoint URL holds a per-response token): in every identity check a report-to
-                      that is well-formed Cloudflare NEL (cf_nel_report_to) counts as one fixed placeholder, so two
-                      such headers compare equal whatever their token. The token cannot carry invite state: the Worker
-                      never sets the header (kit/worker.test.js pins that its 404, its JSON replies and its 200 carry
-                      neither report-to nor nel), so it is the edge's and made without the Worker's verdict. Still
-                      compared: whether the header is there at all (one answer with it, one without, refuses), any
-                      report-to that is not well-formed cf-nel (raw), `nel` as it is, every other header but date and
-                      cf-ray, the status and the body.
+                      that is well-formed Cloudflare NEL (cf_nel_rest: one endpoint, its URL ending ?s=<token>) is
+                      compared with its token cut out and nothing else, so two such headers are equal only when they
+                      differ in the token alone. The token cannot carry invite state: the Worker never sets the header
+                      (kit/worker.test.js pins that its 404, its JSON replies and its 200 carry neither report-to nor
+                      nel), so it is the edge's and made without the Worker's verdict. Still compared, byte for byte
+                      within the run: the rest of that header (max_age, the endpoint's path, the spelling: key order,
+                      whitespace, escapes), whether the header is there at all (one answer with it, one without,
+                      refuses), any report-to that is not well-formed cf-nel (raw), `nel` as it is, every other header
+                      but date and cf-ray, the status and the body.
 
 Nothing here prints an invite code, a key, a token or a response body; it prints vector names, statuses and numbers.
 Exit 0 passed, 1 refused (the reason is the last line), 2 usage.
@@ -101,7 +103,7 @@ from typing import Callable, NamedTuple
 ALPHABET = '23456789CFGHJMPQRVWX'      # the invite alphabet (N02): 10 symbols of it
 NOT_FOUND = b'not found\n'
 TRY_LATER = b'try later\n'
-VARYING = frozenset({'date', 'cf-ray'})  # the only headers left out when two answers are compared (see also CF_NEL)
+VARYING = frozenset({'date', 'cf-ray'})  # the only headers left out when two answers are compared (see also cf_nel_rest)
 SECRET_NAME = re.compile(r'[A-Z][A-Z0-9_]{0,63}')
 CF_API = 'https://api.cloudflare.com/client/v4'
 UA = 'fleet-kit-deploy-check/1'
@@ -518,13 +520,23 @@ class Client:
 # knows whether a code is live, never writes the header; the edge makes the token per response, the same way for a live
 # and a dead code.
 # The rule (headers_of, so norm, differs, all_identical: the replay's 404 set, the edge rows, the probe): a report-to
-# value that is well-formed Cloudflare NEL (cf_nel_report_to) is compared as ONE fixed placeholder, whatever its token.
-# What is still compared: presence (an answer with the header against one without, or with another count of them,
-# differs: the placeholder is a row like any other), a report-to that is NOT well-formed cf-nel (raw, so it differs from
-# the placeholder and from any other value, and differs() names it), `nel` as it is (it was constant in the probe; only
-# the robots row's EDGE_REPORTING leaves it out), and every other header but VARYING.
+# value that is well-formed Cloudflare NEL (cf_nel_rest) is compared WITHOUT ITS TOKEN and otherwise byte for byte: the
+# row holds the header value with the characters between "?s=" and the closing quote cut out. So the one thing excused is
+# the part the edge makes per response. What is still compared, within the run (nothing here is held to 604800 or to v4,
+# so Cloudflare may change either between runs; a variance inside one run refuses): max_age, the endpoint's path, the
+# number of endpoints (exactly one is well-formed), key order, whitespace and escapes; presence (an answer with the header
+# against one without, or with another count of them, differs: the row is a row like any other); a report-to that is NOT
+# well-formed cf-nel (raw, so it differs from every cf-nel row and from any other value, and differs() names it); `nel`
+# as it is (it was constant in the probe; only the robots row's EDGE_REPORTING leaves it out); every other header but
+# VARYING.
 CF_NEL_GROUP = 'cf-nel'
 CF_NEL_ENDPOINT = 'https://a.nel.cloudflare.com/report/'   # https, host exactly a.nel.cloudflare.com, path under /report/
+# The endpoint URL: CF_NEL_ENDPOINT, a path of unreserved characters and "/" (no "%", so no %2e; no backslash, "#" or
+# second "?"; ".." is refused beside it), then "?s=" and the token: 1 to 512 characters of the base64, base64url and
+# percent-encoding alphabets. Nothing may follow the token (no "&name=value" rides in the part that is not compared).
+CF_NEL_URL = re.compile(re.escape(CF_NEL_ENDPOINT)
+                        + r'(?P<path>[A-Za-z0-9._~/-]{1,64})\?s=(?P<token>[A-Za-z0-9%+/=_.~-]{1,512})')
+CF_NEL_QUERY = '?s='
 REPORT_TO_MAX = 2048                                       # characters of the whole header value
 NOT_CF_NEL = "report-to is not Cloudflare's cf-nel"        # a refusal says this, never the value
 
@@ -536,43 +548,59 @@ def _no_duplicate_keys(pairs):
     return doc
 
 
-def cf_nel_report_to(value) -> bool:
-    """A report-to header value that is well-formed Cloudflare NEL, as run 38164673127's probe measured it: at most
-    REPORT_TO_MAX characters; a JSON object with exactly the keys group, max_age, endpoints (none twice); group "cf-nel";
-    max_age a positive integer; endpoints a non-empty list of objects with exactly one key, url, a string of printable
-    ASCII that starts with CF_NEL_ENDPOINT (what follows is the per-response token and is not judged)."""
+def cf_nel_rest(value) -> str | None:
+    """None unless `value` is a report-to header value that is well-formed Cloudflare NEL as run 38164673127's probe
+    measured it: at most REPORT_TO_MAX characters; a JSON object with exactly the keys group, max_age, endpoints (none
+    twice); group "cf-nel"; max_age a positive integer; endpoints a list of exactly ONE object with exactly one key, url, a
+    string that is CF_NEL_URL in full. Then: the value with its token cut out, which is what two answers are compared on
+    (headers_of). The token is taken from the header as it is spelled (the one "?s=" up to the closing quote; "\\/" for
+    "/" is the only escape taken there), so every character outside it is in the result."""
     if not isinstance(value, str) or len(value) > REPORT_TO_MAX:
-        return False
+        return None
     try:
         doc = json.loads(value, object_pairs_hook=_no_duplicate_keys)
     except (ValueError, RecursionError):
-        return False
+        return None
     if not isinstance(doc, dict) or set(doc) != {'group', 'max_age', 'endpoints'}:
-        return False
+        return None
     if doc['group'] != CF_NEL_GROUP:
-        return False
+        return None
     if type(doc['max_age']) is not int or doc['max_age'] <= 0:        # type(): True is an int and not a max_age
-        return False
+        return None
     endpoints = doc['endpoints']
-    if not isinstance(endpoints, list) or not endpoints:
-        return False
-    for ep in endpoints:
-        if not isinstance(ep, dict) or set(ep) != {'url'}:
-            return False
-        url = ep['url']
-        if not isinstance(url, str) or not url.startswith(CF_NEL_ENDPOINT):
-            return False
-        if any(not '!' <= c <= '~' for c in url):                     # no space, control or non-ASCII character
-            return False
-    return True
+    if not isinstance(endpoints, list) or len(endpoints) != 1:        # one, as measured: a second one is not excused
+        return None
+    ep = endpoints[0]
+    if not isinstance(ep, dict) or set(ep) != {'url'} or not isinstance(ep['url'], str):
+        return None
+    url = CF_NEL_URL.fullmatch(ep['url'])
+    if not url or '..' in url['path']:
+        return None
+    if value.count(CF_NEL_QUERY) != 1:                                # the "?" spelled as an escape: not as measured
+        return None
+    start = value.index(CF_NEL_QUERY) + len(CF_NEL_QUERY)
+    end = value.find('"', start)
+    if end < 0 or value[start:end].replace('\\/', '/') != url['token']:
+        return None
+    return value[:start] + value[end:]
+
+
+def cf_nel_report_to(value) -> bool:
+    """A report-to header value that is well-formed Cloudflare NEL (cf_nel_rest says what that is)."""
+    return cf_nel_rest(value) is not None
 
 
 def headers_of(resp: Resp, varying: frozenset = VARYING) -> list[tuple[str, str, str]]:
-    """The header rows two answers are compared on, sorted: (name, 'raw', value), or (name, 'cf-nel', '') for a report-to
-    that is well-formed Cloudflare NEL (the placeholder; a raw value can never equal it). Headers in `varying` are left
-    out. See the CF_NEL note above."""
-    return sorted((k, CF_NEL_GROUP, '') if k == 'report-to' and cf_nel_report_to(v) else (k, 'raw', v)
-                  for k, v in resp.headers if k not in varying)
+    """The header rows two answers are compared on, sorted: (name, 'raw', value), or (name, 'cf-nel', the value without
+    its token) for a report-to that is well-formed Cloudflare NEL (cf_nel_rest; a raw row can never equal it). Headers in
+    `varying` are left out. See the note above CF_NEL_GROUP."""
+    rows = []
+    for k, v in resp.headers:
+        if k in varying:
+            continue
+        rest = cf_nel_rest(v) if k == 'report-to' else None
+        rows.append((k, 'raw', v) if rest is None else (k, CF_NEL_GROUP, rest))
+    return sorted(rows)
 
 
 def norm(resp: Resp, varying: frozenset = VARYING):
@@ -580,15 +608,19 @@ def norm(resp: Resp, varying: frozenset = VARYING):
 
 
 def differs(a: Resp, b: Resp, varying: frozenset = VARYING) -> str:
-    """Why norm(a) != norm(b): names, never values. A report-to that takes part and is not well-formed cf-nel is said so."""
+    """Why norm(a) != norm(b): names, never values. A report-to that takes part and is not well-formed cf-nel is said so;
+    so are two that are both cf-nel and differ outside the token (a missing or doubled one is plain "report-to")."""
     if a.status != b.status:
         return 'status %d vs %d' % (a.status, b.status)
     ha, hb = Counter(headers_of(a, varying)), Counter(headers_of(b, varying))
     if ha != hb:
-        rows = set((ha - hb) + (hb - ha))                             # counted: one header twice against once differs too
+        only_a, only_b = ha - hb, hb - ha                             # counted: one header twice against once differs too
+        rows = set(only_a + only_b)
         names = sorted({k for k, _, _ in rows})
         if any(k == 'report-to' and kind == 'raw' for k, kind, _ in rows):
             names[names.index('report-to')] = "report-to (not Cloudflare's cf-nel)"
+        elif all(any(k == 'report-to' for k, _, _ in side) for side in (only_a, only_b)):
+            names[names.index('report-to')] = 'report-to (cf-nel, more than its token)'
         return 'headers differ: %s' % ', '.join(names)
     return 'body differs'
 
@@ -619,7 +651,8 @@ def check_fixed_answer(label: str, resp: Resp, status: int, body: bytes) -> None
 
 def cf_nel_line(answers: list[tuple[str, Resp]]) -> str:
     """For a summary, after the answers passed: how many carried a report-to. Each of those is Cloudflare's cf-nel then
-    (check_fixed_answer on the first, all_identical on the rest), and its token is the one thing that was not compared."""
+    (check_fixed_answer on the first, all_identical on the rest), and its token is the one thing that was not compared:
+    the rest of the value was, byte for byte (cf_nel_rest)."""
     n = sum(1 for _, resp in answers if resp.header('report-to') is not None)
     return "Cloudflare's cf-nel report-to on %d of %d (its token is not compared)" % (n, len(answers))
 
@@ -627,7 +660,8 @@ def cf_nel_line(answers: list[tuple[str, Resp]]) -> str:
 def all_identical(label: str, answers: list[tuple[str, Resp]], varying: frozenset = VARYING) -> None:
     """Every answer equal to the first by norm(). `varying` is VARYING everywhere but one edge row's own comparison
     (EdgePage.varying, fold_edge): every 404 identity check takes the default. In all of them a well-formed cf-nel
-    report-to is one placeholder (headers_of), so its per-response token is not a difference; its absence is."""
+    report-to is compared without its token (headers_of), so its per-response token is not a difference; its absence
+    and anything else in it are."""
     first_label, first = answers[0]
     for name, resp in answers[1:]:
         if norm(resp, varying) != norm(first, varying):
@@ -707,7 +741,7 @@ def get_kit(client: Client, serial, name: str, code: str, extra=()) -> Resp:
 # answers with. Every other front reject must be the Worker's 404; these may be the Worker's 404 (held to it exactly as the
 # others) or the one edge page their row names, the same for every label of the row and identical by norm() over the row's
 # own varying headers (fold_edge; VARYING, plus EDGE_REPORTING for the robots row only, run 38140164568 attempt 2), a
-# well-formed cf-nel report-to counting as one placeholder there as everywhere (headers_of, run 38164673127).
+# well-formed cf-nel report-to compared without its token there as everywhere (headers_of, run 38164673127).
 # An edge page on any label not in EDGE_OWNED is held to the 404 and refuses.
 #
 # (1) The two duplicate-Authorization cases: one with a live code, one with a code nobody holds. Measured, kit-deploy run
@@ -770,7 +804,7 @@ def managed_robots_misses(resp: Resp) -> list[str]:
     """The properties of Cloudflare's managed robots.txt (run 38107708369's probes) this answer lacks (empty: it has the
     page's shape). The shape is not proof of origin: bytes after the first line are not judged beyond the size cap. What
     rules the Worker out is its source: for /robots.txt it answers only its front-check 404 (kit/worker.test.js pins it).
-    The headers check_fixed_answer refuses on every fixed answer are refused here too."""
+    A content-encoding, location or set-cookie header is refused here as on every fixed answer (check_fixed_answer)."""
     body = resp.body or b''
     misses = []
     if resp.status != 200:
@@ -805,9 +839,9 @@ EDGE_400_PAGE = EdgePage('duplicate Authorization', 'cases', "Cloudflare's edge 
 # edge's per-response metadata about it, not its content; the page itself (status, every other header, the bytes) is still
 # held identical across both fetches. Ignored by the robots row's own comparison ONLY: VARYING is unchanged, so every 404
 # identity check (the Worker's answers, the front rejects among them) still compares both headers. Since run 38164673127
-# (the edge now adds them to the Worker's 404 too) that comparison takes a report-to that is well-formed cf-nel as one
-# placeholder (headers_of): its token may differ, while its absence on one answer, a report-to of any other shape and a
-# differing nel still refuse there.
+# (the edge now adds them to the Worker's 404 too) that comparison takes a report-to that is well-formed cf-nel without
+# its token (headers_of): the token may differ, while anything else in it, its absence on one answer, a report-to of any
+# other shape and a differing nel still refuse there.
 EDGE_REPORTING = frozenset({'report-to', 'nel'})
 MANAGED_ROBOTS = EdgePage('robots', 'fetches', "Cloudflare's managed robots.txt", managed_robots_misses, ROBOTS_FIRST_LINE,
                           VARYING | EDGE_REPORTING)
@@ -829,7 +863,7 @@ def fold_edge(answers: list[tuple[str, Resp]]) -> tuple[list[tuple[str, Resp]], 
     one verdict line per row). Every label of a row the Worker's 404: they stay in the list (the caller holds them to the
     404 and to the others). Every label of a row that row's edge page, identical by norm() over the row's own varying
     headers (page.varying: VARYING, plus EDGE_REPORTING for robots; never wider for a 404; a well-formed cf-nel report-to
-    is one placeholder in both rows, headers_of): they leave the list. Anything
+    is compared without its token in both rows, headers_of): they leave the list. Anything
     else (a mix, another page, differing answers) is a refusal naming the row and what is missing, never a body. Every
     answer whose label is in no row is passed through untouched."""
     taken: set[str] = set()

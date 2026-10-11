@@ -129,17 +129,29 @@ NOT_CF_NEL = {
     'extra_key': CF_REPORT_TO.replace('{"group"', '{"include_subdomains":true,"group"'),
     'not_json': 'cf-nel; https://a.nel.cloudflare.com/report/v4?s=%s',
     'big': CF_REPORT_TO.replace('?s=', '?s=' + 'A' * 2048),
+    'two_endpoints': CF_REPORT_TO.replace('}]}', '},{"url":"https://a.nel.cloudflare.com/report/v4?s=z"}]}'),
+    'dot_dot': CF_REPORT_TO.replace('/report/v4', '/report/../v4'),
+    'second_parameter': CF_REPORT_TO.replace('?s=%s', '?s=%s&live=1'),
+}
+# A report-to that IS well-formed cf-nel and differs from CF_REPORT_TO outside the token: fine on every answer of a run
+# (Cloudflare may change it between runs), a difference on one answer among the others.
+CF_NEL_OTHER = {
+    'max_age_1': CF_REPORT_TO.replace('604800', '1'),
+    'path_v5': CF_REPORT_TO.replace('/report/v4', '/report/v5'),
+    'spaced': CF_REPORT_TO.replace('"max_age":', '"max_age": '),
+    'edge_spelling': '{"endpoints":[{"url":"https:\\/\\/a.nel.cloudflare.com\\/report\\/v4?s=%s"}],"group":"cf-nel",'
+                     '"max_age":604800}',
 }
 
 
 def report_to_values(kind: str, token: str) -> list[str]:
     """The Report-To header lines of one answer: 'cf-nel' Cloudflare's own, 'absent' none, 'twice' two of Cloudflare's,
-    or one NOT_CF_NEL kind."""
+    or one CF_NEL_OTHER or NOT_CF_NEL kind."""
     if kind == 'absent':
         return []
     if kind == 'twice':
         return [CF_REPORT_TO % token, CF_REPORT_TO % (token + '2')]
-    return [(CF_REPORT_TO if kind == 'cf-nel' else NOT_CF_NEL[kind]) % token]
+    return [(CF_REPORT_TO if kind == 'cf-nel' else CF_NEL_OTHER.get(kind) or NOT_CF_NEL[kind]) % token]
 
 
 class FakeKit:
@@ -1493,7 +1505,7 @@ class OverHttp(unittest.TestCase):
             self.assertNotIn(token, text)
 
     def test_the_replay_refuses_a_404_whose_report_to_is_not_cloudflares_cf_nel(self):
-        # one 404 among Cloudflare's own: it is compared raw, differs from the placeholder and is named
+        # one 404 among Cloudflare's own: it is compared raw, differs from every cf-nel row and is named
         e = self.refused('404: "below the floor" differs from "admin stale": headers differ: report-to '
                          "(not Cloudflare's cf-nel)", edge_nel='cf-nel', edge_nel_nth=(2, 'wrong_group'))
         self.assertNotIn('a.nel.cloudflare.com', str(e))                 # never the value
@@ -1508,6 +1520,12 @@ class OverHttp(unittest.TestCase):
         e = self.refused('404: "below the floor" differs from "admin stale": headers differ: nel',
                          edge_nel='cf-nel', nel_nth=2)
         self.assertTrue(str(e).endswith('headers differ: nel'))
+
+    def test_the_replay_refuses_a_404_whose_cf_nel_report_to_differs_in_more_than_its_token(self):
+        # well-formed cf-nel on every 404, one of them with another max_age: only the token is left out of the comparison
+        e = self.refused('404: "below the floor" differs from "admin stale": headers differ: report-to '
+                         '(cf-nel, more than its token)', edge_nel='cf-nel', edge_nel_nth=(2, 'max_age_1'))
+        self.assertNotIn('a.nel.cloudflare.com', str(e))                 # never the value
 
     def test_the_managed_robots_page_on_another_label_is_refused(self):
         self.refused('root: status 200, expected 404', managed_robots_on='/')
@@ -1565,7 +1583,9 @@ class OverHttp(unittest.TestCase):
             return kit, kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
 
     def test_the_probe_takes_cloudflares_cf_nel_report_to_by_the_same_rule(self):
-        for flags, n in (({'edge_nel': 'cf-nel'}, 25), ({'edge_nel': 'cf-nel', 'robots': 'reporting', 'dup_auth': 'edge'}, 21)):
+        for flags, n in (({'edge_nel': 'cf-nel'}, 25), ({'edge_nel': 'cf-nel', 'robots': 'reporting', 'dup_auth': 'edge'}, 21),
+                         # another max_age, path or spelling on EVERY answer is Cloudflare's change between runs: it passes
+                         *(({'edge_nel': kind}, 25) for kind in CF_NEL_OTHER)):
             kit, lines = self.probe(**flags)
             self.assertIn('%d answers, byte-identical, 5 reached the gate' % n, lines[0])
             self.assertIn("Cloudflare's cf-nel report-to on %d of %d (its token is not compared)" % (n, n), '\n'.join(lines))
@@ -1585,6 +1605,16 @@ class OverHttp(unittest.TestCase):
                 self.assertIn(fragment, str(why.exception))
                 for part in ('a.nel.cloudflare.com', 'example.net', 'AAAA', 'default', 'include_subdomains'):
                     self.assertNotIn(part, str(why.exception))           # a refusal never carries the value
+        # ... and on ONE answer among Cloudflare's usual ones it is a difference, named apart from a missing header
+        for kind in CF_NEL_OTHER:
+            for nth, labels in ((3, '"gateway.json, serial 7" differs from "bundle, serial 1"'),
+                                (1, 'differs from "bundle, serial 1"')):
+                with self.subTest(kind=kind, nth=nth), self.assertRaises(kc.Refused) as why:
+                    self.probe(edge_nel='cf-nel', edge_nel_nth=(nth, kind))
+                self.assertIn(labels, str(why.exception))
+                self.assertTrue(str(why.exception).endswith('headers differ: report-to (cf-nel, more than its token)'),
+                                str(why.exception))
+                self.assertNotIn('a.nel.cloudflare.com', str(why.exception))
         for flags, end in (({'edge_nel': 'cf-nel', 'edge_nel_nth': (3, 'absent')}, 'headers differ: report-to'),
                            ({'edge_nel': 'cf-nel', 'edge_nel_nth': (1, 'absent')}, 'headers differ: report-to'),
                            ({'edge_nel': 'absent', 'edge_nel_nth': (3, 'cf-nel')}, 'headers differ: report-to'),
@@ -1723,18 +1753,37 @@ class FrontRejects(unittest.TestCase):
 
     def test_cf_nel_report_to_is_only_cloudflares_shape(self):
         good = self.RT
-        pad = kc.REPORT_TO_MAX - len(CF_REPORT_TO % '')
-        for value in (good, CF_REPORT_TO % 'x%2By%3D%3D', CF_REPORT_TO % '',
-                      # as the edge spells it: other key order, escaped slashes
-                      '{"endpoints":[{"url":"https:\\/\\/a.nel.cloudflare.com\\/report\\/v4?s=abc"}],"group":"cf-nel",'
-                      '"max_age":604800}',
-                      good.replace('604800', '1'),
-                      good.replace('}]}', '},{"url":"https://a.nel.cloudflare.com/report/v5"}]}'),
-                      CF_REPORT_TO % ('A' * pad)):                       # exactly the cap
+        blank = kc.REPORT_TO_MAX - len(good)                             # whitespace JSON allows, up to the cap
+        at_the_cap = good.replace('{"group"', '{' + ' ' * blank + '"group"')
+        for value in (good, CF_REPORT_TO % 'x%2By%3D%3D', CF_REPORT_TO % 'x+y/z==', CF_REPORT_TO % 'a',
+                      CF_REPORT_TO % 'x\\/y',                             # "/" in the token, spelled as JSON may
+                      CF_REPORT_TO % ('A' * 512),                        # exactly the token cap
+                      at_the_cap,
+                      *(v % 'tokenA' for v in CF_NEL_OTHER.values())):   # other max_age, path, spelling: still the shape
             self.assertTrue(kc.cf_nel_report_to(value), value[:80])
-        self.assertEqual(len(CF_REPORT_TO % ('A' * pad)), 2048)
+        self.assertEqual(len(at_the_cap), 2048)
         bad = dict(NOT_CF_NEL, **{
-            'one over the cap': CF_REPORT_TO.replace('%s', 'A' * (pad + 1)),
+            'one over the cap': at_the_cap.replace('{ ', '{  '),
+            'token one over its cap': CF_REPORT_TO.replace('%s', 'A' * 513),
+            'empty token': CF_REPORT_TO.replace('%s', ''),
+            'no query': good.replace('?s=tokenA', ''),
+            'another parameter name': good.replace('?s=', '?t='),
+            'a second parameter': good.replace('tokenA', 'tokenA&live=1'),
+            'a second question mark': good.replace('tokenA', 'token?A'),
+            'a fragment': good.replace('tokenA', 'tokenA#live'),
+            'a fragment before the query': good.replace('v4?', 'v4#live?'),
+            'question mark escaped': good.replace('?s=', '\\u003fs='),
+            'token escaped': good.replace('tokenA', 'token\\u0041'),
+            'quote in the token': good.replace('tokenA', 'token\\"A'),
+            'two endpoints': good.replace('}]}', '},{"url":"https://a.nel.cloudflare.com/report/v4?s=z"}]}'),
+            'two endpoints, the same': good.replace('}]}', '},{"url":"https://a.nel.cloudflare.com/report/v4?s=tokenA"}]}'),
+            'empty path': good.replace('/report/v4', '/report/'),
+            'path ..': good.replace('/report/v4', '/report/../../x'),
+            'path ends ..': good.replace('/report/v4', '/report/v4/..'),
+            'path %2e%2e': good.replace('/report/v4', '/report/%2e%2e/x'),
+            'path %2E': good.replace('/report/v4', '/report/.%2E/x'),
+            'path backslash': good.replace('/report/v4', '/report/v4\\\\x'),
+            'path too long': good.replace('/report/v4', '/report/' + 'v' * 65),
             'no group': good.replace('"group":"cf-nel",', ''),
             'no max_age': good.replace('"max_age":604800,', ''),
             'no endpoints': '{"group":"cf-nel","max_age":604800}',
@@ -1780,6 +1829,18 @@ class FrontRejects(unittest.TestCase):
             self.assertFalse(kc.cf_nel_report_to(value), name)
         for value in (None, 7, good.encode()):
             self.assertFalse(kc.cf_nel_report_to(value))
+            self.assertIsNone(kc.cf_nel_rest(value))
+
+    def test_cf_nel_rest_is_the_value_with_only_the_token_cut_out(self):
+        rest = '{"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s="}]}'
+        for token in ('tokenA', 'x%2By%3D%3D', 'x+y/z==', 'x\\/y', 'A' * 512, 's=', 'cf-nel', '604800', 'v4'):
+            self.assertEqual(kc.cf_nel_rest(CF_REPORT_TO % token), rest, token[:20])
+        for kind, value in CF_NEL_OTHER.items():
+            with self.subTest(kind=kind):
+                self.assertEqual(kc.cf_nel_rest(value % 'tokenA'), value % '')       # every character but the token
+                self.assertEqual(kc.cf_nel_rest(value % 'tokenA'), kc.cf_nel_rest(value % 'tokenB'))
+                self.assertNotEqual(kc.cf_nel_rest(value % 'tokenA'), rest)
+        self.assertIsNone(kc.cf_nel_rest(rest))                          # the rest is not itself a well-formed value
 
     def test_two_cf_nel_report_tos_are_identical_whatever_their_token_and_nothing_else_is(self):
         nf, differs = self.nf, kc.differs
@@ -1787,7 +1848,25 @@ class FrontRejects(unittest.TestCase):
         b = nf(('report-to', CF_REPORT_TO % 'tokenB'), ('nel', CF_NEL))
         self.assertEqual(kc.norm(a), kc.norm(b))
         kc.all_identical('404', [('a', a), ('b', b), ('c', nf(('nel', CF_NEL), ('report-to', CF_REPORT_TO % 'c')))])
-        self.assertNotIn('token', repr(kc.norm(a)))                      # the placeholder holds nothing of the value
+        self.assertNotIn('token', repr(kc.norm(a)))                      # the row holds nothing of the token
+        self.assertIn(('report-to', 'cf-nel', CF_REPORT_TO % ''), kc.headers_of(a))   # ... and all of the rest
+        # only the token: another max_age, path, spelling or key order on one answer is a difference, and is named so
+        more = 'headers differ: report-to (cf-nel, more than its token)'
+        for kind, value in CF_NEL_OTHER.items():
+            x, y = nf(('report-to', value % 'tokenA'), ('nel', CF_NEL)), nf(('nel', CF_NEL), ('report-to', value % 'tokenB'))
+            with self.subTest(kind=kind):
+                self.assertNotEqual(kc.norm(a), kc.norm(x))
+                self.assertEqual(differs(a, x), more)
+                self.assertEqual(differs(x, a), more)
+                self.assertEqual(differs(nf(('report-to', value % 'tokenB'), ('nel', CF_NEL)), b), more)   # the same token
+                with self.assertRaises(kc.Refused) as why:
+                    kc.all_identical('404', [('first', a), ('second', b), ('third', x)])
+                self.assertEqual(str(why.exception), '404: "third" differs from "first": ' + more)
+                kc.all_identical('404', [('first', x), ('second', y)])   # on every answer of the run it is no difference
+        one, v5 = (nf(('report-to', CF_NEL_OTHER[kind] % 'a')) for kind in ('max_age_1', 'path_v5'))
+        self.assertEqual(differs(one, v5), more)
+        # two of them against one of another kind: counted, and still named as more than the token
+        self.assertEqual(differs(nf(('report-to', self.RT), ('report-to', self.RT)), one), more)
         # presence is compared: with against without, once against twice
         none = nf(('nel', CF_NEL))
         twice = nf(('report-to', CF_REPORT_TO % 'tokenA'), ('report-to', CF_REPORT_TO % 'tokenB'), ('nel', CF_NEL))
@@ -1795,6 +1874,16 @@ class FrontRejects(unittest.TestCase):
             self.assertNotEqual(kc.norm(a), kc.norm(other))
             self.assertEqual(differs(a, other), 'headers differ: report-to')
             self.assertEqual(differs(other, a), 'headers differ: report-to')
+        # the finding's four: max_age 1 against 604800, two endpoints against one, path v5 against v4, ../ in the path
+        two = self.RT.replace('}]}', '},{"url":"https://a.nel.cloudflare.com/report/v4?s=z"}]}')
+        for name, value, why_named in (('max_age', self.RT.replace('604800', '1'), 'report-to (cf-nel, more than its token)'),
+                                       ('endpoints', two, "report-to (not Cloudflare's cf-nel)"),
+                                       ('path', self.RT.replace('/v4', '/v5'), 'report-to (cf-nel, more than its token)'),
+                                       ('dot-dot', self.RT.replace('/report/v4', '/report/../v4'),
+                                        "report-to (not Cloudflare's cf-nel)")):
+            with self.subTest(name=name), self.assertRaises(kc.Refused) as why:
+                kc.all_identical('404', [('base', a), ('variant', nf(('report-to', value), ('nel', CF_NEL)))])
+            self.assertEqual(str(why.exception), '404: "variant" differs from "base": headers differ: ' + why_named)
         # nel is compared as it is
         nel = nf(('report-to', CF_REPORT_TO % 'tokenB'), ('nel', CF_NEL.replace('0.0', '0.5')))
         self.assertNotEqual(kc.norm(a), kc.norm(nel))
@@ -1814,9 +1903,9 @@ class FrontRejects(unittest.TestCase):
                 with self.assertRaises(kc.Refused) as why:
                     kc.all_identical('404', [('first', a), ('second', b), ('third', x)])
                 self.assertEqual(str(why.exception), '404: "third" differs from "first": ' + named)
-        # no raw value can pass for the placeholder
-        for value in ('', 'cf-nel', "('report-to', 'cf-nel', '')"):
-            self.assertNotEqual(kc.norm(a), kc.norm(nf(('report-to', value), ('nel', CF_NEL))), value)
+        # no raw value can pass for a cf-nel row
+        for value in ('', 'cf-nel', "('report-to', 'cf-nel', '')", CF_REPORT_TO % ''):
+            self.assertNotEqual(kc.norm(a), kc.norm(nf(('report-to', value), ('nel', CF_NEL))), value[:40])
         # other headers and the body are compared as before
         self.assertEqual(differs(a, nf(('report-to', CF_REPORT_TO % 'tokenB'), ('nel', CF_NEL), ('x-foo', '1'))),
                          'headers differ: x-foo')
@@ -1834,7 +1923,9 @@ class FrontRejects(unittest.TestCase):
             kc.check_fixed_answer('x', self.nf(('report-to', self.RT), ('nel', CF_NEL), status=status, body=body), status, body)
             kc.check_fixed_answer('x', self.nf(('report-to', self.RT), ('report-to', CF_REPORT_TO % 'b'), status=status,
                                                body=body), status, body)
-            for kind, value in dict(NOT_CF_NEL, empty='', placeholder='cf-nel').items():
+            for value in CF_NEL_OTHER.values():                          # one answer alone is not held to 604800 or v4
+                kc.check_fixed_answer('x', self.nf(('report-to', value % 'tokenA'), status=status, body=body), status, body)
+            for kind, value in dict(NOT_CF_NEL, empty='', group_alone='cf-nel').items():
                 value = value % 'tokenA' if '%s' in value else value
                 # alone, and behind one of Cloudflare's own (every report-to line is judged, not the first)
                 for headers in ([('report-to', value)], [('report-to', self.RT), ('report-to', value)]):
@@ -1866,6 +1957,8 @@ class FrontRejects(unittest.TestCase):
         for first, second, fragment in (
                 (page(rt('a')), page(), 'headers differ: report-to'),
                 (page(rt('a')), page(('report-to', NOT_CF_NEL['http'] % 'b')), "report-to (not Cloudflare's cf-nel)"),
+                (page(rt('a')), page(('report-to', CF_NEL_OTHER['max_age_1'] % 'b')), 'report-to (cf-nel, more than its token)'),
+                (page(rt('a')), page(('report-to', NOT_CF_NEL['two_endpoints'] % 'b')), "report-to (not Cloudflare's cf-nel)"),
                 (page(rt('a'), ('nel', CF_NEL)), page(rt('b'), ('nel', '{}')), 'headers differ: nel')):
             with self.assertRaises(kc.Refused) as why:
                 kc.fold_edge([(kc.DUP_AUTH[0], first), (kc.DUP_AUTH[1], second)] + rob)

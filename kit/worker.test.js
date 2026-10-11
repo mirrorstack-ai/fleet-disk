@@ -320,12 +320,17 @@ test('a pepper under 16 characters is a 503 for a well-formed request and for an
   assert.equal((await get(h, BUNDLE)).status, 200);
 });
 
-// Run 38164673127 (release 5229131): on the live host every answer of this Worker arrived with Cloudflare's Network Error
+// Run 38164673127 (release 5229131): every Worker 404 (and /_k/state) on staging arrived with Cloudflare's Network Error
 // Logging headers, added by the edge: a constant `nel` and a `report-to` whose endpoint URL holds a per-response token
-// (the coordinator's probe of 6 staging 404s and /_k/state). bin/fleet-kit-check.py takes a well-formed cf-nel report-to
-// as one placeholder in its identity checks. That is sound only while the Worker never sets these headers itself: then
-// the token is the edge's and cannot carry what the Worker knows about an invite. This pins it.
+// (the coordinator's probe: 6 fetches of the Worker's 404 on staging, and /_k/state). bin/fleet-kit-check.py compares a
+// well-formed cf-nel report-to without that token in its identity checks (cf_nel_rest, headers_of). That is sound only
+// while the Worker never sets these headers itself: then the token is the edge's and cannot carry what the Worker knows
+// about an invite. This pins it.
 const REPORTING = ['report-to', 'nel', 'reporting-endpoints'];
+// A name check over shipped source, comments left out (a `//` at the start of a line or after a blank, so the tail of a
+// line that holds a URL is still read): a reporting header name anywhere, `nel` as a whole word in any case (a quoted
+// string, an object key, a property).
+const namesReporting = (src) => /report-to|reporting-endpoints|\bnel\b/i.test(src.replace(/(^|\s)\/\/.*$/gm, ''));
 
 test('the Worker sets no reporting header: not on a fixed 404, 429 or 503, a JSON admin reply or a 200 download', async () => {
   const h = await ready();
@@ -348,11 +353,26 @@ test('the Worker sets no reporting header: not on a fixed 404, 429 or 503, a JSO
     assert.deepEqual([...res.headers.keys()].sort(), ['cache-control', 'content-type'], name);
     await res.arrayBuffer();
   }
-  // ... and no shipped source names one, so no path the samples above miss can set it
+  // The pin is the key set above: worker.js builds a Response in three places (fixed, json, the 200 download), each with
+  // a literal headers object, and every one is sampled. Beside it, a name check: no shipped source names a reporting
+  // header outside a comment.
   const files = readdirSync(new URL('.', import.meta.url)).filter((f) => f.endsWith('.js') && !f.includes('test'));
   assert.ok(files.includes('worker.js') && files.includes('gate.js'));
+  let responses = 0;
   for (const f of files) {
     const src = readFileSync(new URL(f, import.meta.url), 'utf8');
-    assert.ok(!/report-to|reporting-endpoints|['"`]nel['"`]/i.test(src), `${f}: names a reporting header`);
+    assert.ok(!namesReporting(src), `${f}: names a reporting header`);
+    responses += (src.match(/new Response\b/g) || []).length;
+  }
+  assert.equal(responses, 3, 'a fourth Response builder: sample its answer above');
+  // the check itself: it sees each way to name one, and a comment is not one
+  for (const src of ["{ nel: 'x' }", '{ NEL: 1 }', "h.set('NEL', 'x')", 'h.set("nel", v)', 'headers.nel = v', '{ [`nel`]: v }',
+    "{ 'Report-To': v }", "h.append('reporting-endpoints', v)", "const u = 'https://example.net/'; h.set('nel', v)",
+    "x = 1; /* a block comment is read */ h.nel = 1"]) {
+    assert.ok(namesReporting(src), src);
+  }
+  for (const src of ['// the nel/report-to the platform adds', 'const a = 1; // nel and report-to are the edge\'s',
+    '  // Reporting-Endpoints', 'const channel = 1; const panel = funnel + kernel_x;', "h.set('cache-control', 'no-store')"]) {
+    assert.ok(!namesReporting(src), src);
   }
 });
