@@ -39,7 +39,8 @@ export { Gate };
 // ---- the fixed answers --------------------------------------------------------
 
 // One constant per answer, one builder: every non-200 public answer is
-// byte-identical (apart from the date and cf-ray the platform adds).
+// byte-identical (apart from the date, the cf-ray and the nel/report-to the
+// platform adds, kit-deploy run 38164673127).
 const BODIES = { 404: 'not found\n', 429: 'try later\n', 503: 'unavailable\n' };
 const fixed = (status) =>
   new Response(BODIES[status], {
