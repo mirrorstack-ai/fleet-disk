@@ -319,3 +319,40 @@ test('a pepper under 16 characters is a 503 for a well-formed request and for an
   const h = await ready({ INVITE_PEPPER: 'a'.repeat(16) }); // exactly 16 is enough
   assert.equal((await get(h, BUNDLE)).status, 200);
 });
+
+// Run 38164673127 (release 5229131): on the live host every answer of this Worker arrived with Cloudflare's Network Error
+// Logging headers, added by the edge: a constant `nel` and a `report-to` whose endpoint URL holds a per-response token
+// (the coordinator's probe of 6 staging 404s and /_k/state). bin/fleet-kit-check.py takes a well-formed cf-nel report-to
+// as one placeholder in its identity checks. That is sound only while the Worker never sets these headers itself: then
+// the token is the edge's and cannot carry what the Worker knows about an invite. This pins it.
+const REPORTING = ['report-to', 'nel', 'reporting-endpoints'];
+
+test('the Worker sets no reporting header: not on a fixed 404, 429 or 503, a JSON admin reply or a 200 download', async () => {
+  const h = await ready();
+  const answers = [
+    ['front 404', await get(h, `${BUNDLE}?x=1`), 404, 'text/plain'],
+    ['gate 404', await get(h, BUNDLE, { code: 'WWWW2222HH', ip: '198.51.100.9' }), 404, 'text/plain'],
+    ['admin 404', await admin(h, 'gateway', 'GET', '/_k/state', null, { noAuth: true }), 404, 'text/plain'],
+    ['admin json 200', await admin(h, 'gateway', 'GET', '/_k/state'), 200, 'application/json'],
+    ['admin json refusal', await admin(h, 'gateway', 'PUT', '/_k/floor', '{"floor":0}'), 403, 'application/json'],
+    ['200 download', await get(h, BUNDLE), 200, 'application/octet-stream'],
+  ];
+  for (let i = 0; i < 30; i++) await get(h, BUNDLE, { code: 'WWWW2222HH' });
+  answers.push(['429', await get(h, BUNDLE), 429, 'text/plain']);
+  h.broken = true;
+  answers.push(['503', await get(h, BUNDLE, { ip: '198.51.100.10' }), 503, 'text/plain']);
+  for (const [name, res, status, type] of answers) {
+    assert.equal(res.status, status, name);
+    assert.equal(res.headers.get('content-type'), type, name);
+    for (const header of REPORTING) assert.equal(res.headers.get(header), null, `${name}: ${header}`);
+    assert.deepEqual([...res.headers.keys()].sort(), ['cache-control', 'content-type'], name);
+    await res.arrayBuffer();
+  }
+  // ... and no shipped source names one, so no path the samples above miss can set it
+  const files = readdirSync(new URL('.', import.meta.url)).filter((f) => f.endsWith('.js') && !f.includes('test'));
+  assert.ok(files.includes('worker.js') && files.includes('gate.js'));
+  for (const f of files) {
+    const src = readFileSync(new URL(f, import.meta.url), 'utf8');
+    assert.ok(!/report-to|reporting-endpoints|['"`]nel['"`]/i.test(src), `${f}: names a reporting header`);
+  }
+});

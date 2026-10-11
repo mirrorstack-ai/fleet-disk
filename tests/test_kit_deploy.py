@@ -117,6 +117,30 @@ MANAGED_ROBOTS = (b'# As a condition of accessing this website, you agree to abi
                   b'# ai-train: training or fine-tuning AI models.\n\nUser-agent: *\nContent-Signal: search=yes,ai-train=no\n'
                   b'Allow: /\n')
 
+# Cloudflare's NEL headers as run 38164673127's probe saw them on every Worker 404: nel constant, report-to with a token
+# that differs per response.
+CF_NEL = '{"report_to":"cf-nel","success_fraction":0.0,"max_age":604800}'
+CF_REPORT_TO = '{"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=%s"}]}'
+# A report-to that is NOT well-formed cf-nel, each wrong in one named way (the token still differs per response).
+NOT_CF_NEL = {
+    'wrong_group': CF_REPORT_TO.replace('"group":"cf-nel"', '"group":"default"'),
+    'foreign_host': CF_REPORT_TO.replace('a.nel.cloudflare.com', 'a.nel.cloudflare.com.example.net'),
+    'http': CF_REPORT_TO.replace('https://', 'http://'),
+    'extra_key': CF_REPORT_TO.replace('{"group"', '{"include_subdomains":true,"group"'),
+    'not_json': 'cf-nel; https://a.nel.cloudflare.com/report/v4?s=%s',
+    'big': CF_REPORT_TO.replace('?s=', '?s=' + 'A' * 2048),
+}
+
+
+def report_to_values(kind: str, token: str) -> list[str]:
+    """The Report-To header lines of one answer: 'cf-nel' Cloudflare's own, 'absent' none, 'twice' two of Cloudflare's,
+    or one NOT_CF_NEL kind."""
+    if kind == 'absent':
+        return []
+    if kind == 'twice':
+        return [CF_REPORT_TO % token, CF_REPORT_TO % (token + '2')]
+    return [(CF_REPORT_TO if kind == 'cf-nel' else NOT_CF_NEL[kind]) % token]
+
 
 class FakeKit:
     """The kit Worker and its Gate as the spec describes them, in memory. Flags make it wrong in one named way."""
@@ -135,6 +159,9 @@ class FakeKit:
         self.per_source = flags.get('per_source', 30)
         self.gate_failures = 0
         self.robots_fetches = 0
+        self.served_404 = 0                      # the Worker's 404s served so far (edge_nel_nth, nel_nth)
+        self.nel_lock = threading.Lock()         # its own lock: a gate 404 is sent while self.lock is held
+        self.tokens: list[str] = []              # every report-to token sent (no refusal may print one)
         self.signed_calls = 0                    # well-formed KitAdmin calls seen, in order (version-propagation flags)
         self.per_target: dict[tuple[str, str | None], int] = {}
         self.admin_log: list[tuple[str, str, str, int, int]] = []  # (role, method, path, ts, status) per signed call
@@ -178,13 +205,32 @@ def make_handler(kit: FakeKit):
             self.send_header('Cache-Control', 'no-store, no-transform')
             self.send_header('Content-Length', str(len(body)))
             self.send_header('CF-RAY', os.urandom(8).hex())
-            if kit.flags.get('report_to_404') and status == 404:  # a per-response reporting header on the Worker's 404
-                self.send_header('Report-To', '{"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=%s"}]}'
-                                 % os.urandom(8).hex())
+            self.edge_nel(status)
             if kit.flags.get('gzip_404') and status == 404 and 'gzip' in (self.headers.get('Accept-Encoding') or ''):
                 self.send_header('Content-Encoding', 'gzip')
             self.end_headers()
             self.wfile.write(body)
+
+        def edge_nel(self, status):
+            """kit.flags['edge_nel']=KIND: the reporting headers Cloudflare's edge adds to every answer of the Worker (run
+            38164673127): a constant NEL and a Report-To of that kind (report_to_values) with a per-response token.
+            edge_nel_nth=(N, KIND): the Nth 404 served takes this kind instead. nel_nth=N: the Nth 404's NEL is another."""
+            kind = kit.flags.get('edge_nel')
+            if not kind:
+                return
+            n = 0
+            if status == 404:
+                with kit.nel_lock:
+                    kit.served_404 += 1
+                    n = kit.served_404
+                nth = kit.flags.get('edge_nel_nth')
+                if nth and nth[0] == n:
+                    kind = nth[1]
+            token = os.urandom(8).hex()
+            kit.tokens.append(token)
+            for value in report_to_values(kind, token):
+                self.send_header('Report-To', value)
+            self.send_header('NEL', CF_NEL.replace('0.0', '0.5') if n and n == kit.flags.get('nel_nth') else CF_NEL)
 
         def nf(self):
             self.send_fixed(404, b'not found\n')
@@ -1335,6 +1381,7 @@ class OverHttp(unittest.TestCase):
         self.assertIn('(c) wrong bytes: 422 (R2 checksum), overwrite: 409 (Worker head guard; the R2 onlyIf wildcard is not separately observable), identical re-upload: 200', text)
         self.assertIn('not CPU time', text)
         self.assertRegex(text, r'404 answers compared: \d+, identical')
+        self.assertRegex(text, r"Cloudflare's cf-nel report-to on 0 of \d+ \(")   # none here: the summary says so
         self.assertEqual(kit.fails, 30)
         self.assertEqual(kit.floor, 0)
         self.assertTrue(all(i['revoked'] for i in kit.invites.values()))  # nothing open is left on the Worker
@@ -1428,9 +1475,39 @@ class OverHttp(unittest.TestCase):
         self.assertIn("robots: Cloudflare's managed robots.txt for both fetches, identical", '\n'.join(lines))
         self.assertEqual(kit.robots_fetches, 2)
         self.refused('robots: "robots, second fetch" differs from "robots": headers differ: x-foo', robots='x_foo')
-        # the Worker's 404s are held to VARYING alone: a differing report-to on them still refuses
-        self.refused('differs from', report_to_404=True)
-        self.refused('headers differ: report-to', report_to_404=True)
+
+    # -- Cloudflare's cf-nel report-to on the Worker's answers (run 38164673127) ---------------------------------------
+    def test_the_replay_takes_cloudflares_cf_nel_report_to_whatever_its_token(self):
+        # run 38164673127: '404: "below the floor" differs from "admin stale": headers differ: report-to'
+        kit, lines = self.replay(edge_nel='cf-nel', robots='reporting', dup_auth='edge')
+        text = '\n'.join(lines)
+        self.assertIn('vectors passed', text)
+        compared = int(re.search(r'404 answers compared: (\d+), identical', text).group(1))
+        self.assertGreater(compared, 30)
+        self.assertIn("Cloudflare's cf-nel report-to on %d of %d (its token is not compared)" % (compared, compared), text)
+        self.assertIn("duplicate Authorization: Cloudflare's edge 400 for both cases, identical", text)
+        self.assertIn("robots: Cloudflare's managed robots.txt for both fetches, identical", text)
+        self.assertGreater(len(set(kit.tokens)), 30)                     # the tokens did differ, 404 by 404
+        self.assertEqual(kit.fails, 30)
+        for token in kit.tokens:
+            self.assertNotIn(token, text)
+
+    def test_the_replay_refuses_a_404_whose_report_to_is_not_cloudflares_cf_nel(self):
+        # one 404 among Cloudflare's own: it is compared raw, differs from the placeholder and is named
+        e = self.refused('404: "below the floor" differs from "admin stale": headers differ: report-to '
+                         "(not Cloudflare's cf-nel)", edge_nel='cf-nel', edge_nel_nth=(2, 'wrong_group'))
+        self.assertNotIn('a.nel.cloudflare.com', str(e))                 # never the value
+        # every answer: the first fixed answer judged already refuses it (the 429 comes before the 404 set)
+        e = self.refused("429: report-to is not Cloudflare's cf-nel", edge_nel='foreign_host')
+        self.assertNotIn('example.net', str(e))
+
+    def test_the_replay_refuses_a_404_without_the_report_to_the_others_carry_and_a_differing_nel(self):
+        e = self.refused('404: "below the floor" differs from "admin stale": headers differ: report-to',
+                         edge_nel='cf-nel', edge_nel_nth=(2, 'absent'))
+        self.assertTrue(str(e).endswith('headers differ: report-to'))    # presence alone: nel was there, nothing malformed
+        e = self.refused('404: "below the floor" differs from "admin stale": headers differ: nel',
+                         edge_nel='cf-nel', nel_nth=2)
+        self.assertTrue(str(e).endswith('headers differ: nel'))
 
     def test_the_managed_robots_page_on_another_label_is_refused(self):
         self.refused('root: status 200, expected 404', managed_robots_on='/')
@@ -1449,6 +1526,7 @@ class OverHttp(unittest.TestCase):
         with Served(kit) as base:
             lines = kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
         self.assertIn('byte-identical, 5 reached the gate', lines[0])
+        self.assertIn("Cloudflare's cf-nel report-to on 0 of 25 (its token is not compared)", '\n'.join(lines))
         self.assertEqual(kit.gate_failures, 5)
         self.assertLessEqual(kit.gate_failures, kc.PROBE_MAX_FAILURES)
 
@@ -1475,12 +1553,47 @@ class OverHttp(unittest.TestCase):
             self.assertEqual(kit.gate_failures, 5)
         for flags, fragment in (({'robots': 'hello'}, 'lacks marker, content signals'), ({'robots': 'mixed'}, 'answered 404'),
                                 ({'robots': 'differ'}, 'body differs'), ({'managed_robots_on': '/'}, 'differs'),
-                                ({'robots': 'x_foo'}, 'headers differ: x-foo'),
-                                ({'report_to_404': True}, 'headers differ: report-to')):
+                                ({'robots': 'x_foo'}, 'headers differ: x-foo')):
             kit = FakeKit(self.pubs, **flags)
             with Served(kit) as base, self.assertRaises(kc.Refused) as why:
                 kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
             self.assertIn(fragment, str(why.exception))
+
+    def probe(self, **flags):
+        kit = FakeKit(self.pubs, **flags)
+        with Served(kit) as base:
+            return kit, kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
+
+    def test_the_probe_takes_cloudflares_cf_nel_report_to_by_the_same_rule(self):
+        for flags, n in (({'edge_nel': 'cf-nel'}, 25), ({'edge_nel': 'cf-nel', 'robots': 'reporting', 'dup_auth': 'edge'}, 21)):
+            kit, lines = self.probe(**flags)
+            self.assertIn('%d answers, byte-identical, 5 reached the gate' % n, lines[0])
+            self.assertIn("Cloudflare's cf-nel report-to on %d of %d (its token is not compared)" % (n, n), '\n'.join(lines))
+            self.assertGreater(len(set(kit.tokens)), 15)
+            self.assertFalse([t for t in kit.tokens if t in '\n'.join(lines)])
+        not_cf = "report-to (not Cloudflare's cf-nel)"
+        for kind in NOT_CF_NEL:
+            for flags, fragment in (
+                    # on every answer: the first answer's own check names it
+                    ({'edge_nel': kind}, "probe first answer: report-to is not Cloudflare's cf-nel"),
+                    # on the first answer only, or on one later answer: the identity check names it
+                    ({'edge_nel': 'cf-nel', 'edge_nel_nth': (1, kind)}, "probe first answer: report-to is not Cloudflare's"),
+                    ({'edge_nel': 'cf-nel', 'edge_nel_nth': (3, kind)},
+                     'probe: "gateway.json, serial 7" differs from "bundle, serial 1": headers differ: ' + not_cf)):
+                with self.subTest(kind=kind, flags=flags), self.assertRaises(kc.Refused) as why:
+                    self.probe(**flags)
+                self.assertIn(fragment, str(why.exception))
+                for part in ('a.nel.cloudflare.com', 'example.net', 'AAAA', 'default', 'include_subdomains'):
+                    self.assertNotIn(part, str(why.exception))           # a refusal never carries the value
+        for flags, end in (({'edge_nel': 'cf-nel', 'edge_nel_nth': (3, 'absent')}, 'headers differ: report-to'),
+                           ({'edge_nel': 'cf-nel', 'edge_nel_nth': (1, 'absent')}, 'headers differ: report-to'),
+                           ({'edge_nel': 'absent', 'edge_nel_nth': (3, 'cf-nel')}, 'headers differ: report-to'),
+                           ({'edge_nel': 'cf-nel', 'edge_nel_nth': (3, 'twice')}, 'headers differ: report-to'),
+                           ({'edge_nel': 'cf-nel', 'nel_nth': 3}, 'headers differ: nel'),
+                           ({'edge_nel': 'cf-nel', 'nel_nth': 1}, 'headers differ: nel')):
+            with self.subTest(flags=flags), self.assertRaises(kc.Refused) as why:
+                self.probe(**flags)
+            self.assertTrue(str(why.exception).endswith(end), str(why.exception))
 
     def test_the_probe_refuses_an_answer_that_differs_or_a_429(self):
         for flags, fragment in (({'gzip_404': True}, 'differs'), ({'per_source': 0}, 'answered 429')):
@@ -1599,6 +1712,175 @@ class FrontRejects(unittest.TestCase):
         self.assertEqual(kc.VARYING, frozenset({'date', 'cf-ray'}))
         self.assertEqual(kc.EDGE_400_PAGE.varying, kc.VARYING)
         self.assertEqual(kc.MANAGED_ROBOTS.varying, kc.VARYING | {'report-to', 'nel'})
+
+    # -- Cloudflare's cf-nel report-to (run 38164673127) ---------------------------------------------------------------
+    RT = CF_REPORT_TO % 'tokenA'
+
+    @staticmethod
+    def nf(*headers, status=404, body=b'not found\n'):
+        return kc.Resp(status, [('content-type', 'text/plain'), ('cache-control', 'no-store, no-transform')] + list(headers),
+                       body, 1)
+
+    def test_cf_nel_report_to_is_only_cloudflares_shape(self):
+        good = self.RT
+        pad = kc.REPORT_TO_MAX - len(CF_REPORT_TO % '')
+        for value in (good, CF_REPORT_TO % 'x%2By%3D%3D', CF_REPORT_TO % '',
+                      # as the edge spells it: other key order, escaped slashes
+                      '{"endpoints":[{"url":"https:\\/\\/a.nel.cloudflare.com\\/report\\/v4?s=abc"}],"group":"cf-nel",'
+                      '"max_age":604800}',
+                      good.replace('604800', '1'),
+                      good.replace('}]}', '},{"url":"https://a.nel.cloudflare.com/report/v5"}]}'),
+                      CF_REPORT_TO % ('A' * pad)):                       # exactly the cap
+            self.assertTrue(kc.cf_nel_report_to(value), value[:80])
+        self.assertEqual(len(CF_REPORT_TO % ('A' * pad)), 2048)
+        bad = dict(NOT_CF_NEL, **{
+            'one over the cap': CF_REPORT_TO.replace('%s', 'A' * (pad + 1)),
+            'no group': good.replace('"group":"cf-nel",', ''),
+            'no max_age': good.replace('"max_age":604800,', ''),
+            'no endpoints': '{"group":"cf-nel","max_age":604800}',
+            'group twice': good.replace('{"group":"cf-nel"', '{"group":"default","group":"cf-nel"'),
+            'group case': good.replace('cf-nel', 'CF-NEL'),
+            'group not a string': good.replace('"cf-nel"', '["cf-nel"]'),
+            'max_age zero': good.replace('604800', '0'),
+            'max_age negative': good.replace('604800', '-1'),
+            'max_age float': good.replace('604800', '604800.0'),
+            'max_age string': good.replace('604800', '"604800"'),
+            'max_age true': good.replace('604800', 'true'),
+            'endpoints empty': good.replace('[{"url":"https://a.nel.cloudflare.com/report/v4?s=tokenA"}]', '[]'),
+            'endpoints an object': good.replace('[{', '{').replace('}]', '}'),
+            'endpoint a string': good.replace('{"url":"https://a.nel.cloudflare.com/report/v4?s=tokenA"}',
+                                              '"https://a.nel.cloudflare.com/report/v4"'),
+            'endpoint extra key': good.replace('{"url"', '{"priority":1,"url"'),
+            'endpoint url twice': good.replace('{"url"', '{"url":"https://example.net/","url"'),
+            'endpoint no url': good.replace('"url"', '"uri"'),
+            'url not a string': good.replace('"https://a.nel.cloudflare.com/report/v4?s=tokenA"', '7'),
+            'second endpoint foreign': good.replace('}]}', '},{"url":"https://example.net/report/v4"}]}'),
+            'host with a port': good.replace('cloudflare.com/', 'cloudflare.com:8443/'),
+            'host as userinfo': good.replace('https://a.nel.cloudflare.com/', 'https://a.nel.cloudflare.com@example.net/'),
+            'host subdomain': good.replace('a.nel.', 'b.a.nel.'),
+            'host case': good.replace('a.nel.cloudflare.com', 'A.NEL.CLOUDFLARE.COM'),
+            'scheme case': good.replace('https://', 'HTTPS://'),
+            'no path': good.replace('/report/v4?s=tokenA', ''),
+            'other path': good.replace('/report/', '/reports/'),
+            'path is /report': good.replace('/report/v4?s=tokenA', '/report'),
+            'backslash host': good.replace('cloudflare.com/report', 'cloudflare.com\\\\@example.net/report'),
+            'space in the url': good.replace('tokenA', 'token A'),
+            'tab in the url': good.replace('tokenA', 'token\\tA'),
+            'non-ascii in the url': good.replace('tokenA', 'token\\u00e9'),
+            'leading space in the url': good.replace('"https://', '" https://'),
+            'an array': '[%s]' % good,
+            'two objects': good + good,
+            'a json string': json.dumps(good),
+            'empty': '',
+            'null': 'null',
+            'too deep': '[' * 1500,
+        })
+        for name, value in bad.items():
+            value = value % 'tokenA' if '%s' in value else value
+            self.assertFalse(kc.cf_nel_report_to(value), name)
+        for value in (None, 7, good.encode()):
+            self.assertFalse(kc.cf_nel_report_to(value))
+
+    def test_two_cf_nel_report_tos_are_identical_whatever_their_token_and_nothing_else_is(self):
+        nf, differs = self.nf, kc.differs
+        a = nf(('report-to', CF_REPORT_TO % 'tokenA'), ('nel', CF_NEL))
+        b = nf(('report-to', CF_REPORT_TO % 'tokenB'), ('nel', CF_NEL))
+        self.assertEqual(kc.norm(a), kc.norm(b))
+        kc.all_identical('404', [('a', a), ('b', b), ('c', nf(('nel', CF_NEL), ('report-to', CF_REPORT_TO % 'c')))])
+        self.assertNotIn('token', repr(kc.norm(a)))                      # the placeholder holds nothing of the value
+        # presence is compared: with against without, once against twice
+        none = nf(('nel', CF_NEL))
+        twice = nf(('report-to', CF_REPORT_TO % 'tokenA'), ('report-to', CF_REPORT_TO % 'tokenB'), ('nel', CF_NEL))
+        for other in (none, twice):
+            self.assertNotEqual(kc.norm(a), kc.norm(other))
+            self.assertEqual(differs(a, other), 'headers differ: report-to')
+            self.assertEqual(differs(other, a), 'headers differ: report-to')
+        # nel is compared as it is
+        nel = nf(('report-to', CF_REPORT_TO % 'tokenB'), ('nel', CF_NEL.replace('0.0', '0.5')))
+        self.assertNotEqual(kc.norm(a), kc.norm(nel))
+        self.assertEqual(differs(a, nel), 'headers differ: nel')
+        self.assertEqual(differs(a, nf(('report-to', CF_REPORT_TO % 'tokenB'))), 'headers differ: nel')
+        # a report-to that is not well-formed cf-nel is compared raw: against Cloudflare's, and against another raw one
+        named = "headers differ: report-to (not Cloudflare's cf-nel)"
+        for kind, value in NOT_CF_NEL.items():
+            x, y = nf(('report-to', value % 'tokenA'), ('nel', CF_NEL)), nf(('report-to', value % 'tokenB'), ('nel', CF_NEL))
+            with self.subTest(kind=kind):
+                self.assertNotEqual(kc.norm(a), kc.norm(x))
+                self.assertEqual(differs(a, x), named)
+                self.assertEqual(differs(x, a), named)
+                self.assertNotEqual(kc.norm(x), kc.norm(y))
+                self.assertEqual(differs(x, y), named)
+                self.assertEqual(kc.norm(x), kc.norm(nf(('nel', CF_NEL), ('report-to', value % 'tokenA'))))  # raw, equal
+                with self.assertRaises(kc.Refused) as why:
+                    kc.all_identical('404', [('first', a), ('second', b), ('third', x)])
+                self.assertEqual(str(why.exception), '404: "third" differs from "first": ' + named)
+        # no raw value can pass for the placeholder
+        for value in ('', 'cf-nel', "('report-to', 'cf-nel', '')"):
+            self.assertNotEqual(kc.norm(a), kc.norm(nf(('report-to', value), ('nel', CF_NEL))), value)
+        # other headers and the body are compared as before
+        self.assertEqual(differs(a, nf(('report-to', CF_REPORT_TO % 'tokenB'), ('nel', CF_NEL), ('x-foo', '1'))),
+                         'headers differ: x-foo')
+        self.assertEqual(differs(a, nf(('report-to', CF_REPORT_TO % 'tokenB'), ('nel', CF_NEL), body=b'not found!\n')),
+                         'body differs')
+        self.assertEqual(differs(a, nf(('report-to', 'x'), ('nel', CF_NEL), ('x-foo', '1'))),
+                         "headers differ: report-to (not Cloudflare's cf-nel), x-foo")
+        # date and cf-ray stay the only headers left out; report-to and nel are not among them
+        self.assertEqual(kc.norm(nf(('date', 'a'), ('cf-ray', '1'))), kc.norm(nf(('date', 'b'), ('cf-ray', '2'))))
+        self.assertEqual(kc.VARYING, frozenset({'date', 'cf-ray'}))
+
+    def test_a_fixed_answer_may_carry_cloudflares_cf_nel_report_to_and_no_other(self):
+        for status, body in ((404, kc.NOT_FOUND), (429, kc.TRY_LATER), (503, b'unavailable\n')):
+            kc.check_fixed_answer('x', self.nf(status=status, body=body), status, body)
+            kc.check_fixed_answer('x', self.nf(('report-to', self.RT), ('nel', CF_NEL), status=status, body=body), status, body)
+            kc.check_fixed_answer('x', self.nf(('report-to', self.RT), ('report-to', CF_REPORT_TO % 'b'), status=status,
+                                               body=body), status, body)
+            for kind, value in dict(NOT_CF_NEL, empty='', placeholder='cf-nel').items():
+                value = value % 'tokenA' if '%s' in value else value
+                # alone, and behind one of Cloudflare's own (every report-to line is judged, not the first)
+                for headers in ([('report-to', value)], [('report-to', self.RT), ('report-to', value)]):
+                    with self.subTest(status=status, kind=kind, n=len(headers)), self.assertRaises(kc.Refused) as why:
+                        kc.check_fixed_answer('the label', self.nf(*headers, status=status, body=body), status, body)
+                    self.assertEqual(str(why.exception), "the label: report-to is not Cloudflare's cf-nel")
+        # its other rules hold beside a good report-to
+        for header, fragment in ((('content-encoding', 'gzip'), 'has a content-encoding header'),
+                                 (('location', 'https://example.net/'), 'has a location header'),
+                                 (('set-cookie', 'a=1'), 'has a set-cookie header')):
+            with self.assertRaises(kc.Refused) as why:
+                kc.check_fixed_answer('x', self.nf(('report-to', self.RT), header), 404, kc.NOT_FOUND)
+            self.assertIn(fragment, str(why.exception))
+
+    def test_the_edge_rows_take_the_cf_nel_report_to_by_the_same_rule(self):
+        def page(*headers):
+            return kc.Resp(400, [('server', 'cloudflare'), ('content-type', 'text/html')] + list(headers), b'400 Bad Request', 1)
+
+        def robots(*headers):
+            return kc.Resp(200, [('server', 'cloudflare'), ('content-type', 'text/plain; charset=utf-8')] + list(headers),
+                           MANAGED_ROBOTS, 1)
+
+        rob = [(label, self.nf()) for label in kc.ROBOTS]
+        rt = lambda token: ('report-to', CF_REPORT_TO % token)  # noqa: E731
+        left, verdicts = kc.fold_edge([(kc.DUP_AUTH[0], page(rt('a'), ('nel', CF_NEL))),
+                                       (kc.DUP_AUTH[1], page(rt('b'), ('nel', CF_NEL)))] + rob)
+        self.assertEqual([label for label, _ in left], list(kc.ROBOTS))
+        self.assertIn("Cloudflare's edge 400 for both cases, identical", verdicts[0])
+        for first, second, fragment in (
+                (page(rt('a')), page(), 'headers differ: report-to'),
+                (page(rt('a')), page(('report-to', NOT_CF_NEL['http'] % 'b')), "report-to (not Cloudflare's cf-nel)"),
+                (page(rt('a'), ('nel', CF_NEL)), page(rt('b'), ('nel', '{}')), 'headers differ: nel')):
+            with self.assertRaises(kc.Refused) as why:
+                kc.fold_edge([(kc.DUP_AUTH[0], first), (kc.DUP_AUTH[1], second)] + rob)
+            self.assertTrue(str(why.exception).startswith('duplicate authorization: "two authorization headers, unknown code" '
+                                                          'differs from "two authorization headers": '), str(why.exception))
+            self.assertIn(fragment, str(why.exception))
+        # the robots row is as it was: report-to and nel are outside its comparison, well-formed or not, there or not
+        dup = [(label, self.nf()) for label in kc.DUP_AUTH]
+        for first, second in ((robots(rt('a'), ('nel', '1')), robots(rt('b'), ('nel', '2'))),
+                              (robots(('report-to', 'x')), robots(rt('b'), ('nel', '2'))),
+                              (robots(), robots(rt('b'), ('nel', '2')))):
+            left, verdicts = kc.fold_edge(dup + [(kc.ROBOTS[0], first), (kc.ROBOTS[1], second)])
+            self.assertEqual([label for label, _ in left], list(kc.DUP_AUTH))
+            self.assertIn("Cloudflare's managed robots.txt for both fetches, identical", verdicts[1])
+        self.assertEqual(kc.EDGE_REPORTING, frozenset({'report-to', 'nel'}))
 
     def test_worker_404_is_exactly_the_fixed_answer(self):
         self.assertTrue(kc.worker_404(kc.Resp(404, [('content-type', 'text/plain')], b'not found\n', 1)))
