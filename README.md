@@ -55,8 +55,12 @@ signing key's public line and fingerprint, and `mode` floor runs only the floor 
   that is a placeholder), re-hashes the bytes against the plan's sha256, signs `install.json` (namespace
   `mirrorstack-fleet-install`), `kit.json` and `deploy-pin.json` (`mirrorstack-fleet-pin`), verifies each and wipes the key.
 - **kit** (Environment `release`, secrets `FLEET_READ` and `KIT_UPLOAD_KEY` and nothing else) runs `bin/fleet-kit-upload.py`
-  twice: `bundle` rebuilds the tar from the fleet commit `install.json` names and uploads it, `gateway` reads the gateway record
-  and its signature from the fleet `release` tip, checks the owner's signature and uploads the pair. The install.json it works
+  three times: `gateway --check` judges the gateway pair at the fleet `release` tip before anything is stored (no upload, so a
+  bad pair leaves no bundle behind on the write-once host), `bundle` rebuilds the tar from the fleet commit `install.json`
+  names and uploads it, `gateway` reads the gateway record and its signature from the tip again, checks the owner's signature
+  and uploads the pair, or, while no gateway is live (the placeholder record: serial 0, address null, and no `.sig` beside it),
+  prints `SKIP gateway not-live` and uploads nothing (ledger D309), so a first test release can be published before a gateway
+  exists. Any other state without a good signed pair is still `REFUSED gateway` or `REFUSED sig`. The install.json it works
   from is the plan's output re-hashed against the plan's sha256, with the sign job's signature, so nothing here is downloaded.
   The job uploads no artifact, uses no cache and writes no step summary; the log shows a size and a sha256 only. The gateway pair
   is never in the plan's folder, which becomes a public artifact and public release assets.
@@ -186,11 +190,20 @@ never inherit it. `OWNER_PIN_SHA256` is required for both verbs (`REFUSED key` w
   (`{"sha256", "size"}`, as R2 holds them) to equal what it sent. An identical re-run is a 200; different bytes for the same serial
   are a 409 `conflict`. The other 409s keep their own word (`REFUSED replay`, `rollback`, `revoked`), and another known error
   word of the host follows the status (`REFUSED upload 401 stale`).
-- `fleet-kit-upload.py gateway --owner-pub P` reads `fleet/core/gateway.json` and `.sig` from the tip of the fleet `release`
+- `fleet-kit-upload.py gateway [--check] --owner-pub P` reads `fleet/core/gateway.json` and `.sig` from the tip of the fleet `release`
   branch, checks the owner's signature under namespace `mirrorstack-fleet-pin` and that the record has the gateway record's keys
   (`serial`, `address`, `cert_sha256`, `manifest_key`, `session_key`: the other files signed under the same namespace do not),
   and `PUT /_k/gateway/<serial>` (one to nine digits) with both files in one request, so the host flips to the pair whole or
   not at all. The answer must carry `gserial` and the `{sha256, size}` of both files. These two files never enter the release folder.
+  Not live is the one state that is not a refusal: `gateway.json` is a regular file (mode 100644) that is exactly the placeholder
+  the fleet repository holds (`serial` the integer 0 written as a plain `0`, `address`, `cert_sha256`, `manifest_key`,
+  `session_key` and `next` null, `r9_closed` false, no other key), and the tip has no `gateway.json.sig` at all. Then the verb
+  prints `SKIP gateway not-live`, makes no request and exits 0. A half-edited record (any field filled in) is not the placeholder.
+  A signature beside a placeholder, a serial 0 with an address, an unsigned record with a null address and a serial of 1 or more,
+  a live-looking record without a signature, and every malformed record stay `REFUSED gateway` (or `REFUSED sig` for a bad
+  signature). A signed record with a null address and a serial of 1 or more is judged live, as before: the address is not read.
+  `--check` is the same read and the same verdict with no upload and no upload key: `OK gateway-check serial=N`, the SKIP line, or
+  the refusal. The kit job runs it first, so a refusal comes before the bundle is stored.
 - This repository is public, so nothing a build holds is printed: git's stderr and the build's output go to a file in
   `RUNNER_TEMP`, an error names the rule and never a value, and there is no stack dump. The log shows a size and a sha256 only.
 
