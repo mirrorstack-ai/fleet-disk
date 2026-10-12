@@ -2530,7 +2530,7 @@ class Workflow(unittest.TestCase):
         self.assertIn('/dev/shm/kit.', body)
         self.assertIn('umask 077', body)
         self.assertLess(body.index('bundle "$d/install"'), body.index('gateway --owner-pub'))   # the bundle first, then the pair
-        self.assertEqual(body.count('python3 bin/fleet-kit-upload.py '), 2)
+        self.assertEqual(body.count('python3 bin/fleet-kit-upload.py '), 3)   # the pair is judged first (D309), see the next test
         self.assertIn('--owner-pub "$d/owner.pub"', body)
         for need in ('OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}', 'INSTALL_B64: ${{ needs.plan.outputs.install_b64 }}',
                      'INSTALL_SHA: ${{ needs.plan.outputs.install_sha }}', 'INSTALL_SIG: ${{ needs.sign.outputs.install_sig }}',
@@ -2539,6 +2539,25 @@ class Workflow(unittest.TestCase):
             self.assertIn(need, kit)
         self.assertLess(body.index('= "$INSTALL_SHA"'), body.index('python3 '))   # the bytes are the ones the plan hashed
         self.assertIn('timeout-minutes: 30', kit)
+
+    def test_the_kit_job_judges_the_gateway_pair_before_the_bundle_and_uploads_it_after(self):
+        body = self.run_body('kit')
+        calls = [line.strip() for line in body.splitlines() if line.strip().startswith('python3 bin/fleet-kit-upload.py ')]
+        self.assertEqual(calls, ['python3 bin/fleet-kit-upload.py gateway --check --owner-pub "$d/owner.pub"',
+                                 'python3 bin/fleet-kit-upload.py bundle "$d/install" --owner-pub "$d/owner.pub"',
+                                 'python3 bin/fleet-kit-upload.py gateway --owner-pub "$d/owner.pub"'])
+        check, bundle, upload = (body.index(c) for c in calls)
+        self.assertLess(check, bundle)
+        self.assertLess(bundle, upload)
+        self.assertLess(body.index('unset FLEET_READ'), check)   # still no child sees the read key
+        self.assertLess(body.index('GIT_SSH_COMMAND='), check)   # the check fetches the fleet tip with the read key
+        self.assertLess(body.index('= "$INSTALL_SHA"'), check)
+        self.assertEqual(body.count('set -eu'), 1)   # a refused check stops the job before the bundle is stored
+        kit = self.JOBS['kit']
+        self.assertEqual(re.findall(r'^          (\w+): ', kit, re.M),
+                         ['INSTALL_B64', 'INSTALL_SHA', 'INSTALL_SIG', 'PUB', 'OWNER_PIN_SHA256', 'KIT_HOST', 'FLEET_READ', 'KIT_UPLOAD_KEY'])
+        self.assertEqual(re.findall(r'secrets\.(\w+)', kit), ['FLEET_READ', 'KIT_UPLOAD_KEY'])
+        self.assertIn('    needs: [plan, sign]\n    if: github.ref == \'refs/heads/release\'\n    environment: release\n', kit)
 
     def test_the_gateway_record_never_enters_the_folder_the_plan_publishes(self):
         for name in fp.FIXED + fp.KIT_FILES + fp.DATA:
@@ -2590,6 +2609,7 @@ class Workflow(unittest.TestCase):
     echo "KNOWN=$(cat "$d/known_hosts")"
   fi
 } >> "$STUB_LOG"
+[ "$3" = --check ] && [ -n "$STUB_FAIL_CHECK" ] && exit 1
 [ "$2" != "$STUB_FAIL" ]
 """
 
@@ -2622,12 +2642,13 @@ class Workflow(unittest.TestCase):
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertEqual(done.stdout + done.stderr, '')
             calls = [l for l in log.splitlines() if l.startswith('ARGS ')]
-            self.assertEqual(len(calls), 2)
-            self.assertRegex(calls[0], r'^ARGS bin/fleet-kit-upload\.py bundle \S+/install --owner-pub \S+/owner\.pub$')
-            self.assertRegex(calls[1], r'^ARGS bin/fleet-kit-upload\.py gateway --owner-pub \S+/owner\.pub$')
+            self.assertEqual(len(calls), 3)
+            self.assertRegex(calls[0], r'^ARGS bin/fleet-kit-upload\.py gateway --check --owner-pub \S+/owner\.pub$')
+            self.assertRegex(calls[1], r'^ARGS bin/fleet-kit-upload\.py bundle \S+/install --owner-pub \S+/owner\.pub$')
+            self.assertRegex(calls[2], r'^ARGS bin/fleet-kit-upload\.py gateway --owner-pub \S+/owner\.pub$')
             for want in ('FLEET_READ=unset', 'UPLOAD=set', 'SSH=set', 'KEYFILE=THROWAWAY-READ-KEY', 'KEYMODE=-rw-------',
                          'INSTALL={"kind": "install"}', 'SIG=SIGBYTES', 'PUBFILE=ssh-ed25519 PUBLINE', 'KNOWN=github.com ssh-ed25519 AAAA'):
-                self.assertEqual(log.count(want + '\n'), 2, want)
+                self.assertEqual(log.count(want + '\n'), 3, want)
             self.assertEqual(list(shm.iterdir()), [])   # the key and the files are gone on exit
 
     def test_the_kit_step_stops_and_cleans_up_when_the_bundle_is_refused_or_the_manifest_is_not_the_planned_bytes(self):
@@ -2636,7 +2657,14 @@ class Workflow(unittest.TestCase):
             (tmp / 'x').mkdir()
             done, log, shm = self.run_block(tmp / 'x', 'kit', dict(self.kit_env(), STUB_FAIL='bundle'))
             self.assertNotEqual(done.returncode, 0)
-            self.assertEqual(len([l for l in log.splitlines() if l.startswith('ARGS ')]), 1)   # no gateway after a refused bundle
+            self.assertEqual(len([l for l in log.splitlines() if l.startswith('ARGS ')]), 2)   # the check, the bundle; no gateway after it
+            self.assertEqual(list(shm.iterdir()), [])
+            (tmp / 'z').mkdir()
+            done, log, shm = self.run_block(tmp / 'z', 'kit', dict(self.kit_env(), STUB_FAIL_CHECK='1'))
+            self.assertNotEqual(done.returncode, 0)
+            calls = [l for l in log.splitlines() if l.startswith('ARGS ')]
+            self.assertEqual(len(calls), 1)   # a refused check: the bundle is never even built, so none is stored
+            self.assertIn('gateway --check', calls[0])
             self.assertEqual(list(shm.iterdir()), [])
             (tmp / 'y').mkdir()
             done, log, shm = self.run_block(tmp / 'y', 'kit', self.kit_env(INSTALL_SHA='0' * 64))

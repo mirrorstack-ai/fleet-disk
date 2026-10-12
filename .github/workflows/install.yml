@@ -7,8 +7,12 @@
 #   kit      puts the bundle and the gateway record on the kit host. It holds only FLEET_READ and KIT_UPLOAD_KEY (the Ed25519
 #            key whose signature the host takes; it has no Cloudflare power at all). It rebuilds the bundle from the fleet
 #            commit install.json names, with the vendored packer, refuses unless size, sha256, head and tree equal the signed
-#            install.json, and uploads it; then it reads the gateway record and its signature from the release tip, checks
-#            the owner's signature and uploads the pair. Neither goes through the plan's files, an artifact, a cache or a log.
+#            install.json, and uploads it. Before the bundle it judges the gateway pair at the release tip (`gateway --check`, no
+#            upload), so a bad pair is refused before a bundle the host can never delete is stored; after the bundle it reads
+#            the record and its signature from the release tip again, checks the owner's signature and uploads the pair.
+#            While no gateway is live (the record is the placeholder, serial 0 and address null, with no signature file) the
+#            gateway step prints `SKIP gateway not-live` and uploads nothing; any other state without a good signed pair is
+#            still a refusal. Nothing goes through the plan's files, an artifact, a cache or a log.
 #   tag      creates the tag install-<serial> on this run's commit with the deploy key TAG_KEY.
 #   publish  runs the publisher on the plan's files plus the signatures; no environment, no secret.
 # Tag and publish both need kit, so no install tag or release page exists for a bundle the host cannot serve; a failed
@@ -221,6 +225,7 @@ jobs:
           unset FLEET_READ
           printf '%s\n' "$GH_HOSTKEY" > "$d/known_hosts"
           export GIT_SSH_COMMAND="/usr/bin/ssh -i $d/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$d/known_hosts -o GlobalKnownHostsFile=/dev/null -o HostKeyAlgorithms=ssh-ed25519"
+          python3 bin/fleet-kit-upload.py gateway --check --owner-pub "$d/owner.pub"
           python3 bin/fleet-kit-upload.py bundle "$d/install" --owner-pub "$d/owner.pub"
           python3 bin/fleet-kit-upload.py gateway --owner-pub "$d/owner.pub"
   tag:
