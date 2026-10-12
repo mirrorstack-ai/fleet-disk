@@ -61,6 +61,7 @@ test('the front check: every malformed request is the one 404, with no Gate call
     ['GET', '/v1/kit/5', {}],
     ['GET', '/', {}],
     ['GET', '/_k', {}],
+    ['GET', '/ready', {}], // PROBE_READY_PATH in bin/fleet-kit-check.py: the production probe's readiness path never reaches the Gate
     ['GET', '/robots.txt', {}], // the edge may serve Cloudflare's managed robots.txt; the Worker's own answer is the 404
     ['GET', BUNDLE, { code: null }],
     ['GET', BUNDLE, { auth: 'Bearer CCCC2222VV' }],
