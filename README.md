@@ -195,10 +195,13 @@ never inherit it. `OWNER_PIN_SHA256` is required for both verbs (`REFUSED key` w
   (`serial`, `address`, `cert_sha256`, `manifest_key`, `session_key`: the other files signed under the same namespace do not),
   and `PUT /_k/gateway/<serial>` (one to nine digits) with both files in one request, so the host flips to the pair whole or
   not at all. The answer must carry `gserial` and the `{sha256, size}` of both files. These two files never enter the release folder.
-  Not live is the one state that is not a refusal: the record parses as a gateway record with `serial` exactly the integer 0 and
-  `address` null, and the tip has no `gateway.json.sig` at all. Then the verb prints `SKIP gateway not-live`, makes no request and
-  exits 0. A signature beside a placeholder, a serial 0 with an address, a null address with a serial of 1 or more, a live-looking
-  record without a signature, and every malformed record stay `REFUSED gateway` (or `REFUSED sig` for a bad signature).
+  Not live is the one state that is not a refusal: `gateway.json` is a regular file (mode 100644) that is exactly the placeholder
+  the fleet repository holds (`serial` the integer 0 written as a plain `0`, `address`, `cert_sha256`, `manifest_key`,
+  `session_key` and `next` null, `r9_closed` false, no other key), and the tip has no `gateway.json.sig` at all. Then the verb
+  prints `SKIP gateway not-live`, makes no request and exits 0. A half-edited record (any field filled in) is not the placeholder.
+  A signature beside a placeholder, a serial 0 with an address, an unsigned record with a null address and a serial of 1 or more,
+  a live-looking record without a signature, and every malformed record stay `REFUSED gateway` (or `REFUSED sig` for a bad
+  signature). A signed record with a null address and a serial of 1 or more is judged live, as before: the address is not read.
   `--check` is the same read and the same verdict with no upload and no upload key: `OK gateway-check serial=N`, the SKIP line, or
   the refusal. The kit job runs it first, so a refusal comes before the bundle is stored.
 - This repository is public, so nothing a build holds is printed: git's stderr and the build's output go to a file in

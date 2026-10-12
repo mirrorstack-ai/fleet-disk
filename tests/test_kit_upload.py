@@ -591,7 +591,6 @@ class TestGateway(Fixture):
         self.assertNotIn('203.0.113', out + err)
 
 
-
 # The placeholder the fleet repository holds while no gateway is live, copied from `fleet/core/gateway.json` on its main branch
 # (ledger D309). The not-live tests are built from this text, so the exact test is against the real shape.
 PLACEHOLDER = ('{"serial": 0, "address": null, "cert_sha256": null, "manifest_key": null, "session_key": null, "next": null, '
@@ -730,21 +729,81 @@ class TestGatewayNotLive(Fixture):
             self.refuses('gateway', name)
 
     def test_a_record_that_only_looks_like_the_placeholder_is_refused(self):
+        """End to end through both verbs, a few of each kind; the whole list is judged by is_placeholder just below."""
+        base = json.loads(PLACEHOLDER)
+        bodies = {'a list': '[]', 'an empty file': '', 'a bool serial': json.dumps({**base, 'serial': False}),
+                  'a negative zero serial': PLACEHOLDER.replace('"serial": 0', '"serial": -0'),
+                  'a filled cert_sha256': json.dumps({**base, 'cert_sha256': 'ab' * 32}),
+                  'a half-edited record': json.dumps({**base, 'cert_sha256': 'ab' * 32, 'manifest_key': 'k', 'session_key': 's'}),
+                  'an extra key': json.dumps({**base, 'extra': 1}),
+                  'an oversized record': json.dumps({**base, 'pad': 'x' * fk.MAX_GATEWAY_JSON})}
+        for name, body in bodies.items():
+            self.tip(body, None)
+            self.refuses('gateway', name)
+
+    def test_is_placeholder_is_an_exact_match(self):
         base = json.loads(PLACEHOLDER)
         bodies = {'a list': '[]', 'null': 'null', 'a number': '0', 'a string': '"x"', 'an empty object': '{}', 'not json': 'serial 0',
                   'an empty file': '', 'a bool serial': json.dumps({**base, 'serial': False}),
                   'a float serial': json.dumps({**base, 'serial': 0.0}), 'a string serial': json.dumps({**base, 'serial': '0'}),
                   'a null serial': json.dumps({**base, 'serial': None}), 'a negative serial': json.dumps({**base, 'serial': -1}),
+                  'a negative zero': PLACEHOLDER.replace('"serial": 0', '"serial": -0'),
                   'a missing address': json.dumps({k: v for k, v in base.items() if k != 'address'}),
                   'a missing key': json.dumps({k: v for k, v in base.items() if k != 'session_key'}),
+                  'only the five gateway keys': json.dumps({k: v for k, v in base.items() if k in fk.GATEWAY_KEYS}),
                   'a duplicate serial': PLACEHOLDER.replace('"serial": 0', '"serial": 0, "serial": 0'),
                   'a deploy pin': json.dumps({'serial': 0, 'sha256': 'ab' * 32}),
-                  'an oversized record': json.dumps({**base, 'pad': 'x' * fk.MAX_GATEWAY_JSON}),
-                  'false address': json.dumps({**base, 'address': False}),
-                  'an empty address': json.dumps({**base, 'address': ''})}
+                  'an extra key': json.dumps({**base, 'extra': 1}),
+                  'false address': json.dumps({**base, 'address': False}), 'an empty address': json.dumps({**base, 'address': ''}),
+                  'a filled cert_sha256': json.dumps({**base, 'cert_sha256': 'ab' * 32}),
+                  'a filled manifest_key': json.dumps({**base, 'manifest_key': 'k'}),
+                  'a filled session_key': json.dumps({**base, 'session_key': 's'}),
+                  'next set': json.dumps({**base, 'next': {'serial': 5}}), 'r9_closed true': json.dumps({**base, 'r9_closed': True}),
+                  'r9_closed 0': json.dumps({**base, 'r9_closed': 0}), 'r9_closed null': json.dumps({**base, 'r9_closed': None})}
         for name, body in bodies.items():
-            self.tip(body, None)
-            self.refuses('gateway', name)
+            self.assertFalse(fk.is_placeholder(body.encode()), name)
+        self.assertFalse(fk.is_placeholder(PLACEHOLDER.encode(), '100755'), 'an executable file')
+        self.assertFalse(fk.is_placeholder(PLACEHOLDER.encode(), '120000'), 'a symlink')
+
+    def test_a_symlink_or_an_executable_record_is_refused_not_skipped(self):
+        record = self.origin / 'fleet/core/gateway.json'
+        self.tip(PLACEHOLDER)
+        record.chmod(0o755)
+        git(self.origin, 'add', '-A')
+        git(self.origin, 'commit', '-q', '-m', 'mode')
+        self.refuses('gateway', 'mode 100755')
+        record.chmod(0o644)
+        record.unlink()
+        (self.origin / 'fleet/core/target.json').write_text(PLACEHOLDER + '\n')
+        record.symlink_to('target.json')
+        git(self.origin, 'add', '-A')
+        git(self.origin, 'commit', '-q', '-m', 'symlink')
+        self.refuses('gateway', 'mode 120000')
+
+    def test_a_signed_record_with_a_null_address_and_a_serial_is_judged_live_as_before(self):
+        self.tip(json.dumps({**json.loads(PLACEHOLDER), 'serial': 3}), 'pin')
+        self.assertEqual(self.check()[:2], (0, 'OK gateway-check serial=3\n'))
+        code, out, _ = self.gateway()
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith('OK gateway serial=3 json='))
+        self.assertEqual(len(self.net.calls), 1)
+
+    def test_a_git_failure_while_reading_the_tip_refuses_and_never_skips(self):
+        self.tip(PLACEHOLDER)
+        real = fk.git_run
+        sig_listing = ('ls-tree', fk.FLEET_TIP, '--', fk.GATEWAY_SIG_PATH)
+
+        def failing(repo, env, *args, **kw):
+            if args == sig_listing:
+                raise fk.Refused('fetch')
+            return real(repo, env, *args, **kw)
+
+        def strange(repo, env, *args, **kw):
+            return b'something else\n' if args == sig_listing else real(repo, env, *args, **kw)
+
+        for name, replacement in (('ls-tree fails', failing), ('ls-tree answers something unexpected', strange)):
+            with mock.patch.object(fk, 'git_run', replacement):
+                self.refuses('gateway', name)
 
     def test_a_live_looking_record_without_a_signature_or_with_a_bad_one_is_refused(self):
         live = json.dumps(self.record(3))
@@ -777,9 +836,10 @@ class TestGatewayNotLive(Fixture):
             with redirect_stderr(io.StringIO()):
                 self.assertEqual(fk.main(['x', *argv], {}), 2, argv)
 
-    def test_the_skip_line_and_the_check_line_are_the_only_new_words(self):
+    def test_the_skip_line_is_one_fixed_string(self):
         self.assertEqual(fk.NOT_LIVE, 'SKIP gateway not-live')
-        self.assertIn('gateway', fk.CODES)
+
+
 @unittest.skipUnless(OPENSSL, 'no openssl with Ed25519 raw signing')
 class TestSigner(unittest.TestCase):
     def setUp(self):
