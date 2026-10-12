@@ -9,6 +9,7 @@ import base64
 import hashlib
 import http.client
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -24,6 +25,7 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stdout
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -170,6 +172,10 @@ class FakeKit:
         self.fails = 0
         self.per_source = flags.get('per_source', 30)
         self.gate_failures = 0
+        self.gate_calls = 0                      # requests that got past the front check into the Gate
+        self.requests = 0                        # every request, in order (the 'placeholder' flag asks for this number)
+        self.paths: list[str] = []               # every path requested, in order
+        self.ready_tries = 0                     # requests to the probe's readiness path so far (the 'ready_fault' flag)
         self.robots_fetches = 0
         self.served_404 = 0                      # the Worker's 404s served so far (edge_nel_nth, nel_nth)
         self.nel_lock = threading.Lock()         # its own lock: a gate 404 is sent while self.lock is held
@@ -231,7 +237,7 @@ def make_handler(kit: FakeKit):
             if not kind:
                 return
             n = 0
-            if status == 404:
+            if status == 404 and self.path != kc.PROBE_READY_PATH:     # readiness tries are not among the numbered 404s
                 with kit.nel_lock:
                     kit.served_404 += 1
                     n = kit.served_404
@@ -336,8 +342,57 @@ def make_handler(kit: FakeKit):
         def send_json(self, status, doc):
             self.send_fixed(status, json.dumps(doc).encode(), 'application/json')
 
+        def send_placeholder(self):
+            # the Cloudflare dashboard's placeholder Worker, run 38180769445: 200 "Hello World!"; no cache-control (measured),
+            # nel/report-to were not measured (the refusal prints neither), none are sent here
+            body = b'Hello World!'
+            self.send_response_only(200)
+            self.send_header('Server', 'cloudflare')
+            self.send_header('Date', self.date_time_string())
+            self.send_header('Content-Type', 'text/plain;charset=UTF-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('CF-RAY', os.urandom(8).hex())
+            self.end_headers()
+            self.wfile.write(body)
+
+        def send_faulty_404(self, kind):
+            """The Worker's fixed 404 (status, text/plain, "not found\\n") with ONE header wrong, as kind names it."""
+            body = b'not found\n'
+            self.send_response(404)                              # as send_fixed does: Server and Date are the stdlib's
+            self.send_header('Content-Type', 'text/plainx-evil' if kind == 'ctype' else 'text/plain')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('CF-RAY', os.urandom(8).hex())
+            if kind != 'no-cache-control':
+                self.send_header('Cache-Control', 'public, max-age=60' if kind == 'public-cache' else 'no-store, no-transform')
+            extra = {'set-cookie': ('Set-Cookie', 'a=b'), 'location': ('Location', '/other'), 'content-encoding':
+                     ('Content-Encoding', 'gzip'), 'x-foo': ('X-Foo', '1'), 'report-to': ('Report-To', NOT_CF_NEL['wrong_group'] % 'tok')}
+            if kind in extra:
+                self.send_header(*extra[kind])
+            self.end_headers()
+            self.wfile.write(body)
+
         def handle_any(self):
             path = self.path
+            with kit.lock:
+                kit.requests += 1
+                n = kit.requests
+                kit.paths.append(path)
+            # kit.flags['placeholder']=f: f(n, path) is True when the edge location asked still serves the previous
+            # version (the placeholder); n counts every request of the run from 1
+            if kit.flags.get('placeholder') and kit.flags['placeholder'](n, path):
+                return self.send_placeholder()
+            if path == kc.PROBE_READY_PATH:
+                with kit.lock:
+                    kit.ready_tries += 1
+                    fault = kit.flags.get('ready_fault')
+                    faulty = fault and (kit.ready_tries <= fault[0] or kit.ready_tries in fault[2:])
+                if faulty:                                       # the Worker's 404 with one header wrong
+                    return self.send_faulty_404(fault[1])
+                first = kit.flags.get('ready_first')             # (n, status, body): the Worker's own 429/503 for the first n
+                if first and kit.ready_tries <= first[0]:
+                    return self.send_fixed(first[1], first[2])
+            if path == kc.PROBE_READY_PATH and kit.flags.get('ready_answer'):      # a 404 that is not the Worker's fixed one
+                return self.send_fixed(*kit.flags['ready_answer'])
             if path == kit.flags.get('edge_400_on'):             # the edge 400 on a label that is not DUP_AUTH
                 return self.send_edge_400()
             if path == kit.flags.get('managed_robots_on'):       # the managed robots page on a label that is not robots
@@ -365,6 +420,7 @@ def make_handler(kit: FakeKit):
                 return
             serial, name = int(m.group(1)), m.group(2)
             with kit.lock:
+                kit.gate_calls += 1                              # the Gate's decide answers the 429 too: count it first
                 if kit.fails >= kit.per_source:
                     return self.send_fixed(429, b'try later\n')
                 inv = next((i for i in kit.invites.values() if i['code'] == c.group(1)), None)
@@ -1542,21 +1598,202 @@ class OverHttp(unittest.TestCase):
     def test_the_probe_passes_and_spends_at_most_five_gate_failures(self):
         kit = FakeKit(self.pubs)
         with Served(kit) as base:
-            lines = kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
+            lines = kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None, ready_spacing=0.0)
         self.assertIn('byte-identical, 5 reached the gate', lines[0])
         self.assertIn("Cloudflare's cf-nel report-to on 0 of 25 (its token is not compared)", '\n'.join(lines))
         self.assertEqual(kit.gate_failures, 5)
         self.assertLessEqual(kit.gate_failures, kc.PROBE_MAX_FAILURES)
 
+    # -- production propagation (run 38180769445): the probe waits for the Worker's own 404 before it judges ---------------
+    def ready_full(self, kit_flags=None, **kw):
+        """wait_worker alone against a fake. A fake clock: sleep() moves it, nothing waits."""
+        now = [0.0]
+        slept: list[float] = []
+
+        def sleep(s):
+            slept.append(s)
+            now[0] += s
+        kit = FakeKit(self.pubs, **(kit_flags or {}))
+        with Served(kit) as base:
+            got = kc.wait_worker(kc.Client(base, allow_http=True), sleep=sleep, clock=lambda: now[0], **kw)
+        return kit, got, slept
+
+    def ready(self, kit_flags=None, **kw):
+        kit, got, slept = self.ready_full(kit_flags, **kw)
+        return kit, (got.tries, got.other), slept
+
+    def assertReadyLine(self, lines, tries, other, kinds=''):
+        """The summary's readiness line: tries, seconds, how many answers were not the Worker's 404 (and which statuses)."""
+        judged = tries - other
+        want = (r"  ready after %d tries, \d+\.\d s \(%d answers were not this Worker's 404%s; the %d that were are judged "
+                r"with the rest\)$" % (tries, other, re.escape(kinds), judged))
+        self.assertTrue([l for l in lines if re.match(want, l)], (want, lines))
+
+    def test_the_readiness_path_is_one_the_worker_front_answers_without_the_gate(self):
+        path = kc.PROBE_READY_PATH
+        self.assertIsNone(TARGET_RE.match(path))             # not /v1/kit/<serial>/<file>: the front's 404 comes first
+        self.assertFalse(path.startswith('/_k/'))            # not the admin route
+        self.assertNotIn(path, ('/', '/robots.txt'))         # the fake's (and the edge's) own rows are other labels
+        worker = (Path(__file__).resolve().parent.parent / 'kit' / 'worker.js').read_text()
+        self.assertIn('if (!m) return fixed(404);', worker)  # publicRoute: no match, 404, before the Authorization check
+        # per_source=0 would answer 429 to anything that reached the Gate: the readiness never does
+        kit, (tries, other), _ = self.ready({'per_source': 0})
+        self.assertEqual((tries, other, kit.gate_calls, kit.fails, kit.gate_failures), (10, 0, 0, 0, 0))
+        self.assertEqual(set(kit.paths), {path})
+
+    def test_the_probe_goes_to_the_gate_exactly_five_times_and_readiness_is_not_one_of_them(self):
+        kit, lines = self.probe(placeholder=lambda n, path: n <= 3)
+        self.assertEqual(kit.gate_calls, 5)
+        self.assertEqual(kit.gate_failures, 5)
+        self.assertEqual(kit.paths[:13], [kc.PROBE_READY_PATH] * 13)      # 3 placeholders, then the streak of 10
+
+    def test_the_probe_waits_out_k_placeholders_and_names_k(self):
+        for k in (1, 7, 40):
+            kit, lines = self.probe(placeholder=lambda n, path, k=k: n <= k)
+            self.assertReadyLine(lines, 10 + k, k, ': 200 x%d' % k)
+            self.assertIn('byte-identical, 5 reached the gate', lines[0])
+            self.assertEqual(kit.paths[:10 + k], [kc.PROBE_READY_PATH] * (10 + k))
+
+    def test_an_existing_worker_to_a_new_worker_deploy_passes_with_no_answer_that_was_not_ready(self):
+        kit, lines = self.probe()
+        self.assertReadyLine(lines, 10, 0)
+        # the streak still takes its spaced tries: this is the time propagation gets
+        _, (tries, other), slept = self.ready(streak=10, spacing=1.0, timeout=120.0)
+        self.assertEqual((tries, other, slept), (10, 0, [1.0] * 9))
+
+    def test_the_run_38180769445_shape_the_previous_versions_page_for_the_first_answers_now_passes(self):
+        # every answer of the dashboard placeholder is 200 "Hello World!"; here it holds for the first 30 requests of the
+        # probe, so without the wait the gate cases (and the first answer) would have met it
+        kit, lines = self.probe(placeholder=lambda n, path: n <= 30)
+        self.assertReadyLine(lines, 40, 30, ': 200 x30')
+        self.assertIn('byte-identical, 5 reached the gate', lines[0])
+        self.assertIn("robots: the Worker's 404 for both fetches", '\n'.join(lines))
+
+    def test_a_streak_broken_at_the_ninth_answer_starts_again(self):
+        _, (tries, other), _ = self.ready({'placeholder': lambda n, path: n == 9})
+        self.assertEqual((tries, other), (19, 1))             # 8 good, the placeholder, then ten
+        _, (tries, other), _ = self.ready({'placeholder': lambda n, path: n in (9, 18)})
+        self.assertEqual((tries, other), (28, 2))             # the second run reaches its own ninth and breaks again
+        # one short of the streak, again and again: never ready, and the refusal says how many were not the Worker's
+        with self.assertRaises(kc.Refused) as why:
+            self.ready({'placeholder': lambda n, path: n % 10 == 0}, timeout=40.0)
+        self.assertRegex(str(why.exception), r'\(\d+ tries, \d+ were not')
+
+    def test_the_placeholder_forever_is_refused_at_the_timeout_with_its_headers_and_no_body(self):
+        with self.assertRaises(kc.Refused) as why:
+            self.ready({'placeholder': lambda n, path: True}, streak=10, spacing=1.0, timeout=120.0)
+        text = str(why.exception)
+        self.assertEqual(text, "probe readiness: no 10 consecutive fixed 404s of the Worker within 120 s (122 tries, 122 were "
+                               "not the Worker's 404; the last of them: status 200, content-type text/plain;charset=UTF-8, "
+                               "content-length 12)")
+        self.assertNotIn('Hello', text)
+        self.assertNotIn('World', text)
+
+    def test_a_worker_that_never_makes_ten_in_a_row_is_refused_and_a_probe_with_it_never_reaches_the_gate(self):
+        kit = FakeKit(self.pubs, placeholder=lambda n, path: True)
+        with Served(kit) as base, self.assertRaises(kc.Refused) as why:
+            kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None, ready_spacing=0.0, ready_timeout=0.2)
+        self.assertIn('probe readiness: no 10 consecutive fixed 404s of the Worker within 0 s (', str(why.exception))
+        self.assertEqual((kit.gate_calls, kit.fails), (0, 0))
+        self.assertEqual(set(kit.paths), {kc.PROBE_READY_PATH})
+
+    def test_the_readiness_takes_the_workers_404_whatever_the_edge_adds_to_it(self):
+        # a per-response report-to token and a nel are not what version it is: ready at once, judged afterwards as before
+        for kind in ('cf-nel', *CF_NEL_OTHER):
+            _, (tries, other), _ = self.ready({'edge_nel': kind})
+            self.assertEqual((tries, other), (10, 0), kind)
+
+    def test_a_404_that_is_not_the_fixed_one_is_not_ready(self):
+        for body, ctype in ((b'not found!\n', 'text/plain'), (b'<html>404</html>', 'text/html'), (b'not found\n', 'text/html')):
+            with self.subTest(body=body, ctype=ctype), self.assertRaises(kc.Refused) as why:
+                self.ready({'ready_answer': (404, body, ctype)}, spacing=1.0, timeout=20.0)
+            self.assertIn("were not the Worker's 404; the last of them: status 404", str(why.exception))
+            self.assertNotIn(body.decode().strip(), str(why.exception))
+
+    def test_a_404_with_a_wrong_header_during_the_wait_is_judged_not_excused(self):
+        # review: worker_404 (status, text/plain, body) ends the wait, but the 404s it kept are judged with the rest, so a
+        # header fault confined to the first answers is the same refusal as on any answer, never "0 were not this Worker's 404"
+        for kind in ('set-cookie', 'location', 'content-encoding', 'report-to', 'public-cache', 'no-cache-control', 'x-foo', 'ctype'):
+            for fault in ((10, kind), (0, kind, 10), (3, kind), (0, kind, 1)):
+                with self.subTest(kind=kind, fault=fault), self.assertRaises(kc.Refused) as why:
+                    self.probe(ready_fault=fault)
+                self.assertRegex(str(why.exception), r'^probe: "readiness try \d+" differs from "bundle, serial 1": ', kind)
+                self.assertIn({'public-cache': 'cache-control', 'no-cache-control': 'cache-control', 'ctype': 'content-type'}
+                              .get(kind, kind), str(why.exception).split(': ', 2)[2])      # the header that is wrong, by name
+
+    def test_a_faulty_404_before_a_broken_streak_is_judged_too(self):
+        with self.assertRaises(kc.Refused) as why:
+            self.probe(ready_fault=(0, 'set-cookie', 2), placeholder=lambda n, path: n == 5)
+        self.assertIn('headers differ: set-cookie', str(why.exception))
+
+    def test_the_wait_returns_every_answer_that_was_the_workers_404_for_judging(self):
+        _, got, _ = self.ready_full({'placeholder': lambda n, path: n in (3, 4)})
+        self.assertEqual((got.tries, got.other, got.statuses), (14, 2, {200: 2}))
+        self.assertEqual([l for l, _ in got.answers], ['readiness try %d' % i for i in (1, 2, *range(5, 15))])
+
+    def test_the_summary_names_the_statuses_of_the_answers_it_excused(self):
+        for status, body in ((503, b'unavailable\n'), (429, b'try later\n')):
+            kit, lines = self.probe(ready_first=(3, status, body))
+            self.assertReadyLine(lines, 13, 3, ': %d x3' % status)
+        kit, lines = self.probe(placeholder=lambda n, path: n == 1, ready_first=(2, 503, b'unavailable\n'))
+        self.assertReadyLine(lines, 13, 3, ': 200 x1, 503 x2')
+
+    def test_run_probe_hands_streak_spacing_timeout_sleep_and_clock_to_the_wait(self):
+        def run(flags, **kw):
+            now, slept = [0.0], []
+
+            def sleep(s):
+                slept.append(s)
+                now[0] += s
+            kit = FakeKit(self.pubs, **flags)
+            try:
+                with Served(kit) as base:
+                    return slept, kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None, sleep=sleep,
+                                               clock=lambda: now[0], **kw)
+            except kc.Refused as e:
+                return slept, e
+        slept, lines = run({}, ready_streak=3, ready_spacing=1.0, ready_timeout=5.0)
+        self.assertEqual(slept, [1.0, 1.0])
+        self.assertTrue([l for l in lines if l.startswith("  ready after 3 tries, 2.0 s (0 answers were not")], lines)
+        slept, why = run({'placeholder': lambda n, path: True}, ready_streak=3, ready_spacing=1.0, ready_timeout=5.0)
+        self.assertEqual(slept, [1.0] * 6)
+        self.assertEqual(str(why), "probe readiness: no 3 consecutive fixed 404s of the Worker within 5 s (7 tries, 7 were not the "
+                                   "Worker's 404; the last of them: status 200, content-type text/plain;charset=UTF-8, "
+                                   "content-length 12)")
+
+    def test_the_production_wait_is_the_staging_wait_and_the_cli_does_not_change_it(self):
+        self.assertEqual((kc.PROBE_READY_STREAK, kc.PROBE_READY_SPACING, kc.PROBE_READY_TIMEOUT), (10, 1.0, 120.0))
+        self.assertEqual((kc.PROBE_READY_STREAK, kc.PROBE_READY_SPACING, kc.PROBE_READY_TIMEOUT),
+                         (kc.READY_STREAK, kc.READY_SPACING, kc.READY_TIMEOUT))
+        for fn, names in ((kc.wait_worker, ('streak', 'spacing', 'timeout')),
+                          (kc.run_probe, ('ready_streak', 'ready_spacing', 'ready_timeout'))):
+            got = tuple(inspect.signature(fn).parameters[n].default for n in names)
+            self.assertEqual(got, (10, 1.0, 120.0), fn.__name__)
+        with mock.patch.object(kc, 'run_probe', return_value=['x']) as run, redirect_stdout(io.StringIO()):
+            self.assertEqual(kc.main(['probe', 'https://x.example']), 0)
+        (args, kwargs), = [run.call_args]
+        self.assertEqual((len(args), kwargs), (1, {}))           # only the Client: no keyword changes the wait
+
+    def test_the_refusal_names_the_last_answer_that_was_not_the_404_and_a_slow_worker_has_none(self):
+        # the placeholder once, then a 404 that is not the fixed one for every later try: the LAST of them is the 404
+        with self.assertRaises(kc.Refused) as why:
+            self.ready({'placeholder': lambda n, path: n == 1, 'ready_answer': (404, b'not found!\n', 'text/plain')},
+                       spacing=1.0, timeout=20.0)
+        self.assertIn('the last of them: status 404, content-type text/plain, content-length 11)', str(why.exception))
+        # the time runs out with every answer the Worker's 404 (a slow Worker): nothing to name, and no crash
+        with self.assertRaises(kc.Refused) as why:
+            self.ready(streak=10, spacing=30.0, timeout=120.0)
+        self.assertTrue(str(why.exception).endswith("(6 tries, 0 were not the Worker's 404)"), str(why.exception))
+
     def test_the_probe_takes_the_identical_edge_400_for_the_duplicate_pair_and_nothing_else(self):
         kit = FakeKit(self.pubs, dup_auth='edge')
         with Served(kit) as base:
-            lines = kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
+            lines = kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None, ready_spacing=0.0)
         self.assertIn("Cloudflare's edge 400 for both cases, identical", '\n'.join(lines))
         for flags, fragment in (({'dup_auth': 'json400'}, "neither the Worker's 404"), ({'edge_400_on': '/'}, 'differs')):
             kit = FakeKit(self.pubs, **flags)
             with Served(kit) as base, self.assertRaises(kc.Refused) as why:
-                kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
+                kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None, ready_spacing=0.0)
             self.assertIn(fragment, str(why.exception))
 
     def test_the_probe_takes_the_same_robots_rows_as_the_replay(self):
@@ -1565,7 +1802,7 @@ class OverHttp(unittest.TestCase):
                              ('reporting', "robots: Cloudflare's managed robots.txt for both fetches, identical")):
             kit = FakeKit(self.pubs, **({'robots': robots} if robots else {}))
             with Served(kit) as base:
-                lines = kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
+                lines = kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None, ready_spacing=0.0)
             self.assertIn(line, '\n'.join(lines))
             self.assertIn("duplicate Authorization: the Worker's 404 for both cases", '\n'.join(lines))
             self.assertEqual(kit.gate_failures, 5)
@@ -1574,13 +1811,13 @@ class OverHttp(unittest.TestCase):
                                 ({'robots': 'x_foo'}, 'headers differ: x-foo')):
             kit = FakeKit(self.pubs, **flags)
             with Served(kit) as base, self.assertRaises(kc.Refused) as why:
-                kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
+                kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None, ready_spacing=0.0)
             self.assertIn(fragment, str(why.exception))
 
     def probe(self, **flags):
         kit = FakeKit(self.pubs, **flags)
         with Served(kit) as base:
-            return kit, kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
+            return kit, kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None, ready_spacing=0.0)
 
     def test_the_probe_takes_cloudflares_cf_nel_report_to_by_the_same_rule(self):
         for flags, n in (({'edge_nel': 'cf-nel'}, 25), ({'edge_nel': 'cf-nel', 'robots': 'reporting', 'dup_auth': 'edge'}, 21),
@@ -1629,7 +1866,7 @@ class OverHttp(unittest.TestCase):
         for flags, fragment in (({'gzip_404': True}, 'differs'), ({'per_source': 0}, 'answered 429')):
             kit = FakeKit(self.pubs, **flags)
             with Served(kit) as base, self.assertRaises(kc.Refused) as why:
-                kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None)
+                kc.run_probe(kc.Client(base, allow_http=True), log=lambda *_: None, ready_spacing=0.0)
             self.assertIn(fragment, str(why.exception))
 
     def test_the_cli_prints_a_refusal_as_the_last_line_and_exits_1(self):

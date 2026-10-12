@@ -118,3 +118,10 @@ lives here, not in `known_differences`, because the vendored file is byte-pinned
 against the Worker, not the edge. To update: copy the
 new file over `vectors/kit_vectors.json`, write the new pin line (`shasum -a 256`, the fleet commit, the path), and
 run `node --test kit/`.
+
+The production probe holds no key, so before its first judged request it waits for ten consecutive fixed 404s of the
+Worker on an unknown path, `/ready` (`wait_worker`; the Worker's front answers it before the invite check, so it never
+reaches the Gate and spends none of the 30 an hour). A probe four seconds after the deploy met the previous version's
+page (kit-deploy run 38180769445). Only answers that are not the Worker's 404 are excused before the streak, and the
+summary counts them by status; the Worker's 404s of the wait are judged with the probe's other answers; a Worker that
+never reaches the streak within 120 s is refused.
