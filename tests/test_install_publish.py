@@ -176,6 +176,13 @@ class FakeGh:
         self.query_code = 0
         self.raw: dict[str, tuple[int, str]] = {}  # query name -> (exit code, stdout) to answer instead
         self.old_pin = (0, json.dumps({'serial': 1, 'head': H40, 'tree': BUNDLE_TREE}))  # what a previous release's pin says
+        self.read_failures = 0  # this many read-backs of the created release fail (exit 1) before GitHub answers
+        self.read_calls = 0
+        self.create_raises: fp.Refused | None = None  # gh was killed: Real.run raises Refused('tool-timeout')
+        self.left: str | None = None  # 'draft' | 'published': what the list shows of a create that failed or was killed
+        self.delete_code, self.delete_raises = 0, None  # what `gh release delete` answers
+        self.list_after_create: tuple[int, str] | None = None
+        self.listed: list[dict] = []  # the rows of the release this run created, shown by a later list
 
     def run(self, argv, env, timeout=fp.TOOL_TIMEOUT):
         self.calls.append(list(argv))
@@ -185,15 +192,32 @@ class FakeGh:
         if words[:1] == ['api'] and 'matching-refs' in words[1]:
             return self.raw.get('refs') or (self.query_code, json.dumps(self.refs))
         if words[:2] == ['release', 'list']:
-            return self.raw.get('releases') or (0, json.dumps(self.releases))
+            if self.list_after_create and self.creates():  # the list a cleanup reads, once the release exists
+                return self.list_after_create
+            return self.raw.get('releases') or (0, json.dumps(self.releases + self.listed))
         if words[:1] == ['api'] and words[1].endswith('/immutable-releases'):
             return self.immutable
         if words[:2] == ['release', 'download']:
             return self.old_pin
         if words[:2] == ['release', 'create']:
             self.created = [Path(p) for p in words[3:words.index('--target')]]
+            tag = words[2]
+            if self.left or (self.create_code == 0 and not self.create_raises):  # a release is there after the create
+                draft = self.left == 'draft' or (self.left is None and self.release_flags.get('draft') is True)
+                self.listed = [{'tagName': tag, 'isDraft': draft}]
+            if self.create_raises:
+                raise self.create_raises
             return self.create_code, ''
+        if words[:2] == ['release', 'delete']:
+            if self.delete_raises:
+                raise self.delete_raises
+            if self.delete_code == 0:
+                self.listed = []
+            return self.delete_code, ''
         if words[:1] == ['api'] and '/releases/tags/' in words[1]:
+            self.read_calls += 1
+            if self.read_calls <= self.read_failures:
+                return 1, ''
             assets = [{'name': p.name.replace('.gitattributes', 'default.gitattributes'),
                        'digest': 'sha256:' + sha(p.read_bytes()), 'size': p.stat().st_size} for p in self.created]
             return self.raw.get('tag') or (0, json.dumps({'assets': self.tweak(assets), **self.release_flags}))
@@ -201,6 +225,9 @@ class FakeGh:
 
     def creates(self) -> list[list[str]]:
         return [c for c in self.calls if c[1:3] == ['release', 'create']]
+
+    def deletes(self) -> list[list[str]]:
+        return [c for c in self.calls if c[1:3] == ['release', 'delete']]
 
 
 @unittest.skipUnless(HAVE_KEYGEN, 'ssh-keygen is missing')
@@ -217,6 +244,11 @@ class Publish(unittest.TestCase):
         self.addCleanup(patch.stop)  # runs before the temp dir is removed (LIFO)
         self.fx = Fixture(Path(self._tmp.name))
         self.addCleanup(self.fx.cleanup)  # runs before the temp dir is removed (LIFO)
+        self.sleeps: list[float] = []  # the read-back waits, recorded and never slept
+        # fp's own `time` only: a patch of the shared time.sleep would also record the polling of every subprocess.run
+        sleep = mock.patch.object(fp, 'time', types.SimpleNamespace(sleep=self.sleeps.append))
+        sleep.start()
+        self.addCleanup(sleep.stop)
 
     def refuses(self, code: str, gh: FakeGh | None = None, confirmed: str = '', **kw) -> FakeGh:
         gh = gh or FakeGh()
@@ -777,10 +809,12 @@ class Publish(unittest.TestCase):
 
     # the tag
 
-    def test_a_release_of_the_tag_is_refused_tag_exists_whatever_the_tag_says_and_nothing_is_created(self):
+    def test_a_published_release_of_the_tag_is_refused_tag_exists_and_a_draft_of_it_draft_left_and_nothing_is_created(self):
         self.fx.build()
-        for draft in (True, False):
-            self.assertEqual(self.refuses('tag-exists', FakeGh(releases=[{'tagName': TAG, 'isDraft': draft}])).creates(), [])
+        for draft, code in ((False, 'tag-exists'), (True, 'draft-left')):
+            self.assertEqual(self.refuses(code, FakeGh(releases=[{'tagName': TAG, 'isDraft': draft}])).creates(), [])
+        for row in ({'tagName': TAG}, {'tagName': TAG, 'isDraft': 'true'}, {'tagName': TAG, 'isDraft': None}):  # odd: not a draft
+            self.assertEqual(self.refuses('tag-exists', FakeGh(releases=[row])).creates(), [])
 
     def test_the_tag_must_exist_as_a_lightweight_tag_on_the_runs_commit(self):
         self.fx.build()
@@ -853,6 +887,102 @@ class Publish(unittest.TestCase):
     def test_a_failed_create_is_refused_publish_failed(self):
         self.fx.build()
         self.refuses('publish-failed', FakeGh(create_code=1))
+
+    # AF16: what a failed publish leaves behind is named and removed, and the first refusal is never hidden
+
+    def test_a_create_killed_by_the_timeout_with_a_draft_listed_deletes_exactly_that_draft_and_refuses_tool_timeout(self):
+        self.fx.build()
+        gh = FakeGh()
+        gh.create_raises, gh.left = fp.Refused('tool-timeout'), 'draft'
+        self.refuses('tool-timeout', gh)
+        self.assertEqual(gh.deletes(), [['/usr/bin/gh', 'release', 'delete', TAG, '--yes']])  # no --cleanup-tag
+        self.assertEqual(gh.read_calls, 0)
+        self.assertEqual(gh.listed, [])  # and the fake's draft is gone: it was the delete that removed it
+
+    def test_a_failed_create_with_a_draft_listed_deletes_it_and_keeps_publish_failed(self):
+        self.fx.build()
+        gh = FakeGh(create_code=1)
+        gh.left = 'draft'
+        self.refuses('publish-failed', gh)
+        self.assertEqual(gh.deletes(), [['/usr/bin/gh', 'release', 'delete', TAG, '--yes']])
+
+    def test_a_failed_or_killed_create_that_left_nothing_deletes_nothing_and_keeps_the_first_refusal(self):
+        self.fx.build()
+        for gh, code in ((FakeGh(create_code=1), 'publish-failed'), (FakeGh(), 'tool-timeout')):
+            with self.subTest(code):
+                if code != 'publish-failed':
+                    gh.create_raises = fp.Refused(code)
+                self.refuses(code, gh)
+                self.assertEqual(gh.deletes(), [])
+        gh = FakeGh(create_code=1)  # the list cannot be read after the failure: the first refusal still stands
+        gh.list_after_create = (1, '')
+        self.refuses('publish-failed', gh)
+        self.assertEqual(gh.deletes(), [])
+
+    def test_a_create_whose_gh_never_ran_is_not_cleaned_up_after(self):
+        self.fx.build()
+        gh = FakeGh()
+        gh.create_raises = fp.Refused('tool-missing')
+        self.refuses('tool-missing', gh)
+        self.assertEqual(gh.calls[-1][1:3], ['release', 'create'])  # nothing was listed or deleted after it
+
+    def test_a_draft_that_cannot_be_deleted_is_release_left_and_the_first_refusal_goes_to_stderr(self):
+        self.fx.build()
+        for what, setup in (('exit 1', lambda g: setattr(g, 'delete_code', 1)),
+                            ('killed', lambda g: setattr(g, 'delete_raises', fp.Refused('tool-timeout')))):
+            with self.subTest(what):
+                gh = FakeGh()
+                gh.create_raises, gh.left = fp.Refused('tool-timeout'), 'draft'
+                setup(gh)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.refuses('release-left', gh)
+                self.assertIn('first refusal tool-timeout', err.getvalue())
+                self.assertEqual(len(gh.deletes()), 1)
+
+    def test_a_published_release_after_a_failed_create_is_release_left_and_never_deleted(self):
+        self.fx.build()
+        for create in (FakeGh(create_code=1), FakeGh()):
+            gh = create
+            if not gh.create_code:
+                gh.create_raises = fp.Refused('tool-timeout')
+            gh.left = 'published'
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.refuses('release-left', gh)
+            self.assertEqual(gh.deletes(), [])
+
+    def test_a_read_back_that_fails_once_is_read_again_after_five_seconds_and_goes_on(self):
+        self.fx.build()
+        gh = FakeGh()
+        gh.read_failures = 1
+        lines = fp.publish(gh, self.fx.check(), REPO, SHA, TOKEN)
+        self.assertEqual((len(lines), gh.read_calls, self.sleeps, gh.deletes()), (14, 2, [5], []))
+        gh = FakeGh()
+        gh.read_failures = 2
+        self.sleeps.clear()
+        fp.publish(gh, self.fx.check(), REPO, SHA, TOKEN)
+        self.assertEqual((gh.read_calls, self.sleeps), (3, [5, 15]))
+        gh = FakeGh()
+        gh.raw['tag'] = (0, 'not json')  # a read that exits 0 with a body that does not parse is retried too
+        gh.read_failures = 0
+        self.sleeps.clear()
+        self.refuses('release-left', gh)
+        self.assertEqual(self.sleeps, [5, 15])
+
+    def test_a_read_back_that_never_parses_is_release_left_after_three_reads_and_nothing_is_deleted(self):
+        self.fx.build()
+        gh = FakeGh()
+        gh.read_failures = 99
+        self.refuses('release-left', gh)
+        self.assertEqual((gh.read_calls, self.sleeps, gh.deletes(), len(gh.creates())), (3, [5, 15], [], 1))
+        self.assertEqual(gh.timeouts[-3:], [fp.TOOL_TIMEOUT] * 3)
+
+    def test_a_parsed_read_back_is_judged_at_once_never_re_read_and_a_mismatch_is_never_deleted(self):
+        self.fx.build()
+        gh = FakeGh()
+        gh.tweak = lambda assets: [dict(assets[0], digest='sha256:' + '0' * 64)] + assets[1:]
+        self.refuses('publish-mismatch', gh)
+        self.assertEqual((gh.read_calls, self.sleeps, gh.deletes()), (1, [], []))
 
     # second review: the pin, the immutable flag, one read per file, the folder, the floor, .gitattributes, test gaps
 
@@ -958,6 +1088,43 @@ class Publish(unittest.TestCase):
                 gh = FakeGh()
                 gh.release_flags = flags
                 self.refuses('immutable-not-set', gh)
+
+    def test_a_read_back_that_says_not_immutable_or_a_draft_deletes_the_release_and_odd_flags_delete_nothing(self):
+        self.fx.build()
+        for flags, deletes in (({'immutable': False, 'draft': False}, True), ({'immutable': True, 'draft': True}, True),
+                               ({'immutable': False, 'draft': True}, True), ({'immutable': False}, True),
+                               ({'draft': True}, True), ({'draft': False}, False), ({'immutable': True}, False),
+                               ({'immutable': 'true', 'draft': False}, False), ({'immutable': 1, 'draft': False}, False),
+                               ({'immutable': True, 'draft': 'false'}, False), ({'immutable': None, 'draft': False}, False),
+                               ({}, False)):
+            with self.subTest(flags):
+                gh = FakeGh()
+                gh.release_flags = flags
+                self.refuses('immutable-not-set', gh)
+                self.assertEqual(gh.deletes(), [['/usr/bin/gh', 'release', 'delete', TAG, '--yes']] if deletes else [])
+                self.assertEqual(gh.read_calls, 1)  # a parsed read is judged at once
+
+    def test_a_release_the_read_back_condemns_that_cannot_be_deleted_or_listed_is_release_left_and_the_first_refusal_is_logged(self):
+        self.fx.build()
+        flags = {'immutable': False, 'draft': False}
+        for what, setup in (('delete fails', lambda g: setattr(g, 'delete_code', 1)),
+                            ('delete is killed', lambda g: setattr(g, 'delete_raises', fp.Refused('tool-timeout'))),
+                            ('list unreadable', lambda g: setattr(g, 'list_after_create', (1, ''))),
+                            ('list shows nothing', lambda g: setattr(g, 'list_after_create', (0, '[]'))),
+                            ('list is not a list', lambda g: setattr(g, 'list_after_create', (0, '{}')))):
+            with self.subTest(what):
+                gh = FakeGh()
+                gh.release_flags = flags
+                setup(gh)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.refuses('release-left', gh)
+                self.assertIn('first refusal immutable-not-set', err.getvalue())
+        gh = FakeGh()  # a draft read-back that the list shows as published is a contradiction: nothing is deleted
+        gh.release_flags, gh.left = {'immutable': True, 'draft': True}, 'published'
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.refuses('release-left', gh)
+        self.assertEqual(gh.deletes(), [])
 
     def test_a_confirmed_but_wrong_immutable_variable_does_not_publish_a_mutable_release_unnoticed(self):
         self.fx.build()
@@ -1444,10 +1611,23 @@ class Publish(unittest.TestCase):
 
     # the rollback floor read from GitHub
 
-    def test_a_draft_install_release_counts_for_the_floor(self):
+    def test_a_draft_of_any_install_tag_is_draft_left_before_the_floor_and_the_pin_are_read(self):
         self.fx.build()
-        gh = self.refuses('not-newer', FakeGh(releases=[{'tagName': 'install-9', 'isDraft': True}]))
-        self.assertEqual(gh.creates(), [])
+        for tag in ('install-9', 'install-2', 'install-6'):  # above, below and the serial after this one
+            with self.subTest(tag):
+                gh = self.refuses('draft-left', FakeGh(releases=[{'tagName': tag, 'isDraft': True}]))
+                self.assertEqual((gh.creates(), [c for c in gh.calls if c[1:3] == ['release', 'download']]), ([], []))
+        gh = self.previous(5)  # install-4's pin is above this one's: pin-mismatch, but a draft of install-2 is named first
+        gh.releases.append({'tagName': 'install-2', 'isDraft': True})
+        self.assertEqual(self.refuses('draft-left', gh).creates(), [])
+        for row in ({'tagName': 'v9', 'isDraft': True}, {'tagName': 'install-9abc', 'isDraft': True},
+                    {'tagName': 'install-9', 'isDraft': 'true'}):  # not an install tag, or not exactly a draft
+            gh = FakeGh(releases=[row])
+            if row['tagName'] == 'install-9':
+                self.refuses('not-newer', gh)
+            else:
+                fp.publish(gh, self.fx.check(), REPO, SHA, TOKEN)
+                self.assertEqual(len(gh.creates()), 1)
 
     def test_serial_zero_is_a_first_release(self):
         self.fx.build(serial=0)
@@ -1481,11 +1661,11 @@ class Publish(unittest.TestCase):
                     gh = FakeGh()
                     gh.raw[key] = answer
                     self.assertEqual(self.refuses('tag-check-failed', gh).creates(), [])
-        for answer in ((0, '[]'), (0, 'null'), (0, '5'), (0, '"x"'), (0, 'not json'), (0, '')):
-            with self.subTest(key='tag', answer=answer):
+        for answer in ((0, '[]'), (0, 'null'), (0, '5'), (0, '"x"'), (0, 'not json'), (0, ''), (1, '{}')):
+            with self.subTest(key='tag', answer=answer):  # never parsed in three reads: the release exists, state unknown
                 gh = FakeGh()
                 gh.raw['tag'] = answer
-                self.refuses('publish-mismatch', gh)
+                self.refuses('release-left', gh)
 
     # the read-back is lenient about a missing size and strict about everything else
 
@@ -2204,13 +2384,17 @@ class PlanJob(unittest.TestCase):
         if tip:
             self.git('update-ref', 'refs/remotes/origin/release', 'HEAD')
 
-    def plan(self, serial: int = SERIAL, env: dict | None = None):
+    def plan(self, serial: int = SERIAL, env: dict | None = None, gh: FakeGh | None = None, drop=()):
         out, err = io.StringIO(), io.StringIO()
         environ = {'SERIES': 'test', 'KIT_HOST': KIT_HOST, 'OWNER_PIN_SHA256': fp.key_fingerprint((OWNER_LINE + '\n').encode()),
-                   'GITHUB_OUTPUT': str(self.root / 'output'), 'GITHUB_STEP_SUMMARY': str(self.root / 'summary'), **(env or {})}
+                   'GITHUB_OUTPUT': str(self.root / 'output'), 'GITHUB_STEP_SUMMARY': str(self.root / 'summary'),
+                   'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN, **(env or {})}
+        for name in drop:
+            del environ[name]
+        self.gh = gh or FakeGh()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = fp.main(['x', 'plan', str(self.fleet), '--serial', str(serial), '--min-serial', '0', '--out',
-                            str(self.root / 'out')], environ, FakeGh(), now=NOW)
+                            str(self.root / 'out')], environ, self.gh, now=NOW)
         return code, out.getvalue().strip()
 
     def test_the_plan_reads_git_blobs_not_the_checkout_and_hands_on_exactly_the_bytes_to_sign(self):
@@ -2272,6 +2456,85 @@ class PlanJob(unittest.TestCase):
                     self.assertEqual(self.plan(serial, env), (1, f'REFUSED {code}'))
                     self.assertFalse((Path(tmp) / 'output').exists())
 
+    def test_the_plan_reads_github_and_refuses_what_publish_would_before_anything_is_written_to_hand_on(self):
+        newer = lambda: FakeGh(releases=[{'tagName': 'install-9', 'isDraft': False}])  # noqa: E731
+        def floor():
+            gh = FakeGh(releases=[{'tagName': 'install-4', 'isDraft': False}])
+            gh.old_pin = (0, json.dumps({'serial': 5, 'head': H40, 'tree': BUNDLE_TREE}))  # the pin here is serial 4
+            return gh
+        for what, make, env, code in (
+                ('a published release of the tag', lambda: FakeGh(releases=[{'tagName': TAG, 'isDraft': False}]), {}, 'tag-exists'),
+                ('a draft of the tag', lambda: FakeGh(releases=[{'tagName': TAG, 'isDraft': True}]), {}, 'draft-left'),
+                ('a draft of another install tag', lambda: FakeGh(releases=[{'tagName': 'install-2', 'isDraft': True}]), {},
+                 'draft-left'),
+                ('a tag on another commit', lambda: FakeGh(refs=[tag_ref(sha_='cd' * 20)]), {}, 'tag-moved'),
+                ('a tag that is not a lightweight commit tag', lambda: FakeGh(refs=[tag_ref(kind='tag')]), {}, 'tag-moved'),
+                ('a serial not above the newest release', newer, {}, 'not-newer'),
+                ('a pin below the previous release\'s', floor, {}, 'pin-mismatch'),
+                ('a previous pin that cannot be read', lambda: self.unreadable_pin(), {}, 'pin-mismatch'),
+                ('the setting off', lambda: FakeGh(immutable=(0, '{"enabled": false}')), {'IMMUTABLE_CONFIRMED': 'yes'},
+                 'immutable-off'),
+                ('the setting unreadable and no confirmation', lambda: FakeGh(immutable=(1, '')), {}, 'immutable-unreadable'),
+                ('the setting unreadable and a wrong word', lambda: FakeGh(immutable=(1, '')), {'IMMUTABLE_CONFIRMED': 'true'},
+                 'immutable-unreadable'),
+                ('a release list that cannot be read', lambda: self.raw_gh('releases'), {}, 'tag-check-failed'),
+                ('a ref list that cannot be read', lambda: self.raw_gh('refs'), {}, 'tag-check-failed')):
+            with self.subTest(what), tempfile.TemporaryDirectory() as tmp:
+                self.root, self.fleet = Path(tmp), Path(tmp) / 'fleet'
+                self.build()
+                gh = make()
+                self.assertEqual(self.plan(env=env, gh=gh), (1, f'REFUSED {code}'))
+                self.assertFalse((Path(tmp) / 'output').exists())  # nothing to sign
+                self.assertFalse((Path(tmp) / 'summary').exists())
+                self.assert_only_reads(gh)
+
+    def unreadable_pin(self) -> FakeGh:
+        gh = FakeGh(releases=[{'tagName': 'install-4', 'isDraft': False}])
+        gh.old_pin = (1, '')
+        return gh
+
+    def raw_gh(self, key: str) -> FakeGh:
+        gh = FakeGh()
+        gh.raw[key] = (1, '')
+        return gh
+
+    def assert_only_reads(self, gh: FakeGh) -> None:
+        """Plan only reads: no release is created or deleted, and every gh call is one of the five reads."""
+        self.assertEqual((gh.creates(), gh.deletes()), ([], []))
+        for call in gh.calls:
+            self.assertTrue(call[1:3] in (['release', 'list'], ['release', 'download']) or (
+                call[1] == 'api' and ('/matching-refs/' in call[2] or call[2].endswith('/immutable-releases'))), call)
+
+    def test_a_plan_without_the_release_environment_refuses_release_env_after_the_offline_checks_and_writes_nothing(self):
+        for name in ('GITHUB_REPOSITORY', 'GITHUB_SHA', 'GH_TOKEN'):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                self.root, self.fleet = Path(tmp), Path(tmp) / 'fleet'
+                self.build()
+                self.assertEqual(self.plan(drop=(name,)), (1, 'REFUSED release-env'))
+                self.assertFalse((Path(tmp) / 'output').exists())
+                self.assertEqual(self.gh.calls, [])
+        with tempfile.TemporaryDirectory() as tmp:  # an offline refusal comes first, with the word it always had, and no gh call
+            self.root, self.fleet = Path(tmp), Path(tmp) / 'fleet'
+            self.build()
+            self.assertEqual(self.plan(env={'SERIES': 'release'}, drop=('GH_TOKEN',)), (1, 'REFUSED series'))
+            self.assertEqual(self.gh.calls, [])
+
+    def test_a_clean_plan_is_ok_makes_only_reads_and_an_absent_tag_the_tag_job_will_make_is_fine(self):
+        for what, make, env in (('the tag exists on this commit', FakeGh, {}),
+                                ('the tag is not there yet', lambda: FakeGh(refs=[]), {}),
+                                ('a previous release below', lambda: FakeGh(releases=[{'tagName': 'install-4', 'isDraft': False}]), {}),
+                                ('setting unreadable, owner confirmed', lambda: FakeGh(immutable=(1, '')),
+                                 {'IMMUTABLE_CONFIRMED': 'yes'})):
+            with self.subTest(what), tempfile.TemporaryDirectory() as tmp:
+                self.root, self.fleet = Path(tmp), Path(tmp) / 'fleet'
+                self.build()
+                gh = make()
+                self.assertEqual(self.plan(env=env, gh=gh), (0, f'OK plan {TAG}'))
+                self.assertTrue((Path(tmp) / 'output').exists())
+                self.assert_only_reads(gh)
+                self.assertGreaterEqual(len(gh.calls), 3)
+                self.assertTrue(all(set(e) == {'PATH', 'GH_TOKEN', 'GH_REPO', 'GH_PROMPT_DISABLED'} for e in gh.envs))
+
     def test_the_folder_must_be_exactly_the_data_files_as_plain_blobs(self):
         for what, mutate, code in (('an extra file', lambda f: f.update({'extra.txt': b'x'}), 'unlisted'),
                                    ('a missing file', lambda f: f.pop('verify-archive.py'), 'missing'),
@@ -2328,6 +2591,18 @@ class Readme(unittest.TestCase):
         for need in ('`SIGN_KEY`', '`KEY_SHA256`', '`OWNER_PIN_SHA256`', 'not in this repo', 'prints the fingerprint of the key'):
             self.assertIn(need, section)
         self.assertNotIn('OWNER_PIN_PUB', self.TEXT)
+
+
+    def test_the_readme_says_plan_reads_github_first_and_names_each_leftover_word_with_its_state_and_cure(self):
+        section = re.split(r'(?m)^## ', self.TEXT.split('\n## How an install set is released and verified\n', 1)[1])[0]
+        for need in ('The plan job makes the same read-only checks', 'before anything is signed',
+                     '| word | state | cure |', 'gh release delete install-<n> --yes'):
+            self.assertIn(need, section)
+        for word in ('draft-left', 'release-left', 'tag-exists', 'tag-moved', 'not-newer', 'pin-mismatch', 'immutable-off',
+                     'immutable-unreadable', 'immutable-not-set', 'publish-mismatch'):
+            self.assertTrue(re.search(rf'(?m)^\|[^\n]*`{word}`[^\n]*\|[^\n]*\|[^\n]*\|$', section), word)
+        for word in ('draft-left', 'release-left'):
+            self.assertIn(word, fp.PUBLISH_CODES)
 
 
 class Workflow(unittest.TestCase):
@@ -2407,6 +2682,17 @@ class Workflow(unittest.TestCase):
         self.assertLess(sign.index('[ "$fp" = "$KEY_SHA256" ]'), sign.index('-Y sign'))
         self.assertIn('sha256sum "$d/$1"', sign)
         self.assertNotIn('/tmp', sign)
+
+    def test_the_plan_step_reads_github_with_the_job_token_after_the_immutable_step_and_nothing_else_changed(self):
+        plan = self.JOBS['plan']
+        self.assertLess(plan.index('      - id: immutable\n'), plan.index('      - id: plan\n'))
+        step = self.step_text('plan', 'plan')
+        for need in ('GH_TOKEN: ${{ github.token }}', 'IMMUTABLE_CONFIRMED: ${{ steps.immutable.outputs.immutable }}'):
+            self.assertIn(need, step)
+        self.assertEqual(self.declared_outputs('plan')['immutable'], ('immutable', 'immutable'))  # still handed to publish
+        self.assertIn('IMMUTABLE_CONFIRMED: ${{ needs.plan.outputs.immutable }}', self.JOBS['publish'])
+        self.assertEqual(len(self.JOBS), 7)  # no job is added (AF08's gateway job is parked)
+        self.assertEqual(re.findall(r'vars\.(\w+)', self.TEXT), ['IMMUTABLE_RELEASES_CONFIRMED'])
 
     def test_the_plan_job_reads_the_fleet_over_ssh_with_the_pinned_host_key_and_the_tag_job_never_forces(self):
         for need in ('StrictHostKeyChecking=yes', 'IdentitiesOnly=yes', '/dev/shm/fleet.', 'shred -u "$d/key"',
