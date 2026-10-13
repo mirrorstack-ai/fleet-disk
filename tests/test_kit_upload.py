@@ -591,6 +591,255 @@ class TestGateway(Fixture):
         self.assertNotIn('203.0.113', out + err)
 
 
+# The placeholder the fleet repository holds while no gateway is live, copied from `fleet/core/gateway.json` on its main branch
+# (ledger D309). The not-live tests are built from this text, so the exact test is against the real shape.
+PLACEHOLDER = ('{"serial": 0, "address": null, "cert_sha256": null, "manifest_key": null, "session_key": null, "next": null, '
+               '"r9_closed": false}')
+SKIP_LINE = 'SKIP gateway not-live\n'
+
+
+class Boom:
+    """A host that must never be asked: any request is a failure of the test (and is recorded too)."""
+
+    def __init__(self) -> None:
+        self.calls: list = []
+
+    def request(self, *a):
+        self.calls.append(a)
+        raise AssertionError('the kit host was asked')
+
+
+class TestGatewayNotLive(Fixture):
+    """While no gateway is live the gateway step skips (D309); every other state refuses with the word it had before."""
+
+    def setUp(self):
+        super().setUp()
+        self.old_sig = (self.origin / 'fleet/core/gateway.json.sig').read_bytes()  # the owner's signature of the serial 3 record
+
+    def tip(self, text: str | None = PLACEHOLDER, sig: str | None = None) -> None:
+        """The release tip's pair: `text` as gateway.json (None: no file), and gateway.json.sig as `sig` says: None no file, 'pin' a
+        good owner signature, 'install' the right key in another namespace, 'stale' the fixture's old signature, 'empty' a zero-byte
+        file, 'dir' a folder of that name."""
+        record, sigfile = self.origin / 'fleet/core/gateway.json', self.origin / 'fleet/core/gateway.json.sig'
+        shutil.rmtree(sigfile, ignore_errors=True)
+        sigfile.unlink(missing_ok=True)
+        if text is not None:
+            record.write_text(text if text.endswith('\n') or not text else text + '\n')
+        if sig == 'stale':
+            sigfile.write_bytes(self.old_sig)
+        elif sig == 'pin':
+            ssh_sign(self.owner, record, fp.PIN_NS)
+        elif sig == 'install':
+            ssh_sign(self.owner, record, fp.NS)
+        elif sig == 'empty':
+            sigfile.write_bytes(b'')
+        elif sig == 'dir':
+            sigfile.mkdir()
+            (sigfile / 'x').write_text('x')
+        if text is None:
+            record.unlink(missing_ok=True)
+        git(self.origin, 'add', '-A')
+        git(self.origin, 'commit', '-q', '--allow-empty', '-m', 'edit')
+
+    def check(self, **kw):
+        return self.invoke('gateway', '--check', '--owner-pub', str(self.pub), **kw)
+
+    def refuses(self, word: str, why: str) -> None:
+        for run in (self.gateway, self.check):
+            net = Boom()
+            code, out, _ = run(net=net)
+            self.assertEqual((code, out), (1, f'REFUSED {word}\n'), why)
+            self.assertEqual(net.calls, [], why)
+        self.assertClean()
+
+    def test_the_placeholder_fixture_is_the_real_placeholder(self):
+        self.assertEqual(json.loads(PLACEHOLDER), {'serial': 0, 'address': None, 'cert_sha256': None, 'manifest_key': None,
+                                                   'session_key': None, 'next': None, 'r9_closed': False})
+        self.assertEqual(PLACEHOLDER, '{"serial": 0, "address": null, "cert_sha256": null, "manifest_key": null, '
+                                      '"session_key": null, "next": null, "r9_closed": false}')
+        self.assertTrue(all(key in json.loads(PLACEHOLDER) for key in fk.GATEWAY_KEYS))
+        self.assertTrue(fk.is_placeholder(PLACEHOLDER.encode()))
+        self.assertTrue(fk.is_placeholder((PLACEHOLDER + '\n').encode()))
+
+    def test_no_gateway_live_is_a_skip_and_no_request_is_made(self):
+        for text in (PLACEHOLDER, PLACEHOLDER + '\n', json.dumps(json.loads(PLACEHOLDER), separators=(',', ':'))):
+            self.tip(text)
+            for run in (self.gateway, self.check):
+                net = Boom()
+                code, out, err = run(net=net)
+                self.assertEqual((code, out, err), (0, SKIP_LINE, ''), text)
+                self.assertEqual(net.calls, [])
+                self.assertClean()
+        self.assertEqual(self.net.calls, [])
+
+    def test_a_live_pair_still_uploads_and_reads_back_and_the_check_only_judges_it(self):
+        code, out, _ = self.check()
+        self.assertEqual((code, out), (0, 'OK gateway-check serial=3\n'))
+        self.assertEqual(self.net.calls, [])
+        code, out, _ = self.gateway()
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith('OK gateway serial=3 json='))
+        (call,) = self.net.calls
+        self.assertEqual(call['path'], '/_k/gateway/3')
+        self.assertTrue(self.net.signature_ok(call))
+        self.assertClean()
+
+    def test_the_check_needs_no_upload_key_and_never_builds_a_signer(self):
+        with mock.patch.object(fk, 'Signer', side_effect=AssertionError('a signer was made')):
+            code, out, _ = self.check(env=self.env(KIT_UPLOAD_KEY=None))
+        self.assertEqual((code, out), (0, 'OK gateway-check serial=3\n'))
+        self.tip()
+        with mock.patch.object(fk, 'Signer', side_effect=AssertionError('a signer was made')):
+            self.assertEqual(self.check(env=self.env(KIT_UPLOAD_KEY=None))[:2], (0, SKIP_LINE))
+        self.assertEqual(self.gateway(env=self.env(KIT_UPLOAD_KEY=None))[:2], (1, 'REFUSED env\n'))  # the upload still needs it
+
+    def test_the_check_refuses_a_bad_host_or_a_missing_environment(self):
+        self.assertEqual(self.check(env=self.env(KIT_HOST='not a host'))[:2], (1, 'REFUSED kit-host\n'))
+        for key in ('KIT_HOST', 'RUNNER_TEMP', 'FLEET_REPO'):
+            self.assertEqual(self.check(env=self.env(**{key: None}))[:2], (1, 'REFUSED env\n'), key)
+        self.assertEqual(self.check(env=self.env(OWNER_PIN_SHA256=None))[:2], (1, 'REFUSED key\n'))
+
+    def test_a_gateway_file_that_is_missing_is_refused_not_skipped(self):
+        self.tip(None, None)
+        self.refuses('gateway', 'no record, no signature')
+        self.tip(None, 'stale')
+        self.refuses('gateway', 'a signature and no record')
+
+    def test_a_signature_beside_a_not_live_record_is_refused(self):
+        self.tip(PLACEHOLDER, 'pin')
+        self.refuses('gateway', 'a signed placeholder')
+        self.tip(PLACEHOLDER, 'stale')
+        self.refuses('sig', 'a placeholder with a signature that does not fit')
+        self.tip(PLACEHOLDER, 'install')
+        self.refuses('sig', 'a placeholder signed in the wrong namespace')
+        self.tip(PLACEHOLDER, 'empty')
+        self.refuses('gateway', 'a placeholder with an empty signature file')
+        self.tip(PLACEHOLDER, 'dir')
+        self.refuses('gateway', 'a placeholder and a folder where the signature should be')
+        self.tip(json.dumps({**json.loads(PLACEHOLDER), 'address': '203.0.113.9'}), 'pin')
+        self.refuses('gateway', 'a signed serial 0 with an address')
+
+    def test_serial_zero_with_an_address_or_a_null_address_with_a_serial_is_refused_unsigned(self):
+        base = json.loads(PLACEHOLDER)
+        for name, edit in {'serial 0 with an address': {'address': '203.0.113.9'},
+                           'address null with serial 3': {'serial': 3},
+                           'address null with serial 1': {'serial': 1},
+                           'a live-looking record': {'serial': 3, 'address': '203.0.113.9', 'cert_sha256': 'ab' * 32}}.items():
+            self.tip(json.dumps({**base, **edit}), None)
+            self.refuses('gateway', name)
+
+    def test_a_record_that_only_looks_like_the_placeholder_is_refused(self):
+        """End to end through both verbs, a few of each kind; the whole list is judged by is_placeholder just below."""
+        base = json.loads(PLACEHOLDER)
+        bodies = {'a list': '[]', 'an empty file': '', 'a bool serial': json.dumps({**base, 'serial': False}),
+                  'a negative zero serial': PLACEHOLDER.replace('"serial": 0', '"serial": -0'),
+                  'a filled cert_sha256': json.dumps({**base, 'cert_sha256': 'ab' * 32}),
+                  'a half-edited record': json.dumps({**base, 'cert_sha256': 'ab' * 32, 'manifest_key': 'k', 'session_key': 's'}),
+                  'an extra key': json.dumps({**base, 'extra': 1}),
+                  'an oversized record': json.dumps({**base, 'pad': 'x' * fk.MAX_GATEWAY_JSON})}
+        for name, body in bodies.items():
+            self.tip(body, None)
+            self.refuses('gateway', name)
+
+    def test_is_placeholder_is_an_exact_match(self):
+        base = json.loads(PLACEHOLDER)
+        bodies = {'a list': '[]', 'null': 'null', 'a number': '0', 'a string': '"x"', 'an empty object': '{}', 'not json': 'serial 0',
+                  'an empty file': '', 'a bool serial': json.dumps({**base, 'serial': False}),
+                  'a float serial': json.dumps({**base, 'serial': 0.0}), 'a string serial': json.dumps({**base, 'serial': '0'}),
+                  'a null serial': json.dumps({**base, 'serial': None}), 'a negative serial': json.dumps({**base, 'serial': -1}),
+                  'a negative zero': PLACEHOLDER.replace('"serial": 0', '"serial": -0'),
+                  'a missing address': json.dumps({k: v for k, v in base.items() if k != 'address'}),
+                  'a missing key': json.dumps({k: v for k, v in base.items() if k != 'session_key'}),
+                  'only the five gateway keys': json.dumps({k: v for k, v in base.items() if k in fk.GATEWAY_KEYS}),
+                  'a duplicate serial': PLACEHOLDER.replace('"serial": 0', '"serial": 0, "serial": 0'),
+                  'a deploy pin': json.dumps({'serial': 0, 'sha256': 'ab' * 32}),
+                  'an extra key': json.dumps({**base, 'extra': 1}),
+                  'false address': json.dumps({**base, 'address': False}), 'an empty address': json.dumps({**base, 'address': ''}),
+                  'a filled cert_sha256': json.dumps({**base, 'cert_sha256': 'ab' * 32}),
+                  'a filled manifest_key': json.dumps({**base, 'manifest_key': 'k'}),
+                  'a filled session_key': json.dumps({**base, 'session_key': 's'}),
+                  'next set': json.dumps({**base, 'next': {'serial': 5}}), 'r9_closed true': json.dumps({**base, 'r9_closed': True}),
+                  'r9_closed 0': json.dumps({**base, 'r9_closed': 0}), 'r9_closed null': json.dumps({**base, 'r9_closed': None})}
+        for name, body in bodies.items():
+            self.assertFalse(fk.is_placeholder(body.encode()), name)
+        self.assertFalse(fk.is_placeholder(PLACEHOLDER.encode(), '100755'), 'an executable file')
+        self.assertFalse(fk.is_placeholder(PLACEHOLDER.encode(), '120000'), 'a symlink')
+
+    def test_a_symlink_or_an_executable_record_is_refused_not_skipped(self):
+        record = self.origin / 'fleet/core/gateway.json'
+        self.tip(PLACEHOLDER)
+        record.chmod(0o755)
+        git(self.origin, 'add', '-A')
+        git(self.origin, 'commit', '-q', '-m', 'mode')
+        self.refuses('gateway', 'mode 100755')
+        record.chmod(0o644)
+        record.unlink()
+        (self.origin / 'fleet/core/target.json').write_text(PLACEHOLDER + '\n')
+        record.symlink_to('target.json')
+        git(self.origin, 'add', '-A')
+        git(self.origin, 'commit', '-q', '-m', 'symlink')
+        self.refuses('gateway', 'mode 120000')
+
+    def test_a_signed_record_with_a_null_address_and_a_serial_is_judged_live_as_before(self):
+        self.tip(json.dumps({**json.loads(PLACEHOLDER), 'serial': 3}), 'pin')
+        self.assertEqual(self.check()[:2], (0, 'OK gateway-check serial=3\n'))
+        code, out, _ = self.gateway()
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith('OK gateway serial=3 json='))
+        self.assertEqual(len(self.net.calls), 1)
+
+    def test_a_git_failure_while_reading_the_tip_refuses_and_never_skips(self):
+        self.tip(PLACEHOLDER)
+        real = fk.git_run
+        sig_listing = ('ls-tree', fk.FLEET_TIP, '--', fk.GATEWAY_SIG_PATH)
+
+        def failing(repo, env, *args, **kw):
+            if args == sig_listing:
+                raise fk.Refused('fetch')
+            return real(repo, env, *args, **kw)
+
+        def strange(repo, env, *args, **kw):
+            return b'something else\n' if args == sig_listing else real(repo, env, *args, **kw)
+
+        for name, replacement in (('ls-tree fails', failing), ('ls-tree answers something unexpected', strange)):
+            with mock.patch.object(fk, 'git_run', replacement):
+                self.refuses('gateway', name)
+
+    def test_a_live_looking_record_without_a_signature_or_with_a_bad_one_is_refused(self):
+        live = json.dumps(self.record(3))
+        self.tip(live, None)
+        self.refuses('gateway', 'no signature')
+        self.tip(json.dumps(self.record(4)), 'stale')  # the stale signature is of the serial 3 record
+        self.refuses('sig', 'a signature of other bytes')
+        self.tip(live, 'install')
+        self.refuses('sig', 'the wrong namespace')
+        self.tip(live, 'empty')
+        self.refuses('gateway', 'an empty signature')
+        self.tip(live, 'dir')
+        self.refuses('gateway', 'a folder of that name')
+
+    def test_the_check_never_uploads_in_any_state(self):
+        base = json.loads(PLACEHOLDER)
+        states = [(PLACEHOLDER, None), (PLACEHOLDER, 'pin'), (json.dumps(self.record(3)), 'pin'), (json.dumps(self.record(3)), None),
+                  (json.dumps({**base, 'serial': 3}), None), (None, None), ('[]', None), (json.dumps(self.record(4)), 'pin')]
+        for text, sig in states:
+            self.tip(text, sig)
+            net = Boom()
+            self.check(net=net)
+            self.assertEqual(net.calls, [], (text, sig))
+            self.assertEqual(self.net.calls, [])
+
+    def test_the_usage_of_the_check(self):
+        self.assertEqual(fk.parse_args(['x', 'gateway', '--check', '--owner-pub', 'p']), ('gateway-check', None, 'p'))
+        for argv in (['gateway', '--check'], ['gateway', '--check', '--owner-pub'], ['gateway', '--owner-pub', 'p', '--check'],
+                     ['gateway', '--check', 'p'], ['gateway', '--check', '--owner-pub', 'p', 'q']):
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(fk.main(['x', *argv], {}), 2, argv)
+
+    def test_the_skip_line_is_one_fixed_string(self):
+        self.assertEqual(fk.NOT_LIVE, 'SKIP gateway not-live')
+
+
 @unittest.skipUnless(OPENSSL, 'no openssl with Ed25519 raw signing')
 class TestSigner(unittest.TestCase):
     def setUp(self):

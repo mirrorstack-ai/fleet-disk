@@ -13,6 +13,18 @@ says it stored.
 `gateway`: reads fleet/core/gateway.json and fleet/core/gateway.json.sig from the tip of the fleet `release` branch, checks
 the owner's signature under the pin's namespace (ssh-keygen -Y verify) and the shape of the record, and PUTs the pair as one
 request, so the host flips to it whole or not at all. These two files are not part of the public release folder and never pass through an artifact.
+Until a gateway is live the record is the placeholder (serial exactly 0, address null) and has no signature file: that state alone
+is not a refusal; the verb prints `SKIP gateway not-live`, uploads nothing, makes no request and exits 0 (ledger D309). Every other
+state refuses as before, so a signed placeholder, a signature beside a not-live record, a live-looking record without a signature,
+a serial 0 with an address and an unsigned record with a null address and a serial of 1 or more are all `REFUSED gateway`
+(`REFUSED sig` when a signature is there and does not verify). The not-live test is an exact match with the placeholder as the
+fleet repository holds it: every field, its type, no other key, a plain `0`, a regular file. A signed record with a null address and
+a serial of 1 or more is judged live, as it was before: the address is not read here.
+
+`gateway --check`: the same read and the same verdict, no upload and no upload key: `OK gateway-check serial=N`, `SKIP gateway
+not-live` or a refusal. The kit job runs it first, so a bad pair is refused before the bundle, which the host can never delete,
+is stored. The verb `gateway` reads the tip again (a second shallow fetch) and judges again, so a tip that moves in between is
+still judged by the upload itself.
 
 `floor N`: PUT /_k/floor {"floor": N}, the host's break-glass for a bad serial (it serves nothing below N), and reads the floor
 back. It needs only KIT_HOST and the upload key: no fleet repository, no owner key.
@@ -147,6 +159,13 @@ GATEWAY_KEYS = ('serial', 'address', 'cert_sha256', 'manifest_key', 'session_key
 MAX_ANSWER = 65536  # the most of an answer that is read
 CLOSURE_PATH = 'fleet/install/closure.txt'
 GATEWAY_PATH, GATEWAY_SIG_PATH = 'fleet/core/gateway.json', 'fleet/core/gateway.json.sig'
+NOT_LIVE = 'SKIP gateway not-live'  # the one line of the not-live state (ledger D309)
+# The record the fleet repository holds while no gateway is live (fleet/core/gateway.json on its main branch). The not-live test
+# is an exact match with this, value by value and type by type, so a half-edited record never skips.
+PLACEHOLDER_RECORD = {'serial': 0, 'address': None, 'cert_sha256': None, 'manifest_key': None, 'session_key': None, 'next': None,
+                      'r9_closed': False}
+PLACEHOLDER_SERIAL_RX = re.compile(rb'"serial"\s*:\s*0\s*[,}]')  # the token is a plain 0, not -0
+BLOB_ENTRY_RX = re.compile(rb'([0-7]{6}) blob [0-9a-f]{40,64}\t(.+)\n', re.DOTALL)  # one `git ls-tree` line
 FLEET_TIP = 'refs/remotes/origin/release'
 GIT = '/usr/bin/git'
 OPENSSL = '/usr/bin/openssl'
@@ -154,7 +173,7 @@ SHM = '/dev/shm'  # where the key lives for the length of the run
 KEY_PEM = re.compile(r'-----BEGIN PRIVATE KEY-----\n[A-Za-z0-9+/=\n]{1,400}-----END PRIVATE KEY-----\n?', re.ASCII)
 GIT_TIMEOUT, SIGN_TIMEOUT, NET_TIMEOUT = 600, 60, 900
 USAGE_TEXT = ('usage: fleet-kit-upload.py bundle <dir> --owner-pub <path>\n'
-              '       fleet-kit-upload.py gateway --owner-pub <path>\n'
+              '       fleet-kit-upload.py gateway [--check] --owner-pub <path>\n'
               '       fleet-kit-upload.py floor <N>\n')
 
 
@@ -427,18 +446,53 @@ def upload_bundle(folder: Path, owner_pub: bytes, environ: dict[str, str], net: 
     return f'OK bundle serial={serial} size={size} sha256={sha}'
 
 
-def upload_gateway(owner_pub: bytes, environ: dict[str, str], net: Net, signer: Signer, work: Path) -> str:
-    host = fp.check_kit_host(environ.get('KIT_HOST', ''))
+def tip_blob(repo: Path, env: dict[str, str], log: Path, path: str) -> tuple[str, bytes] | None:
+    """(file mode, bytes) of the blob at path on the release tip, or None when the tip has no such path at all (git ls-tree lists
+    nothing); anything else that is not that one blob, or any git failure, is Refused('gateway')."""
+    try:
+        listed = git_run(repo, env, 'ls-tree', FLEET_TIP, '--', path, log=log)
+        if not listed:
+            return None
+        entry = BLOB_ENTRY_RX.fullmatch(listed)
+        if entry is None or entry.group(2) != path.encode('ascii'):
+            raise Refused('gateway')
+        return entry.group(1).decode('ascii'), git_run(repo, env, 'cat-file', 'blob', f'{FLEET_TIP}:{path}', log=log)
+    except Refused:
+        raise Refused('gateway') from None
+
+
+def is_placeholder(text: bytes, mode: str = '100644') -> bool:
+    """The record the fleet repository holds while no gateway is live, exactly: a regular file (mode 100644) that parses
+    strictly to PLACEHOLDER_RECORD, key for key and type for type (serial the int 0, written as a plain 0; address, the three
+    gateway fields and `next` null; r9_closed false; no other key). Anything else, however nearly it looks like one, is not
+    (fail closed)."""
+    if mode != '100644' or PLACEHOLDER_SERIAL_RX.search(text) is None:
+        return False
+    try:
+        doc = fp.manifest.canon.loads_strict(text)
+    except fp.manifest.canon.SchemaError:
+        return False
+    return (isinstance(doc, dict) and doc.keys() == PLACEHOLDER_RECORD.keys()
+            and all(type(doc[key]) is type(want) and doc[key] == want for key, want in PLACEHOLDER_RECORD.items()))
+
+
+def read_gateway_pair(owner_pub: bytes, environ: dict[str, str], work: Path) -> tuple[bytes, bytes, int] | None:
+    """(json, signature, serial) of the live pair at the release tip, once every check has passed; None when no gateway is
+    live: the record is the placeholder and no signature file exists beside it. Every other state is Refused."""
     env, repo, log = git_env(environ), work / 'fleet', work / 'fetch.log'
     repo.mkdir()
     git_run(repo, env, 'init', '-q', log=log)
     fetch_fleet(environ['FLEET_REPO'], repo, env, log, tip=True)
-    try:
-        text = git_run(repo, env, 'cat-file', 'blob', f'{FLEET_TIP}:{GATEWAY_PATH}', log=log)
-        sig = git_run(repo, env, 'cat-file', 'blob', f'{FLEET_TIP}:{GATEWAY_SIG_PATH}', log=log)
-    except Refused:
-        raise Refused('gateway') from None  # the pair is not at the release tip
-    if not 0 < len(text) <= MAX_GATEWAY_JSON or not 0 < len(sig) <= MAX_GATEWAY_SIG:
+    record, signature = tip_blob(repo, env, log, GATEWAY_PATH), tip_blob(repo, env, log, GATEWAY_SIG_PATH)
+    if record is None or not 0 < len(record[1]) <= MAX_GATEWAY_JSON:  # no record, or one the host would not take
+        raise Refused('gateway')
+    mode, text = record
+    if signature is None:
+        if is_placeholder(text, mode):
+            return None
+        raise Refused('gateway')  # a live-looking record nobody signed
+    sig = signature[1]
+    if not 0 < len(sig) <= MAX_GATEWAY_SIG:
         raise Refused('gateway')
     fp.verify_pin_signature(text, sig, owner_pub, fp.run_argv)  # Refused('sig'): the owner signed this very pair
     try:
@@ -449,7 +503,23 @@ def upload_gateway(owner_pub: bytes, environ: dict[str, str], net: Net, signer: 
         raise Refused('gateway')  # signed by the owner under this namespace, but not a gateway record
     serial = doc['serial']
     if type(serial) is not int or not 1 <= serial <= MAX_GATEWAY_SERIAL:
-        raise Refused('gateway')
+        raise Refused('gateway')  # also a signed placeholder, or a signature beside a not-live record
+    return text, sig, serial
+
+
+def check_gateway(owner_pub: bytes, environ: dict[str, str], work: Path) -> str:
+    """The judgement of upload_gateway and nothing else: it makes no request and holds no upload key."""
+    fp.check_kit_host(environ.get('KIT_HOST', ''))
+    pair = read_gateway_pair(owner_pub, environ, work)
+    return NOT_LIVE if pair is None else f'OK gateway-check serial={pair[2]}'
+
+
+def upload_gateway(owner_pub: bytes, environ: dict[str, str], net: Net, signer: Signer, work: Path) -> str:
+    host = fp.check_kit_host(environ.get('KIT_HOST', ''))
+    pair = read_gateway_pair(owner_pub, environ, work)
+    if pair is None:
+        return NOT_LIVE
+    text, sig, serial = pair
     body = json.dumps({'json': base64.b64encode(text).decode('ascii'), 'sig': base64.b64encode(sig).decode('ascii')},
                       sort_keys=True, separators=(',', ':')).encode('ascii')
     answer = answer_json(call(net, signer, host, 'PUT', f'/_k/gateway/{serial}', body))
@@ -469,19 +539,21 @@ def upload_floor(floor: int, environ: dict[str, str], net: Net, signer: Signer) 
 
 
 def parse_args(argv: list[str]) -> tuple[str, Path | int | None, str] | None:
-    """(verb, dir or floor or None, owner-pub path) from `bundle <dir> --owner-pub P`, `gateway --owner-pub P` or `floor N`
-    (N canonical decimal, at most MAX_FLOOR), or None."""
+    """(verb, dir or floor or None, owner-pub path) from `bundle <dir> --owner-pub P`, `gateway --owner-pub P`,
+    `gateway --check --owner-pub P` (verb `gateway-check`) or `floor N` (N canonical decimal, at most MAX_FLOOR), or None."""
     if len(argv) == 5 and argv[1] == 'bundle' and argv[3] == '--owner-pub':
         return 'bundle', Path(argv[2]), argv[4]
     if len(argv) == 4 and argv[1] == 'gateway' and argv[2] == '--owner-pub':
         return 'gateway', None, argv[3]
+    if len(argv) == 5 and argv[1] == 'gateway' and argv[2] == '--check' and argv[3] == '--owner-pub':
+        return 'gateway-check', None, argv[4]
     if len(argv) == 3 and argv[1] == 'floor' and FLOOR_RX.fullmatch(argv[2]) and int(argv[2]) <= MAX_FLOOR:
         return 'floor', int(argv[2]), ''
     return None
 
 
 def main(argv: list[str], environ: dict[str, str], net: Net | None = None) -> int:
-    """0 done, 1 refused, 2 usage. The environment: KIT_HOST (the workflow's constant), KIT_UPLOAD_KEY (the Ed25519 key, PEM),
+    """0 done, 1 refused, 2 usage. The environment: KIT_HOST (the workflow's constant), KIT_UPLOAD_KEY (the Ed25519 key, PEM; `gateway --check` does not need it),
     FLEET_REPO (the private repository's address; `floor` does not need it), RUNNER_TEMP, OWNER_PIN_SHA256 (the owner key's fingerprint: it is what
     ties --owner-pub to the key the owner pinned, so a run without it is `REFUSED key`) and GIT_SSH_COMMAND (the read
     key's ssh command, optional). KIT_UPLOAD_KEY is taken out of this process's own environment at once, so no child
@@ -494,7 +566,8 @@ def main(argv: list[str], environ: dict[str, str], net: Net | None = None) -> in
     os.environ.pop('KIT_UPLOAD_KEY', None)
     work = signer = None
     try:
-        needed = ('KIT_HOST', 'KIT_UPLOAD_KEY', 'RUNNER_TEMP') + (() if verb == 'floor' else ('FLEET_REPO',))
+        needed = (('KIT_HOST', 'RUNNER_TEMP', 'FLEET_REPO') if verb == 'gateway-check'  # judges only: no upload key
+                  else ('KIT_HOST', 'KIT_UPLOAD_KEY', 'RUNNER_TEMP') + (() if verb == 'floor' else ('FLEET_REPO',)))
         if not all(environ.get(k) for k in needed) or not os.path.isdir(environ['RUNNER_TEMP']):
             raise Refused('env')
         if verb == 'floor':  # the upload key and the host, nothing of the fleet repository or the owner key
@@ -505,10 +578,13 @@ def main(argv: list[str], environ: dict[str, str], net: Net | None = None) -> in
                 raise Refused('key')
             owner_pub = fp.owner_key(pub_path, environ['OWNER_PIN_SHA256'], fp.run_argv)
             work = Path(tempfile.mkdtemp(prefix='kit-', dir=environ['RUNNER_TEMP']))
-            signer = Signer(environ['KIT_UPLOAD_KEY'])
-            net = net or Real()
-            line = (upload_bundle(folder, owner_pub, environ, net, signer, work) if verb == 'bundle'
-                    else upload_gateway(owner_pub, environ, net, signer, work))
+            if verb == 'gateway-check':  # no signer, no net: this verb cannot make a request
+                line = check_gateway(owner_pub, environ, work)
+            else:
+                signer = Signer(environ['KIT_UPLOAD_KEY'])
+                net = net or Real()
+                line = (upload_bundle(folder, owner_pub, environ, net, signer, work) if verb == 'bundle'
+                        else upload_gateway(owner_pub, environ, net, signer, work))
     except Refused as why:
         sys.stderr.write(f'fleet-kit-upload: refused {why.code.split()[0]}\n')
         print(f'REFUSED {why.code}')
