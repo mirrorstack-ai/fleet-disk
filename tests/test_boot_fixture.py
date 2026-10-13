@@ -25,18 +25,27 @@ import serve  # noqa: E402
 
 TOOLS = bool(shutil.which('ssh-keygen') and shutil.which('openssl')) and os.path.exists(mf.PUB.SSH_KEYGEN)
 KEY = 'ssh-ed25519 ' + 'A' * 68
+# The shipped lines are verbatim from mirrorstack-fleet main 8746da9f (fleet/install/boot/bootstrap.ps1 blob 5711c0ab, bootstrap.sh blob
+# fe742a20), the loaders that boot-smoke run 38440004807 refused: the PBS line, the kit-host deny line and the ps1 curl.exe re-fetch.
+PS1_CURL = ("$k=[Diagnostics.Process]::Start('C:\\Windows\\System32\\curl.exe','-fsSL --max-redirs 3 --proto =https --proto-redir =https "
+            "--tlsv1.2 --max-time 120 --max-filesize 262144 -o '+$d+$f+$d+' "
+            "https://github.com/mirrorstack-ai/fleet-disk/releases/download/install-{0}/bootstrap.ps1')")
+SH_PBS = "PBS=https://github.com/astral-sh/python-build-standalone/releases/download  # the one place kit.json's python_mac url may point"
+SH_DENY = "    '' | .* | *. | *..* | *[!a-z0-9.-]* | github.com | *.github.com | *githubusercontent.com) host= ;;"
 PS1 = ("# the base: https://github.com/mirrorstack-ai/fleet-disk and python.org in a comment\n"
        "$OwnerKey = 'ssh-ed25519 UNBAKED'\n$Expires = '1970-01-01T00:00:00Z'\n"
        "$Release = 'https://github.com/mirrorstack-ai/fleet-disk/releases/download'\n"
-       "$PythonUrl = 'https://www.python.org/ftp/python/{0}/python-{0}-embed-amd64.zip'\nWrite-Host $OwnerKey\n").encode()
+       "$PythonUrl = 'https://www.python.org/ftp/python/{0}/python-{0}-embed-amd64.zip'\n"
+       f"{PS1_CURL}\nWrite-Host $OwnerKey\n").encode()
 SH = ("#!/bin/sh\n# https://github.com/mirrorstack-ai/fleet-disk\nOWNER_KEY='ssh-ed25519 UNBAKED'\n"
-      "EXPIRES=1970-01-01T00:00:00Z\nRELEASES=https://github.com/mirrorstack-ai/fleet-disk/releases/download\nBASE=\n").encode()
+      f"EXPIRES=1970-01-01T00:00:00Z\nRELEASES=https://github.com/mirrorstack-ai/fleet-disk/releases/download\n{SH_PBS}\n"
+      f"case $host in\n{SH_DENY}\n    *) ;;\nesac\nBASE=\n").encode()
 EXPIRES = '2027-02-01T00:00:00Z'
 
 
 class Rewrite(unittest.TestCase):
     def test_base_and_baked_lines_change_and_nothing_else(self):
-        for name, raw, n in (('ps1', PS1, 4), ('sh', SH, 3)):
+        for name, raw, n in (('ps1', PS1, 5), ('sh', SH, 4)):
             copy = mf.prepare(name, raw, '127.0.0.1', 18443, KEY, EXPIRES)
             self.assertEqual(mf.PUB.baked_values(name, copy), (KEY, EXPIRES))
             self.assertIn(b'127.0.0.1:18443', copy)
@@ -50,15 +59,67 @@ class Rewrite(unittest.TestCase):
                 mf.rewrite(name, raw.replace(old, new), '127.0.0.1', 1)
 
     def test_a_live_line_naming_github_refuses(self):
-        copy = mf.prepare('sh', SH, '127.0.0.1', 1, KEY, EXPIRES)
-        with self.assertRaises(mf.Refused):
-            mf.check_copy(SH, copy + b'curl https://github.com/x\n', 3)
+        for name, raw in (('sh', SH), ('ps1', PS1)):
+            live = raw + b'curl https://github.com/x\n'  # in the original too, so only the live-line check can refuse it
+            with self.subTest(name=name), self.assertRaises(mf.Refused):
+                mf.prepare(name, live, '127.0.0.1', 1, KEY, EXPIRES)
 
-    def test_the_real_bootstraps_in_the_tree(self):  # vacuous until the first release folder is committed
+    def test_the_shipped_loader_lines_are_accepted(self):
+        """Pins what the builder knows of the shipped loaders: every live line naming github.com that they carry (the base, the
+        PBS root, the curl.exe re-fetch) is rewritten to the fixture host, and only the sh deny line stays. Whether the
+        loaders have drifted since is not decided here: AF34's run over the loaders at the release tip catches that."""
+        sh = mf.prepare('sh', SH, '127.0.0.1', 18443, KEY, EXPIRES).decode()
+        ps1 = mf.prepare('ps1', PS1, '127.0.0.1', 18443, KEY, EXPIRES).decode()
+        self.assertIn('PBS=https://127.0.0.1:18443/pbs/releases/download  # the one place', sh)
+        self.assertIn(SH_DENY, sh.split('\n'))
+        self.assertIn(' https://127.0.0.1:18443/releases/download/install-{0}/bootstrap.ps1\')', ps1)
+        for text in (sh, ps1):
+            self.assertEqual([x for x in text.split('\n') if not x.startswith('#') and 'github.com' in x and x != SH_DENY], [])
+            self.assertEqual(text.count('127.0.0.1:18443'), 3 if text is ps1 else 2)
         for d in ROOT.glob('release/install-*'):
             for name in ('ps1', 'sh'):
-                raw = (d / f'bootstrap.{name}').read_bytes()
-                mf.prepare(name, raw, '127.0.0.1', 18443, KEY, EXPIRES)
+                mf.prepare(name, mf.lf((d / f'bootstrap.{name}').read_bytes()), '127.0.0.1', 18443, KEY, EXPIRES)
+
+    def test_the_deny_line_is_excused_only_byte_for_byte_once_and_only_in_sh(self):
+        copy = mf.prepare('sh', SH, '127.0.0.1', 1, KEY, EXPIRES)
+        mf.check_copy('sh', SH, copy, 4)
+        changed = SH.replace(SH_DENY.encode(), SH_DENY.replace('github.com |', 'github.com  |').encode())  # one character added
+        with self.assertRaises(mf.Refused):
+            mf.prepare('sh', changed, '127.0.0.1', 1, KEY, EXPIRES)
+        with self.assertRaises(mf.Refused):  # a second live line naming github.com, in orig and copy alike
+            mf.prepare('sh', SH + b'curl https://github.com/x\n', '127.0.0.1', 1, KEY, EXPIRES)
+        with self.assertRaises(mf.Refused):  # the deny line twice: only one is excused
+            mf.prepare('sh', SH.replace(SH_DENY.encode(), SH_DENY.encode() + b'\n' + SH_DENY.encode()), '127.0.0.1', 1, KEY, EXPIRES)
+        with self.assertRaises(mf.Refused):  # a deny line the original did not hold is not excused
+            mf.check_copy('sh', b'a\nb', ('a\n' + SH_DENY).encode(), 1)
+        mf.check_copy('sh', ('a\n' + SH_DENY).encode(), ('b\n' + SH_DENY).encode(), 1)  # control: one held in both is
+        with self.assertRaises(mf.Refused):  # the sh line inside a ps1 is a live line
+            mf.prepare('ps1', PS1 + SH_DENY.encode() + b'\n', '127.0.0.1', 1, KEY, EXPIRES)
+
+    def test_a_live_line_naming_githubusercontent_or_spelling_a_host_in_another_case_refuses(self):
+        for name, raw in (('sh', SH), ('ps1', PS1)):
+            for url in ('https://raw.githubusercontent.com/x', 'https://objects.githubusercontent.com/x', 'https://GitHub.com/x',
+                        'https://GITHUB.COM/x', 'https://www.PYTHON.org/x', 'https://github.com/x', 'https://www.python.org/x'):
+                with self.subTest(name=name, url=url), self.assertRaises(mf.Refused):
+                    mf.prepare(name, raw + f'curl -fsSL {url}\n'.encode(), '127.0.0.1', 1, KEY, EXPIRES)
+        mf.prepare('sh', SH + b'echo https://127.0.0.1/x\n', '127.0.0.1', 1, KEY, EXPIRES)  # control: a line naming no such host passes
+
+    def test_a_reshaped_shipped_line_refuses(self):
+        for name, raw, old, new in (('sh', SH, b'PBS=', b'PBSX='), ('ps1', PS1, b'/install-{0}/bootstrap.ps1', b'/install-{0}/boot.ps1'),
+                                    ('sh', SH, b'download  # the one', b'download/x  # the one')):
+            with self.subTest(old=old), self.assertRaises(mf.Refused):
+                mf.prepare(name, raw.replace(old, new), '127.0.0.1', 1, KEY, EXPIRES)
+        with self.assertRaises(mf.Refused):  # the curl line twice matches twice
+            mf.prepare('ps1', PS1.replace(PS1_CURL.encode(), PS1_CURL.encode() + b'\n' + PS1_CURL.encode()), '127.0.0.1', 1, KEY, EXPIRES)
+
+    def test_crlf_becomes_lf_and_a_lone_cr_refuses(self):
+        crlf = PS1.replace(b'\n', b'\r\n')
+        self.assertEqual(mf.lf(crlf), PS1)
+        self.assertEqual(mf.prepare('ps1', mf.lf(crlf), '127.0.0.1', 1, KEY, EXPIRES), mf.prepare('ps1', PS1, '127.0.0.1', 1, KEY, EXPIRES))
+        with self.assertRaises(mf.Refused):
+            mf.lf(PS1.replace(b'Write-Host', b'Write\rHost'))
+        with self.assertRaises(mf.Refused):
+            mf.rewrite('ps1', crlf, '127.0.0.1', 1)
 
 
 @unittest.skipUnless(TOOLS, 'ssh-keygen or openssl is missing')
@@ -80,6 +141,18 @@ class Built(unittest.TestCase):
         names = {p.name for p in self.out.rglob('*')}
         self.assertFalse(names & {'ca.key', 'owner', 'wrong', 'index.txt', 'openssl.cnf'})
         self.assertTrue(names >= {'leaf.key', 'ca.crt', 'ca.cer', 'ca.crl', 'owner.pub', 'cases.json'})
+
+    def test_built_copies_hold_no_cr_and_a_crlf_ps1_builds_the_same_copies(self):
+        for p in self.out.rglob('bootstrap.*'):
+            if p.parent.name == 'run' and p.parent.parent.name != 'boot-hash-crlf-ps1':  # that case is CRLF on purpose
+                self.assertNotIn(b'\r', p.read_bytes(), str(p))
+        (self.tmp / 'c.ps1').write_bytes(PS1.replace(b'\n', b'\r\n'))
+        crlf = mf.build(self.tmp / 'fx-crlf', self.tmp / 'c.ps1', self.tmp / 'a.sh', zip_path=self.tmp / 'z.zip')
+        key, exp = mf.PUB.baked_values('ps1', (self.out / 'good-ps1' / 'run' / 'bootstrap.ps1').read_bytes())
+        twin = (self.tmp / 'fx-crlf' / 'good-ps1' / 'run' / 'bootstrap.ps1').read_bytes()
+        self.assertNotIn(b'\r', twin)
+        self.assertEqual(mf.bake('ps1', twin, key, exp), (self.out / 'good-ps1' / 'run' / 'bootstrap.ps1').read_bytes())
+        self.assertEqual(len(crlf['cases']), len(self.meta['cases']))
 
     def test_every_case_has_a_folder_and_the_table_is_complete(self):
         ids = {c['id'] for c in self.meta['cases']}
