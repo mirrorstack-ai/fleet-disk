@@ -37,6 +37,7 @@ jobs:
       - id: plan
         env:
           BOOT_DIR: ${{ inputs.boot_dir }}
+          BOOT_EVENT: ${{ github.event_name }}
         shell: bash
         run: |
           dir=$BOOT_DIR
@@ -46,6 +47,10 @@ jobs:
             printf 'have=true\ndir=%s\n' "$dir" >> "$GITHUB_OUTPUT"
           else
             printf 'have=false\n' >> "$GITHUB_OUTPUT"
+            if [ "$BOOT_EVENT" = workflow_dispatch ] || [ -n "$(ls -d release/install-* 2>/dev/null || true)" ]; then  # a run that was asked for, or a folder that is not a pair, must not pass having run nothing
+              echo "::error::no release/install-<serial>/ with both bootstraps was found: nothing was smoked, and this run was asked to"
+              exit 1
+            fi
             echo "::notice::no release/install-<serial>/ with both bootstraps in this ref: nothing to smoke"
           fi
       - if: steps.plan.outputs.have == 'true'

@@ -138,7 +138,9 @@ class Workflow(unittest.TestCase):
         self.assertIn('upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2', WF)
         self.assertIn('download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0', WF)
 
-    def test_the_plan_step_runs_as_actions_runs_it(self):  # bash -e -o pipefail: a ref with no release folder must skip, not fail
+    def plan(self, event, files, boot_dir=''):
+        """Runs the plan step's script as Actions runs it (bash -e -o pipefail, only these env vars) in a tree holding `files`:
+        (return code, stdout, what it wrote to GITHUB_OUTPUT)."""
         import subprocess
         block = WF.split('      - id: plan\n', 1)[1].split('        run: |\n', 1)[1]
         lines = []
@@ -149,19 +151,54 @@ class Workflow(unittest.TestCase):
         bash = shutil.which('bash')
         if not bash:
             self.skipTest('no bash')
-        for folders, want in (((), 'have=false'), (('release/install-3', 'release/install-12'), 'dir=release/install-12')):
-            with tempfile.TemporaryDirectory() as d:
-                for f in folders:
-                    os.makedirs(os.path.join(d, f))
-                    for b in ('bootstrap.ps1', 'bootstrap.sh'):
-                        open(os.path.join(d, f, b), 'w').close()
-                out = os.path.join(d, 'out')
-                r = subprocess.run([bash, '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', '\n'.join(lines)], cwd=d,
-                                   env={'PATH': os.environ['PATH'], 'BOOT_DIR': '', 'GITHUB_OUTPUT': out},
-                                   capture_output=True, text=True, timeout=30)
-                self.assertEqual(r.returncode, 0, r.stderr)
-                with open(out) as fh:
-                    self.assertIn(want, fh.read())
+        with tempfile.TemporaryDirectory() as d:
+            for f in files:
+                os.makedirs(os.path.dirname(os.path.join(d, f)), exist_ok=True)
+                open(os.path.join(d, f), 'w').close()
+            out = os.path.join(d, 'out')
+            r = subprocess.run([bash, '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', '\n'.join(lines)], cwd=d,
+                               env={'PATH': os.environ['PATH'], 'BOOT_DIR': boot_dir, 'BOOT_EVENT': event, 'GITHUB_OUTPUT': out},
+                               capture_output=True, text=True, timeout=30)
+            written = Path(out).read_text() if os.path.exists(out) else ''
+        return r.returncode, r.stdout, written, r.stderr
+
+    PAIR = ('bootstrap.ps1', 'bootstrap.sh')
+
+    def test_the_plan_step_runs_as_actions_runs_it(self):  # bash -e -o pipefail: a ref with no release folder must skip, not fail
+        for event in ('pull_request', 'push'):
+            rc, out, written, err = self.plan(event, ())
+            self.assertEqual(rc, 0, err)
+            self.assertIn('have=false', written)
+            self.assertIn('::notice::', out)
+            self.assertNotIn('::error::', out)
+        for event in ('pull_request', 'workflow_dispatch'):
+            files = [f'release/install-{n}/{b}' for n in (3, 12) for b in self.PAIR]
+            rc, out, written, err = self.plan(event, files)
+            self.assertEqual(rc, 0, err)
+            self.assertIn('dir=release/install-12', written)
+            self.assertIn('have=true', written)
+
+    def test_a_dispatch_that_would_run_nothing_fails(self):
+        rc, out, written, err = self.plan('workflow_dispatch', ())
+        self.assertNotEqual(rc, 0)
+        self.assertIn('::error::', out)
+        self.assertIn('have=false', written)
+        rc, out, written, err = self.plan('workflow_dispatch', (), boot_dir='release/install-9')  # a named folder that is not there
+        self.assertNotEqual(rc, 0)
+        self.assertIn('::error::', out)
+
+    def test_a_release_folder_that_is_not_a_pair_fails_on_a_pull_request_and_on_a_dispatch(self):
+        for event in ('pull_request', 'workflow_dispatch'):
+            for only in self.PAIR:
+                with self.subTest(event=event, only=only):
+                    rc, out, written, err = self.plan(event, [f'release/install-3/{only}'])
+                    self.assertNotEqual(rc, 0)
+                    self.assertIn('::error::', out)
+                    self.assertNotIn('dir=', written)
+
+    def test_the_event_reaches_the_plan_through_env_only(self):
+        self.assertIn('BOOT_EVENT: ${{ github.event_name }}', WF)
+        self.assertIn('"$BOOT_EVENT"', WF[WF.index('id: plan'):WF.index('python3 tests/fixture/make_fixture.py')])
 
 
 @unittest.skipUnless(TOOLS and shutil.which('sh') and shutil.which('curl'), 'ssh-keygen, openssl, sh or curl is missing')
