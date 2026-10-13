@@ -143,6 +143,44 @@ Not enforced here: that a first release under a new owner key follows a
 published handoff from the old key (a new key starts a new series instead: a serial-floor jump). The owner's own check of a
 release is `VERIFY.txt`'s `ssh-keygen` line.
 
+The plan job makes the same read-only checks before anything is signed, stored on the kit host or tagged (after its offline
+ones and before it writes the bytes to sign): a published release of the tag (`tag-exists`), a leftover draft of any install
+tag (`draft-left`), the tag on another commit or not a lightweight commit tag (`tag-moved`; an absent tag is fine, the tag job
+makes it), a serial not above the newest release (`not-newer`), a pin below that release's (`pin-mismatch`), the Immutable
+setting off or unreadable without the owner's confirmation (`immutable-off`, `immutable-unreadable`), and a missing
+`GITHUB_REPOSITORY`, `GITHUB_SHA` or `GH_TOKEN` (`release-env`). `publish` makes them again as the final authority. The plan
+only reads: it creates and deletes nothing.
+
+What plan guarantees is `tag-exists`, `tag-moved`, `not-newer`, `pin-mismatch` and the Immutable checks. `draft-left` is only
+certain in `publish`: GitHub generally shows draft releases only to a token with write access, the plan job's token is
+`contents: read` and is not widened for this, so a leftover draft may pass plan and be first named by `publish`, after sign,
+kit and tag. That stops before the create, so nothing irreversible has happened, but it is a re-run after the delete. To
+measure once at the first real run, on a scratch repository with Immutable releases, before relying on plan to stop a draft
+early: whether `gh release list` under a `contents: read` token lists a draft of the repository; whether GitHub reports
+`immutable: false` for a moment on a release that later becomes immutable (the publisher deletes on the first read that says
+`false`; if it flips late, delete only after a second read).
+
+Because a release cannot be changed once it is immutable, every refusal comes before the first irreversible step, and what a
+failed publish leaves is named and, when it is safe, removed. When `gh release create` fails or is killed, or the read-back
+says `draft: true` or `immutable: false` (exactly those), the publisher lists the releases and runs
+`gh release delete <tag> --yes` for the release of exactly this tag (never with `--cleanup-tag`: the tag job's tag stays), then
+gives the first refusal. An immutable published release is never deleted. The read-back of the created release is read up to
+three times (5 s, then 15 s apart), only while an answer does not parse; a parsed answer is judged at once. If the delete
+fails, or a release is there that cannot be deleted or read, the word is `release-left` and the first refusal is printed on
+stderr (`first refusal <word>`).
+
+| word | state | cure |
+|---|---|---|
+| `draft-left` | a draft of an install tag exists (a run's upload was killed before it was public) | a repo writer runs `gh release delete install-<n> --yes` (the tag stays), then re-runs |
+| `release-left` | a release of the tag exists and the publisher could not read, judge or remove it | read the release page; if it is immutable and right, the serial is used: take the next one; a draft or mutable one: `gh release delete install-<n> --yes`, then re-run |
+| `tag-exists` | a published release of the tag exists | read the release page; if it is immutable and right, the serial is used |
+| `tag-moved` | the tag is on another commit, or not a lightweight commit tag, and has no release | the deploy key deletes the tag by hand (no workflow mode removes a release-less tag until AF42) |
+| `not-newer` | a release of this or a higher serial exists | dispatch the next serial |
+| `pin-mismatch` | the pin's serial is below the newest release's, or that pin cannot be read | fix the pin or the serial in the release folder |
+| `immutable-off`, `immutable-unreadable` | the Immutable releases setting is off, or the token cannot read it and `IMMUTABLE_RELEASES_CONFIRMED` is not `yes` | turn it on, or record the confirmation |
+| `immutable-not-set` | the created release did not read back immutable and not a draft; it was deleted when it was a draft or mutable | turn the setting on, re-run |
+| `publish-mismatch` | the read-back release is immutable and its assets are not the checked ones | the serial is used and the release stays: take the next serial |
+
 Immutable releases: the job's token usually cannot read the setting (it needs admin). Then the run stops with
 `immutable-unreadable` until the owner records their confirmation as the Environment variable
 `IMMUTABLE_RELEASES_CONFIRMED=yes` on `release` (the plan job passes it on to publish). A setting that reads as off always stops the run.

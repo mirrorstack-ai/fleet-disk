@@ -20,6 +20,10 @@ The serial must fit the series (SERIES=test: below 1000, release: 1000 and up). 
 install-<serial> (made by the tag job: a lightweight tag on this run's commit, with no release yet), require GitHub's
 Immutable releases setting, create the release with exactly those assets and, in its body, `key SHA256:` and the line for
 each OS, read GitHub's digests back and require the release to say immutable and not draft.
+`plan` makes the same read-only GitHub checks (release_state) after its offline ones, so a run publish would refuse stops
+before anything is signed, stored or tagged; publish makes them again as the final authority. A create that fails or is
+killed, or a read-back that says draft or not immutable, has the release it made deleted (never an immutable one) and the
+read-back is retried; a draft an earlier run left is `draft-left`, a release that cannot be removed or read is `release-left`.
 Standalone stdlib. An error names the rule and never echoes a value; a refusal is exit 1, a bad command line 2.
 
 The install.json rules are not written here: vendor/manifest.py is the one verifier, a byte-identical copy of the fleet's
@@ -40,6 +44,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
@@ -166,7 +171,7 @@ USAGE_TEXT = ('usage: fleet-install-publish.py publish|verify <dir> --owner-pub 
               '  OWNER_PIN_SHA256 is the fingerprint the key must have (plan and publish need it);\n'
               '  SERIES (test or release) is needed by plan and publish;\n'
               '  KIT_HOST (the one host install.json\'s bundle.url may name) is needed by plan and publish;\n'
-              '  publish also needs GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN\n')
+              '  plan and publish also need GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN\n')
 DIR_NAME = re.compile(r'install-(0|[1-9][0-9]{0,9})', re.ASCII)  # canonical decimal: install-007 is not install-7
 INSTALL_TAG = re.compile(r'install-(0|[1-9][0-9]{0,9})', re.ASCII)
 OWNER_LINE = re.compile(r'ssh-ed25519 [A-Za-z0-9+/]{68}(?: [ -~]*)?', re.ASCII)  # one key line, an optional comment
@@ -175,7 +180,7 @@ REPO = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}', re.ASC
 PUBLISH_CODES = ('serial', 'dir', 'missing', 'no-deploy-pin', 'pin-mismatch', 'hash', 'unlisted', 'kit', 'short-validity',
                  'release-env', 'tag-check-failed', 'tag-exists', 'tag-missing', 'tag-moved', 'series', 'fleet',
                  'not-on-release', 'pin-tree', 'not-newer', 'immutable-off', 'immutable-unreadable',
-                 'immutable-not-set', 'attributes', 'boot-bytes', 'baked', 'kit-host', 'kit-host-size', 'long-validity', 'tool-missing', 'tool-timeout', 'publish-failed', 'publish-mismatch')
+                 'immutable-not-set', 'draft-left', 'release-left', 'attributes', 'boot-bytes', 'baked', 'kit-host', 'kit-host-size', 'long-validity', 'tool-missing', 'tool-timeout', 'publish-failed', 'publish-mismatch')
 SERIES_FLOOR = 1000  # test-key serials are below it, release-key serials at or above it
 GIT = '/usr/bin/git'
 FLEET_TIP = 'refs/remotes/origin/release'  # where the plan job fetched the fleet repository's release branch
@@ -601,30 +606,44 @@ def check_series(serial: int, series: str) -> None:
         raise Refused('series')
 
 
-def publish(io: Io, plan: Plan, repo: str, sha: str, token: str, confirmed: str = '') -> list[str]:
-    """Require the tag install-N on `sha` and no release of it, require Immutable releases, create the release with
-    exactly the plan's assets and read GitHub's digests back; return one line per asset (name, sha256, url). Every check that cannot be answered refuses
-    (fail closed). The pin's serial may not be lower than the newest existing release's pin (`pin-mismatch`)."""
+def gh_env(repo: str, sha: str, token: str) -> dict[str, str]:
+    """The environment gh runs under (exactly four variables), or Refused('release-env') for a repo, commit or token
+    that is not the job's."""
     if not (REPO.fullmatch(repo) and re.fullmatch(r'[0-9a-f]{40}', sha) and token):
         raise Refused('release-env')
+    return {'PATH': '/usr/bin', 'GH_TOKEN': token, 'GH_REPO': repo, 'GH_PROMPT_DISABLED': '1'}
+
+
+def release_state(io: Io, env: dict[str, str], plan: Plan, sha: str, confirmed: str, planning: bool = False) -> None:
+    """Every read-only check of GitHub's state, in the order the refusals are answered; Refused or return. Run by `plan`
+    (planning=True, before anything is signed, uploaded or tagged) and again by `publish` as the final authority. In
+    plan the tag may be absent (the tag job makes it later); in publish it must be there. Any answer that cannot be read
+    refuses (fail closed). Nothing here writes."""
     tag = plan.tag
-    env = {'PATH': '/usr/bin', 'GH_TOKEN': token, 'GH_REPO': repo, 'GH_PROMPT_DISABLED': '1'}
-    # the tag job made install-N on this run's commit: it must be there, a lightweight tag (type commit) on exactly `sha`,
-    # and no release (drafts included) may carry it yet. Any answer but a clean one (a 5xx, a rate limit, a timeout,
-    # unreadable output) is tag-check-failed.
-    refs = json_out(io, [GH, 'api', f'repos/{repo}/git/matching-refs/tags/{tag}'], env, list)  # a PREFIX match
+    # the tag job makes install-N on this run's commit: it must be a lightweight tag (type commit) on exactly `sha`, and no
+    # release may carry it yet. Any answer but a clean one (a 5xx, a rate limit, a timeout, unreadable output) is
+    # tag-check-failed.
+    refs = json_out(io, [GH, 'api', f'repos/{env["GH_REPO"]}/git/matching-refs/tags/{tag}'], env, list)  # a PREFIX match
     releases = json_out(io, [GH, 'release', 'list', '--limit', '1000', '--json', 'tagName,isDraft'], env, list)
-    if any(isinstance(r, dict) and r.get('tagName') == tag for r in releases):
+    rows = [r for r in releases if isinstance(r, dict)]
+    if any(r.get('tagName') == tag and r.get('isDraft') is not True for r in rows):
         raise Refused('tag-exists')
+    # a draft of any install tag is an interrupted upload (gh was killed): its own word, ahead of the floors it would
+    # otherwise trip (a draft has no deploy-pin.json to read). A read-only token may not be shown drafts at all: plan can
+    # miss one, publish (write token) is the certain check.
+    if any(r.get('isDraft') is True and isinstance(r.get('tagName'), str) and INSTALL_TAG.fullmatch(r['tagName'])
+           for r in rows):
+        raise Refused('draft-left')
     made = [r for r in refs if isinstance(r, dict) and r.get('ref') == f'refs/tags/{tag}']
-    if len(made) != 1:
+    if len(made) > 1 or (len(made) != 1 and not planning):
         raise Refused('tag-missing')
-    target = made[0].get('object')
-    if not isinstance(target, dict) or target.get('type') != 'commit' or target.get('sha') != sha:
-        raise Refused('tag-moved')
+    if made:
+        target = made[0].get('object')
+        if not isinstance(target, dict) or target.get('type') != 'commit' or target.get('sha') != sha:
+            raise Refused('tag-moved')
     # rollback floor, derived here and not only dispatched: never a serial at or below an install-N release that exists
     # (min_serial stays an additional floor)
-    newest = max((int(m[1]) for r in releases if isinstance(r, dict) and isinstance(r.get('tagName'), str)
+    newest = max((int(m[1]) for r in rows if isinstance(r.get('tagName'), str)
                   and (m := INSTALL_TAG.fullmatch(r['tagName']))), default=-1)
     if plan.doc['serial'] <= newest:
         raise Refused('not-newer')
@@ -632,7 +651,7 @@ def publish(io: Io, plan: Plan, repo: str, sha: str, token: str, confirmed: str 
         check_pin_floor(io, env, f'install-{newest}', plan.pin_serial)
     # Immutable releases covers only releases created after it is on, so it is read BEFORE the release exists. The
     # job token cannot always read it: then only the owner's recorded confirmation (confirmed == 'yes') goes on.
-    code, out = io.run([GH, 'api', f'repos/{repo}/immutable-releases'], env)
+    code, out = io.run([GH, 'api', f'repos/{env["GH_REPO"]}/immutable-releases'], env)
     try:
         setting = json.loads(out).get('enabled') if code == 0 else None
     except (ValueError, AttributeError):
@@ -644,12 +663,85 @@ def publish(io: Io, plan: Plan, repo: str, sha: str, token: str, confirmed: str 
             raise Refused('immutable-unreadable')
         print('fleet-install-publish: Immutable releases is unreadable by this token; going on the owner\'s recorded'
               ' confirmation', file=sys.stderr, flush=True)
-    if io.run([GH, 'release', 'create', tag, *(str(a.path) for a in plan.assets), '--target', sha, '--title', tag,
-               '--notes', release_notes(plan, repo)], env, UPLOAD_TIMEOUT)[0] != 0:
-        raise Refused('publish-failed')
-    published = json_out(io, [GH, 'api', f'repos/{repo}/releases/tags/{tag}'], env, dict, 'publish-mismatch')
+
+
+def remove_leftover(io: Io, env: dict[str, str], tag: str, known: bool = False, mutable: bool = False) -> None:
+    """Remove the release this publish made, if it can be removed safely; Refused('release-left') if a release of the tag
+    is still there. Only a release of exactly this tag in a fresh list is touched, with `gh release delete <tag> --yes`
+    (never --cleanup-tag: the tag job's tag stays). A draft is deleted; a published release only when the read-back said
+    it is NOT immutable (`mutable`), since an immutable one can never be deleted or re-made and is left alone. `known`:
+    the read-back already showed the release exists, so a list that cannot show it is `release-left` too (when it is not
+    known, an empty or unreadable list means gh cleaned up after itself)."""
+    try:
+        rows = json_out(io, [GH, 'release', 'list', '--limit', '1000', '--json', 'tagName,isDraft'], env, list)
+    except Refused:
+        rows = None
+    mine = [r for r in rows or [] if isinstance(r, dict) and r.get('tagName') == tag]
+    if len(mine) == 1 and (mine[0].get('isDraft') is True or (mutable and mine[0].get('isDraft') is False)):
+        try:
+            code = io.run([GH, 'release', 'delete', tag, '--yes'], env)[0]
+        except Refused:
+            code = 1
+        if code != 0:
+            raise Refused('release-left')
+        return
+    if mine or known:
+        raise Refused('release-left')
+
+
+def refuse_after_create(io: Io, env: dict[str, str], tag: str, code: str, known: bool = False, mutable: bool = False):
+    """Raise Refused(code) once what the create made is removed. A cleanup that fails never replaces the first refusal
+    silently: `release-left` is raised in its place and the first refusal is on stderr."""
+    try:
+        remove_leftover(io, env, tag, known, mutable)
+    except Refused as left:
+        sys.stderr.write(f'fleet-install-publish: first refusal {code}\n')
+        raise Refused(left.code) from None
+    raise Refused(code)
+
+
+READ_BACK_PAUSES = (5, 15)  # seconds before the second and third read of the created release
+
+
+def read_back(io: Io, env: dict[str, str], repo: str, tag: str) -> dict:
+    """The created release as GitHub serves it: up to three reads (pauses READ_BACK_PAUSES), repeated only while the answer
+    does not parse as a JSON object; a parsed read is judged at once and never re-read. Never parsed: Refused('release-left'),
+    for the release exists and is in an unknown state."""
+    for pause in (0, *READ_BACK_PAUSES):
+        if pause:
+            time.sleep(pause)
+        try:
+            code, out = io.run([GH, 'api', f'repos/{repo}/releases/tags/{tag}'], env)
+            data = json.loads(out) if code == 0 else None
+        except (Refused, ValueError):
+            data = None
+        if isinstance(data, dict):
+            return data
+    raise Refused('release-left')
+
+
+def publish(io: Io, plan: Plan, repo: str, sha: str, token: str, confirmed: str = '') -> list[str]:
+    """Require the tag install-N on `sha` and no release of it, require Immutable releases, create the release with
+    exactly the plan's assets and read GitHub's digests back; return one line per asset (name, sha256, url). Every check that cannot be answered refuses
+    (fail closed). The pin's serial may not be lower than the newest existing release's pin (`pin-mismatch`). A create that
+    fails or is killed, or a read-back that says draft or not immutable, has the release it made removed first."""
+    env = gh_env(repo, sha, token)
+    tag = plan.tag
+    release_state(io, env, plan, sha, confirmed)
+    try:
+        made = io.run([GH, 'release', 'create', tag, *(str(a.path) for a in plan.assets), '--target', sha, '--title', tag,
+                       '--notes', release_notes(plan, repo)], env, UPLOAD_TIMEOUT)[0]
+    except Refused as killed:
+        if killed.code == 'tool-timeout':  # gh was killed with its draft half made: its own cleanup never ran
+            refuse_after_create(io, env, tag, killed.code)
+        raise
+    if made != 0:
+        refuse_after_create(io, env, tag, 'publish-failed')
+    published = read_back(io, env, repo, tag)
     # the setting read and the owner's variable are only an early stop: what the created release says is the proof
     if published.get('immutable') is not True or published.get('draft') is not False:
+        if published.get('immutable') is False or published.get('draft') is True:  # exactly those: odd flags delete nothing
+            refuse_after_create(io, env, tag, 'immutable-not-set', True, published.get('immutable') is False)
         raise Refused('immutable-not-set')
     got = published.get('assets')
     want = {a.name: a for a in plan.assets}
@@ -754,10 +846,13 @@ def plan_report(plan: Plan, tip: str, tree: str, files: dict[str, tuple[str, byt
     return out, '\n'.join(text) + '\n'
 
 
-def plan_main(fleet: str, serial: int, min_serial: int, out_dir: Path, environ: dict[str, str],
+def plan_main(fleet: str, serial: int, min_serial: int, out_dir: Path, environ: dict[str, str], io: Io,
               now: datetime | None = None) -> None:
     """The plan job: see the module docstring. Raises Refused; on success the data files are in
-    <out_dir>/release/install-<serial>/ and the outputs and summary are appended to the files GitHub names."""
+    <out_dir>/release/install-<serial>/ and the outputs and summary are appended to the files GitHub names. After every
+    offline check and before anything is written for the sign job, it reads GitHub's state (release_state: a release or
+    a leftover draft of the tag, the serial and the pin against the newest release, the Immutable setting), so a run the
+    publisher would refuse stops before anything is signed, stored on the kit host or tagged."""
     tip = git_text(fleet, 'rev-parse', '--verify', f'{FLEET_TIP}^{{commit}}')
     tree, files = read_folder(fleet, tip, serial)
     series = environ.get('SERIES', '')
@@ -790,6 +885,9 @@ def plan_main(fleet: str, serial: int, min_serial: int, out_dir: Path, environ: 
                 raise Refused('not-on-release' if code == 1 else 'fleet')
         if git_text(fleet, 'rev-parse', '--verify', f'{pin["head"]}^{{tree}}') != pin['tree']:
             raise Refused('pin-tree')
+        release_state(io, gh_env(environ.get('GITHUB_REPOSITORY', ''), environ.get('GITHUB_SHA', ''),
+                                 environ.get('GH_TOKEN', '')), plan, environ.get('GITHUB_SHA', ''),
+                      environ.get('IMMUTABLE_CONFIRMED', ''), True)
         outputs, summary = plan_report(plan, tip, tree, files, environ['SERIES'])
     finally:
         plan.cleanup()
@@ -818,16 +916,16 @@ def append_summary(environ: dict[str, str], text: str) -> None:
 
 def main(argv: list[str], environ: dict[str, str], io: Io, run: Run = run_argv, now: datetime | None = None) -> int:
     """0 done, 1 refused, 2 usage. publish also needs GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN (the job's), and
-    optionally IMMUTABLE_CONFIRMED=yes. plan and publish need SERIES (test or release), KIT_HOST (the one host the
-    bundle URL may name) and OWNER_PIN_SHA256, the fingerprint the signing key must have; verify takes OWNER_PIN_SHA256
-    and KIT_HOST as optional pins."""
+    optionally IMMUTABLE_CONFIRMED=yes; plan needs the same three and reads GitHub the same way (it only reads). plan and
+    publish need SERIES (test or release), KIT_HOST (the one host the bundle URL may name) and OWNER_PIN_SHA256, the
+    fingerprint the signing key must have; verify takes OWNER_PIN_SHA256 and KIT_HOST as optional pins."""
     if argv[1:2] == ['plan']:
         planned = parse_plan_args(argv)
         if planned is None:
             sys.stderr.write(USAGE_TEXT)
             return USAGE
         try:
-            plan_main(planned[0], planned[1], planned[2], planned[3], environ, now)
+            plan_main(planned[0], planned[1], planned[2], planned[3], environ, io, now)
         except Refused as why:
             sys.stderr.write(f'fleet-install-publish: refused {why.code}\n')
             print(f'REFUSED {why.code}')
