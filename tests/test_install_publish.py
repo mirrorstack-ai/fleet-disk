@@ -1126,6 +1126,66 @@ class Publish(unittest.TestCase):
             self.refuses('release-left', gh)
         self.assertEqual(gh.deletes(), [])
 
+    def test_a_published_release_is_deleted_only_on_a_read_back_of_exactly_immutable_false_and_a_list_row_of_exactly_draft_false(self):
+        self.fx.build()
+        # (a) the read-back says draft, but its immutable flag is odd or missing and the list shows a published row
+        for what, flags in (('immutable "true"', {'draft': True, 'immutable': 'true'}),
+                            ('immutable None', {'draft': True, 'immutable': None}),
+                            ('immutable 0', {'draft': True, 'immutable': 0}),
+                            ('immutable missing', {'draft': True}), ('immutable True', {'draft': True, 'immutable': True})):
+            with self.subTest(f'read-back {what}'):
+                gh = FakeGh()
+                gh.release_flags, gh.left = flags, 'published'
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.refuses('release-left', gh)
+                self.assertEqual(gh.deletes(), [])
+                self.assertIn('first refusal immutable-not-set', err.getvalue())
+        # (b) the read-back says mutable, but the list row is not exactly a published (isDraft False) or a draft row
+        for what, row in (('isDraft "true"', {'tagName': TAG, 'isDraft': 'true'}), ('isDraft "false"', {'tagName': TAG, 'isDraft': 'false'}),
+                          ('isDraft None', {'tagName': TAG, 'isDraft': None}), ('isDraft 0', {'tagName': TAG, 'isDraft': 0}),
+                          ('isDraft missing', {'tagName': TAG})):
+            with self.subTest(f'list row {what}'):
+                gh = FakeGh()
+                gh.release_flags = {'immutable': False, 'draft': False}
+                gh.list_after_create = (0, json.dumps([row]))
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.refuses('release-left', gh)
+                self.assertEqual(gh.deletes(), [])
+
+    def test_two_rows_of_the_tag_in_the_fresh_list_delete_nothing_and_keep_the_first_refusal_on_stderr(self):
+        self.fx.build()
+        pairs = (('two drafts', [True, True]), ('a draft and a published', [True, False]), ('a published and a draft', [False, True]),
+                 ('two published', [False, False]))
+        rows = lambda flags: json.dumps([{'tagName': TAG, 'isDraft': d} for d in flags] + [{'tagName': 'install-2', 'isDraft': False}])  # noqa: E731
+        for what, flags in pairs:
+            with self.subTest(f'failed create {what}'):
+                gh = FakeGh(create_code=1)
+                gh.list_after_create = (0, rows(flags))
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.refuses('release-left', gh)
+                self.assertEqual(gh.deletes(), [])
+                self.assertIn('first refusal publish-failed', err.getvalue())
+            with self.subTest(f'killed create {what}'):
+                gh = FakeGh()
+                gh.create_raises = fp.Refused('tool-timeout')
+                gh.list_after_create = (0, rows(flags))
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.refuses('release-left', gh)
+                self.assertEqual(gh.deletes(), [])
+                self.assertIn('first refusal tool-timeout', err.getvalue())
+            with self.subTest(f'read-back condemns {what}'):
+                gh = FakeGh()
+                gh.release_flags = {'immutable': False, 'draft': False}
+                gh.list_after_create = (0, rows(flags))
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.refuses('release-left', gh)
+                self.assertEqual(gh.deletes(), [])
+                self.assertIn('first refusal immutable-not-set', err.getvalue())
+
     def test_a_confirmed_but_wrong_immutable_variable_does_not_publish_a_mutable_release_unnoticed(self):
         self.fx.build()
         gh = FakeGh(immutable=(1, ''))
@@ -2469,6 +2529,7 @@ class PlanJob(unittest.TestCase):
                  'draft-left'),
                 ('a tag on another commit', lambda: FakeGh(refs=[tag_ref(sha_='cd' * 20)]), {}, 'tag-moved'),
                 ('a tag that is not a lightweight commit tag', lambda: FakeGh(refs=[tag_ref(kind='tag')]), {}, 'tag-moved'),
+                ('two refs carrying exactly the tag', lambda: FakeGh(refs=[tag_ref(), tag_ref()]), {}, 'tag-missing'),
                 ('a serial not above the newest release', newer, {}, 'not-newer'),
                 ('a pin below the previous release\'s', floor, {}, 'pin-mismatch'),
                 ('a previous pin that cannot be read', lambda: self.unreadable_pin(), {}, 'pin-mismatch'),

@@ -3,6 +3,7 @@
 #   plan     reads release/install-<serial>/ from the fleet `release` tip as git blobs (deploy key FLEET_READ) and runs
 #            every offline check but the signatures, then the read-only GitHub checks (a release or leftover draft of the tag,
 #            the serial and pin against the newest release, the Immutable setting), so a refusal comes before anything is signed.
+#            Its token is contents: read, which may not list a draft release: `draft-left` is only certain in publish (README).
 #   sign     runs no repository code and no third-party action: holds SIGN_KEY only in memory, refuses unless its
 #            fingerprint is KEY_SHA256 below, signs the three files, verifies them and wipes the key.
 #   kit      puts the bundle and the gateway record on the kit host. It holds only FLEET_READ and KIT_UPLOAD_KEY (the Ed25519

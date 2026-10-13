@@ -151,6 +151,15 @@ setting off or unreadable without the owner's confirmation (`immutable-off`, `im
 `GITHUB_REPOSITORY`, `GITHUB_SHA` or `GH_TOKEN` (`release-env`). `publish` makes them again as the final authority. The plan
 only reads: it creates and deletes nothing.
 
+What plan guarantees is `tag-exists`, `tag-moved`, `not-newer`, `pin-mismatch` and the Immutable checks. `draft-left` is only
+certain in `publish`: GitHub generally shows draft releases only to a token with write access, the plan job's token is
+`contents: read` and is not widened for this, so a leftover draft may pass plan and be first named by `publish`, after sign,
+kit and tag. That stops before the create, so nothing irreversible has happened, but it is a re-run after the delete. To
+measure once at the first real run, on a scratch repository with Immutable releases, before relying on plan to stop a draft
+early: whether `gh release list` under a `contents: read` token lists a draft of the repository; whether GitHub reports
+`immutable: false` for a moment on a release that later becomes immutable (the publisher deletes on the first read that says
+`false`; if it flips late, delete only after a second read).
+
 Because a release cannot be changed once it is immutable, every refusal comes before the first irreversible step, and what a
 failed publish leaves is named and, when it is safe, removed. When `gh release create` fails or is killed, or the read-back
 says `draft: true` or `immutable: false` (exactly those), the publisher lists the releases and runs

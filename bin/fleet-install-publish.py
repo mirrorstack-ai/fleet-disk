@@ -629,7 +629,8 @@ def release_state(io: Io, env: dict[str, str], plan: Plan, sha: str, confirmed: 
     if any(r.get('tagName') == tag and r.get('isDraft') is not True for r in rows):
         raise Refused('tag-exists')
     # a draft of any install tag is an interrupted upload (gh was killed): its own word, ahead of the floors it would
-    # otherwise trip (a draft has no deploy-pin.json to read)
+    # otherwise trip (a draft has no deploy-pin.json to read). A read-only token may not be shown drafts at all: plan can
+    # miss one, publish (write token) is the certain check.
     if any(r.get('isDraft') is True and isinstance(r.get('tagName'), str) and INSTALL_TAG.fullmatch(r['tagName'])
            for r in rows):
         raise Refused('draft-left')
@@ -915,9 +916,9 @@ def append_summary(environ: dict[str, str], text: str) -> None:
 
 def main(argv: list[str], environ: dict[str, str], io: Io, run: Run = run_argv, now: datetime | None = None) -> int:
     """0 done, 1 refused, 2 usage. publish also needs GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN (the job's), and
-    optionally IMMUTABLE_CONFIRMED=yes; plan needs the same three and reads GitHub the same way (it only reads). plan and publish need SERIES (test or release), KIT_HOST (the one host the
-    bundle URL may name) and OWNER_PIN_SHA256, the fingerprint the signing key must have; verify takes OWNER_PIN_SHA256
-    and KIT_HOST as optional pins."""
+    optionally IMMUTABLE_CONFIRMED=yes; plan needs the same three and reads GitHub the same way (it only reads). plan and
+    publish need SERIES (test or release), KIT_HOST (the one host the bundle URL may name) and OWNER_PIN_SHA256, the
+    fingerprint the signing key must have; verify takes OWNER_PIN_SHA256 and KIT_HOST as optional pins."""
     if argv[1:2] == ['plan']:
         planned = parse_plan_args(argv)
         if planned is None:
