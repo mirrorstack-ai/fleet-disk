@@ -11,9 +11,19 @@ fetches that image with Ubuntu's `SHA256SUMS` and `SHA256SUMS.gpg`, verifies the
 `qemu-img` into a VHDX and into an uncompressed `compat=1.1` qcow2 (the Linux disk), publishes both as the release
 `disk-noble-<serial>` and prints the three lock entries (`disk_input`, `disk` and `disk_qcow2`: a url and a sha256 each, and
 the qcow2's size). A release or tag that already exists is refused, and so is any
-check that cannot be answered (fail closed); after the upload the published assets' digests are read back and must equal the
-printed ones. A signature stamped before the serial's date or in the future is refused. A VHDX or qcow2 of 2 GiB or more is
-refused (GitHub's release asset limit).
+check that cannot be answered (fail closed). The release is created as a draft: its assets' digests are read back by release id
+(up to four reads, five seconds apart) and the draft is made public only when they equal the hashed files, so nothing
+irreversible comes before the last check that can refuse. A digest GitHub has not computed yet is retried and then refused as
+`publish-unread`; a wrong digest or asset set is `publish-mismatch` at once. Both delete the draft first. A refusal after the
+release was made public (the second read must show it published with the same digests) prints `unverified <asset> sha256:<hex>`
+lines to stderr: those are the hashed values, not verified entries, so do not pin from them. A signature stamped before the
+serial's date or in the future is refused. A VHDX or qcow2 of 2 GiB or more is refused (GitHub's release asset limit).
+
+A draft that an interrupted run left (a cancelled job, the upload's time limit) makes the next dispatch for that serial refuse
+`draft-left`, apart from `tag-exists` (a published release or a tag). The workflow's last step always runs
+`bin/fleet-disk.py cleanup <arch> <serial>`, which deletes that tag's draft and nothing else (a published release, or a
+draft of another tag, is never deleted); if it cannot, delete the draft by hand under the repository's Releases (writers see
+drafts there). A draft never made a tag, so deleting it frees the serial.
 
 ## How the arm64 disk (macOS lane) is built
 
@@ -237,7 +247,21 @@ ref's workflow file). The real boundary is set in the repo, not in code:
 
 - Create the Environment `release` first (Settings, Environments), restricted to the `release` branch with admins unable to
   bypass, and put `SIGN_KEY`, `TAG_KEY`, `FLEET_READ` and `KIT_UPLOAD_KEY` in it. The disk build has its own Environment `disk`
-  (restricted to `main`), so nothing about `release` gates or reaches it.
+  (restricted to `main`), so nothing about `release` gates or reaches it. `disk` holds no secret or variable, so it is not a
+  boundary: it only restricts the dispatch to `main`, and the job's write power is the workflow file's `contents: write`.
+  No ruleset covers the `disk-*` tags yet, so anyone with push access can take a `disk-noble-<serial>` name. The ruleset
+  (creation, update, deletion, with a deploy key stored in `disk` as its only bypass) is the owner's step; until then the
+  entries to pin come only from the log of a run on `main`. A read-only probe, run by hand with an admin token, prints
+  FAIL until both exist:
+
+  ```sh
+  repo=mirrorstack-ai/fleet-disk
+  for id in $(gh api "repos/$repo/rulesets" --jq '.[].id'); do
+    gh api "repos/$repo/rulesets/$id" --jq '.conditions.ref_name.include[]?'
+  done | grep -q 'refs/tags/disk-' && echo 'ok: a ruleset covers refs/tags/disk-*' || echo 'FAIL: no ruleset covers refs/tags/disk-*'
+  gh api "repos/$repo/environments/disk/secrets" --jq '.total_count' | grep -qv '^0$' \
+    && echo 'ok: the disk environment holds a secret' || echo 'FAIL: the disk environment holds no secret (no tag key)'
+  ```
 - Create the Environment `kit-floor`, restricted to the `release` branch, with the owner (or the team `security`) as required
   reviewer and admins unable to bypass, and no secret. It is the only gate on a floor run (`floor-approve`); `release` has no
   reviewer, so a release run is unattended during the test phase.

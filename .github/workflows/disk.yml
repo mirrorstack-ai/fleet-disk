@@ -22,7 +22,8 @@ concurrency:
 jobs:
   build:
     # `if` only stops an accidental dispatch from a branch: a dispatched run uses the workflow file of ITS ref, so a
-    # writer could drop it. The boundary is the environment: `disk` is restricted to main (see the README).
+    # writer could drop it. The `disk` environment only restricts the ref to main; it holds no secret or variable, so it
+    # is not a boundary, and no ruleset covers the disk-* tags yet (see the README, One-time repo settings).
     if: github.ref == 'refs/heads/main'
     environment: disk
     runs-on: ubuntu-24.04
@@ -39,3 +40,10 @@ jobs:
           SERIAL: ${{ inputs.serial }}
           GH_TOKEN: ${{ github.token }}
         run: python3 bin/fleet-disk.py "$ARCH" "$SERIAL"
+      # a cancelled or timed-out job kills the script before its own cleanup: delete this serial's draft release, if any
+      - if: always()
+        env:
+          ARCH: ${{ inputs.arch }}
+          SERIAL: ${{ inputs.serial }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 bin/fleet-disk.py cleanup "$ARCH" "$SERIAL"
