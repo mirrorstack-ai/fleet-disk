@@ -568,6 +568,20 @@ class Build(unittest.TestCase):
                 self.assertEqual(build(io_)['disk']['sha256'], sha(VHDX))
                 self.assertEqual((io_.patched, io_.deleted), ([RID], []))
 
+    def test_a_patch_that_failed_is_never_deleted_on_one_stale_draft_read(self):
+        stale, pub = self.rows_of(*self.both()), self.rows_of(*self.both(), draft=False)
+        for kw in ({'patch': 1, 'patch_raises': True}, {'patch': 1}):  # a timed-out PATCH, a nonzero exit: both may have applied
+            with self.subTest(kw=kw), contextlib.redirect_stderr(io.StringIO()):
+                io_ = FakeIo(readback=[None, stale, pub], **kw)  # the draft read, a stale draft read, then it is public
+                self.assertEqual(build(io_)['disk']['sha256'], sha(VHDX))
+                self.assertEqual((io_.patched, io_.deleted, io_.reads), ([RID], [], 3))
+        broken = (1, '')
+        for reads in ([stale, stale, broken, stale], [stale, broken, stale, stale]):  # one unread read breaks "every read"
+            with self.subTest(reads=len(reads)):
+                io_ = FakeIo(patch=1, patch_raises=True, readback=[None, *reads])
+                self.publish_refusal('publish-unread', io_)
+                self.assertEqual((io_.patched, io_.deleted), ([RID], []))
+
     def test_a_published_release_that_cannot_be_read_back_is_never_deleted(self):
         pre = self.rows_of(*self.both())
         for patch, after in ((0, (1, '')), (1, (1, '')), (0, (0, 'junk')), (1, (0, '[]'))):

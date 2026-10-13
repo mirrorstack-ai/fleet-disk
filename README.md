@@ -15,7 +15,7 @@ check that cannot be answered (fail closed). The release is created as a draft: 
 (up to four reads, five seconds apart) and the draft is made public only when they equal the hashed files, so nothing
 irreversible comes before the last check that can refuse. A digest GitHub has not computed yet is retried and then refused as
 `publish-unread`; a wrong digest or asset set is `publish-mismatch` at once. Both delete the draft first. A refusal after the
-release was made public (the second read must show it published with the same digests) prints `unverified <asset> sha256:<hex>`
+PATCH was sent (the release may be public; the second read must show it published with the same digests) prints `unverified <asset> sha256:<hex>`
 lines to stderr: those are the hashed values, not verified entries, so do not pin from them. A signature stamped before the
 serial's date or in the future is refused. A VHDX or qcow2 of 2 GiB or more is refused (GitHub's release asset limit).
 
@@ -23,7 +23,11 @@ A draft that an interrupted run left (a cancelled job, the upload's time limit) 
 `draft-left`, apart from `tag-exists` (a published release or a tag). The workflow's last step always runs
 `bin/fleet-disk.py cleanup <arch> <serial>`, which deletes that tag's draft and nothing else (a published release, or a
 draft of another tag, is never deleted); if it cannot, delete the draft by hand under the repository's Releases (writers see
-drafts there). A draft never made a tag, so deleting it frees the serial.
+drafts there). A draft never made a tag, so deleting it should free the serial (a GitHub behaviour to measure once on a scratch repository
+with Immutable releases before the first real dispatch). The cleanup step runs after every build, green ones too, and exits 1
+when it cannot read the release list (only the newest 100 releases are read): a red last step after a green build step means
+the build result stands, so look for a leftover draft. It also deletes a draft that a PATCH exiting 0 left reading as a draft on every
+read of the build step, if its own read still shows a draft then (GitHub reads are normally consistent).
 
 ## How the arm64 disk (macOS lane) is built
 

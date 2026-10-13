@@ -252,7 +252,8 @@ def convert(io: Io, image: Path, out: Path, fmt: str, opts: str = '') -> int:
 
 def release_rows(io: Io, repo: str, tag: str, env: dict[str, str]) -> list[dict] | None:
     """The rows of repo's release list (drafts included: `releases/tags/<tag>` does not serve a draft and gh prints no
-    id) whose tag_name is exactly tag; None when the list cannot be read (a nonzero exit, a timeout, not a JSON list)."""
+    id) whose tag_name is exactly tag; None when the list cannot be read (a nonzero exit, a timeout, not a JSON list).
+    Only the newest 100 releases are read (no pagination): a new draft sorts first, an older one beyond them reads as none."""
     try:
         code, out = io.run([GH, 'api', f'repos/{repo}/releases?per_page=100'], env)
         data = json.loads(out) if code == 0 else None
@@ -330,8 +331,9 @@ def publish(io: Io, repo: str, tag: str, sha: str, env: dict[str, str], assets: 
     """Create the release as a DRAFT with exactly these assets, read the draft's digests back by release id (up to
     READ_TRIES reads), and only when they are the files' own make it public (one PATCH, then a second read that must
     show it published with the same digests). Return each asset's sha256 by name; on a refusal nothing is printed to
-    sign. Before the PATCH any refusal deletes the draft; after it, a draft is deleted, a published release is verified
-    and one that cannot be read is left alone, with the hashed digests printed as `unverified` lines."""
+    sign. Before the PATCH any refusal deletes the draft; after it (sent, whatever its exit: a timed-out or failed PATCH may
+    have been applied) a draft is deleted only when the PATCH failed AND all READ_TRIES reads show that draft, a published
+    release is verified, and one that cannot be read is left alone, with the hashed digests printed as `unverified` lines."""
     digests = {a.name: file_sha(a) for a in assets}
     want = {name: f'sha256:{digest}' for name, digest in digests.items()}
     try:
@@ -363,12 +365,19 @@ def publish(io: Io, repo: str, tag: str, sha: str, env: dict[str, str], assets: 
     if not patched:
         sys.stderr.write('fleet-disk: patch-failed\n')
 
+    seen = {'reads': 0, 'all_draft': True}
+
     def public_state(rows):
+        seen['reads'] += 1
         row = sole(rows)
         if row is None or row_id(row) != found[1]:
+            seen['all_draft'] = False
             return None
         if row.get('draft') is True:
-            return None if patched else 'draft'  # PATCH said yes but the read says draft: a stale read, not a verdict
+            # the PATCH was sent, so one draft read is never a verdict (a PATCH that timed out or exited nonzero may have
+            # been applied, and a read can be stale): only a draft on EVERY read, of a PATCH that failed, is one
+            return 'draft' if not patched and seen['all_draft'] and seen['reads'] == READ_TRIES else None
+        seen['all_draft'] = False
         verdict = judge_assets(row, want) if row.get('draft') is False else 'unread'
         return None if verdict == 'unread' else verdict
 
