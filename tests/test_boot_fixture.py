@@ -96,6 +96,14 @@ class Rewrite(unittest.TestCase):
         with self.assertRaises(mf.Refused):  # the sh line inside a ps1 is a live line
             mf.prepare('ps1', PS1 + SH_DENY.encode() + b'\n', '127.0.0.1', 1, KEY, EXPIRES)
 
+    def test_a_live_line_naming_githubusercontent_or_spelling_a_host_in_another_case_refuses(self):
+        for name, raw in (('sh', SH), ('ps1', PS1)):
+            for url in ('https://raw.githubusercontent.com/x', 'https://objects.githubusercontent.com/x', 'https://GitHub.com/x',
+                        'https://GITHUB.COM/x', 'https://www.PYTHON.org/x', 'https://github.com/x', 'https://www.python.org/x'):
+                with self.subTest(name=name, url=url), self.assertRaises(mf.Refused):
+                    mf.prepare(name, raw + f'curl -fsSL {url}\n'.encode(), '127.0.0.1', 1, KEY, EXPIRES)
+        mf.prepare('sh', SH + b'echo https://127.0.0.1/x\n', '127.0.0.1', 1, KEY, EXPIRES)  # control: a line naming no such host passes
+
     def test_a_reshaped_shipped_line_refuses(self):
         for name, raw, old, new in (('sh', SH, b'PBS=', b'PBSX='), ('ps1', PS1, b'/install-{0}/bootstrap.ps1', b'/install-{0}/boot.ps1'),
                                     ('sh', SH, b'download  # the one', b'download/x  # the one')):

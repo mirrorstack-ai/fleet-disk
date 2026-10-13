@@ -196,6 +196,13 @@ class Workflow(unittest.TestCase):
                     self.assertIn('::error::', out)
                     self.assertNotIn('dir=', written)
 
+    def test_a_plain_file_named_like_a_release_folder_is_not_a_folder(self):
+        rc, out, written, err = self.plan('pull_request', ['release/install-notes.md'])
+        self.assertEqual(rc, 0, err)
+        self.assertIn('have=false', written)
+        self.assertIn('::notice::', out)
+        self.assertNotIn('::error::', out)
+
     def test_the_event_reaches_the_plan_through_env_only(self):
         self.assertIn('BOOT_EVENT: ${{ github.event_name }}', WF)
         self.assertIn('"$BOOT_EVENT"', WF[WF.index('id: plan'):WF.index('python3 tests/fixture/make_fixture.py')])

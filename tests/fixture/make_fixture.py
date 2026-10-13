@@ -134,14 +134,19 @@ def lf(data: bytes) -> bytes:
     return data
 
 
+HOSTS = ('github.com', 'githubusercontent.com', 'python.org')  # check_copy tests the lower-cased line against these
+
+
 def check_copy(name: str, orig: bytes, copy: bytes, changed: int) -> None:
-    """The copy differs from the original in exactly `changed` lines and no live line still names github.com or python.org,
-    except the one DENY line of `name`, once, unchanged."""
+    """The copy differs from the original in exactly `changed` lines and no live line still names github.com, githubusercontent.com
+    or python.org (in any letter case), except the one DENY line of `name`, once, unchanged. A line whose first non-blank character
+    is # counts as a comment and is not examined: inside a heredoc or a here-string such a line is data, a known limit (the loaders
+    carry neither with a URL in it, and the line-count and changed-line checks still hold)."""
     a, b = orig.decode('ascii').split('\n'), copy.decode('ascii').split('\n')
     excuse = [DENY[name]] if DENY[name] in a else []  # only a line the original already held
     live = []
     for x in b:
-        if x.lstrip().startswith('#') or not ('github.com' in x or 'python.org' in x):
+        if x.lstrip().startswith('#') or not any(h in x.lower() for h in HOSTS):
             continue
         if x in excuse:
             excuse.remove(x)
@@ -378,7 +383,7 @@ def build(out: Path, ps1: Path, sh: Path, host='127.0.0.1', port=18443, crl_port
     x = Ctx(out, datetime.now(timezone.utc))
     x.crl_port = crl_port
     try:
-        raw = {'ps1': lf(ps1.read_bytes()), 'sh': lf(sh.read_bytes())}  # served and run copies are LF
+        raw = {'ps1': lf(ps1.read_bytes()), 'sh': lf(sh.read_bytes())}  # the bases are LF whatever the checkout (the boot-hash-crlf case builds its own CRLF run copy later)
         boots = {n: prepare(n, b, host, port, x.key, x.expires) for n, b in raw.items()}
         make_tls(out / 'tls', host, crl_port, x.now)
         zdest = out / 'python' / version / f'python-{version}-embed-amd64.zip'
