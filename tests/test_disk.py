@@ -50,18 +50,39 @@ def validsig(*fprs: str, good: bool = True, stamp: int = SIGNED) -> str:
         f'[GNUPG:] VALIDSIG {f} 2026-09-30 {stamp} 0 4 0 1 10 01 {f}\n' for f in fprs)
 
 
+RID = 4242  # the draft release's id in the fake GitHub
+
+
+def quiet(err: str) -> str:
+    """stderr without the convert's size lines."""
+    return re.sub(r'fleet-disk: \w+ \d+ bytes\n', '', err)
+
+
+def draft_row(tag: str, assets: list | None = None, draft: bool = True, rid: int = RID) -> dict:
+    return {'id': rid, 'tag_name': tag, 'draft': draft, 'assets': assets if assets is not None else []}
+
+
 class FakeIo:
-    """fetch serves bodies by url; run answers gpgv, qemu-img and gh from fields, and logs every argv."""
+    """fetch serves bodies by url; run answers gpgv, qemu-img and gh from fields, and logs every argv. The fake GitHub
+    keeps release rows: `release create --draft` adds one with the digests of the files written, PATCH publishes it,
+    DELETE removes it, and the list answers from them unless `readback` scripts the answer."""
 
     def __init__(self, image: bytes = IMAGE, sums: bytes | None = None, gpgv: tuple[int, str] | None = None,
                  qemu: int = 0, gh: int = 0, release_exists: bool = False, tag_exists: bool = False,
                  vhdx: bytes = VHDX, qcow2: bytes = QCOW2, check_fails: bool = False, check_out: str | None = None,
-                 readback: tuple[int, str] | None = None):
+                 readback: tuple[int, str] | list | None = None, draft_exists: bool = False, timeout: bool = False,
+                 leftover: str = 'draft', patch: int = 0, patch_takes: bool | None = None, patch_raises: bool = False,
+                 delete: int = 0, rows: list | None = None, changed: dict | None = None):
         self.bodies = {'SHA256SUMS': sums if sums is not None else sums_for(image), 'SHA256SUMS.gpg': b'sig',
                        fd.IMAGE: image}
-        self.gpgv, self.qemu, self.gh = gpgv or (0, validsig(FPR)), qemu, gh
+        self.gpgv, self.qemu, self.gh = gpgv or (0, validsig(FPR)), qemu, gh  # gh: the exit status of `release create`
         self.release_exists, self.tag_exists, self.formats = release_exists, tag_exists, {'vhdx': vhdx, 'qcow2': qcow2}
-        self.check_fails, self.check_out, self.readback = check_fails, check_out, readback  # existing-tag check answers
+        self.check_fails, self.check_out = check_fails, check_out  # existing-tag check answers
+        self.draft_exists, self.timeout, self.leftover = draft_exists, timeout, leftover  # how `release create` ends
+        self.readback = readback  # a (code, body) for every release-list read, or a list of them, one per read (None: real)
+        self.patch, self.patch_takes, self.patch_raises, self.delete = patch, patch_takes, patch_raises, delete
+        self.changed = changed or {}  # asset name -> the digest GitHub shows once the release is public
+        self.rows: list[dict] = list(rows or [])
         self.uploaded: list[str] = []
         self.written: dict[str, bytes] = {}  # what the fake tools wrote, by file name: GitHub's digests are read from it
         self.tag = f'disk-noble-{SERIAL}'
@@ -69,6 +90,8 @@ class FakeIo:
         self.limits: dict[str, int] = {}
         self.ran: list[tuple[list[str], dict[str, str]]] = []
         self.timeouts: list[int] = []
+        self.slept: list[float] = []
+        self.reads, self.patched, self.deleted = 0, [], []  # list reads made, ids PATCHed, ids DELETEd (attempts)
 
     def fetch(self, url: str, dest: Path, limit: int) -> str:
         self.fetched.append(url)
@@ -76,6 +99,9 @@ class FakeIo:
         body = self.bodies[url.rpartition('/')[2]]
         dest.write_bytes(body)
         return sha(body)
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
 
     def run(self, argv: list[str], env: dict[str, str], timeout: int = fd.TOOL_TIMEOUT) -> tuple[int, str]:
         self.timeouts.append(timeout)
@@ -88,19 +114,63 @@ class FakeIo:
             return self.qemu, ''
         tag = self.tag
         if argv[:3] == [fd.GH, 'release', 'list']:  # another tag is always listed: only the exact name counts
-            listed = [{'tagName': tag + '0', 'isDraft': False}] + [{'tagName': tag, 'isDraft': True}] * self.release_exists
+            listed = [{'tagName': tag + '0', 'isDraft': False}] + [{'tagName': tag, 'isDraft': False}] * self.release_exists
+            listed += [{'tagName': tag, 'isDraft': True}] * self.draft_exists
             return self.answer(json.dumps(listed))
         if argv[:2] == [fd.GH, 'api'] and 'matching-refs' in argv[2]:  # a PREFIX match: it also returns longer tags
             refs = [{'ref': f'refs/tags/{tag}.2'}] + [{'ref': f'refs/tags/{tag}'}] * self.tag_exists
             return self.answer(json.dumps(refs))
-        if argv[:2] == [fd.GH, 'api']:  # the read-back of the published release
-            if self.readback is not None:
-                return self.readback
-            return self.gh, json.dumps({'assets': [{'name': n, 'digest': 'sha256:' + sha(self.written[n])}
-                                                   for n in self.uploaded]})
+        if argv[:3] == [fd.GH, 'api', '-X']:
+            return self.api_patch(argv) if argv[3] == 'PATCH' else self.api_delete(argv)
+        if argv[:2] == [fd.GH, 'api']:  # the list of releases, drafts too
+            return self.api_list(argv)
         if argv[:3] == [fd.GH, 'release', 'create']:
-            self.uploaded = [Path(a).name for a in argv[4:argv.index('--target')]]
+            self.uploaded = [Path(a).name for a in argv[4:argv.index('--draft')]]
+            return self.create(argv)
         return self.gh, ''
+
+    def create(self, argv: list[str]) -> tuple[int, str]:
+        """gh makes the draft and uploads, then publishes: a failed or killed run leaves what `leftover` says."""
+        assets, tag = [{'name': n, 'digest': 'sha256:' + sha(self.written[n])} for n in self.uploaded], argv[3]
+        if self.gh == 0 and not self.timeout:
+            assert '--draft' in argv  # nothing is created public
+            self.rows = [draft_row(tag, assets)]
+            return 0, ''
+        self.rows = {'draft': [draft_row(tag, assets)], 'published': [draft_row(tag, assets, False)],
+                     'other': [draft_row(tag + '-other', assets)], 'none': []}[self.leftover]
+        if self.timeout:
+            raise fd.Refused('tool-timeout')
+        return self.gh, ''
+
+    def api_list(self, argv: list[str]) -> tuple[int, str]:
+        assert re.fullmatch(r'repos/[\w./-]+/releases\?per_page=100', argv[2]), argv
+        n, self.reads = self.reads, self.reads + 1
+        scripted = self.readback[n] if isinstance(self.readback, list) and n < len(self.readback) else None
+        if isinstance(self.readback, tuple):
+            scripted = self.readback
+        return scripted if scripted is not None else (0, json.dumps(self.rows))
+
+    def row_of(self, argv: list[str]) -> dict | None:
+        return next((r for r in self.rows if argv[4].endswith(f'/releases/{r["id"]}')), None)
+
+    def api_patch(self, argv: list[str]) -> tuple[int, str]:
+        assert argv[5:] == ['-F', 'draft=false'], argv
+        self.patched.append(int(argv[4].rpartition('/')[2]))
+        row = self.row_of(argv)
+        if row is not None and (self.patch == 0 if self.patch_takes is None else self.patch_takes):
+            row['draft'] = False
+            for asset in row['assets']:
+                asset['digest'] = self.changed.get(asset['name'], asset['digest'])
+        if self.patch_raises:
+            raise fd.Refused('tool-timeout')
+        return self.patch, ''
+
+    def api_delete(self, argv: list[str]) -> tuple[int, str]:
+        self.deleted.append(int(argv[4].rpartition('/')[2]))
+        row = self.row_of(argv)
+        if row is not None and self.delete == 0:
+            self.rows.remove(row)
+        return self.delete, ''
 
     def answer(self, out: str) -> tuple[int, str]:
         return (1, '') if self.check_fails else (0, self.check_out if self.check_out is not None else out)
@@ -181,7 +251,11 @@ class Build(unittest.TestCase):
                      'sha256': sha(VHDX)},
             'disk_qcow2': {'url': f'https://github.com/{REPO}/releases/download/disk-noble-{SERIAL}/noble-{SERIAL}.qcow2',
                            'sha256': sha(QCOW2), 'size': len(QCOW2)}})
-        self.assertEqual(io_.tools(), ['gh api', 'gh release', 'gpgv', 'qemu-img', 'qemu-img', 'gh release', 'gh api'])
+        self.assertEqual(io_.tools(), ['gh api', 'gh release', 'gpgv', 'qemu-img', 'qemu-img', 'gh release', 'gh api',
+                                       'gh api', 'gh api'])  # create (a draft), read the draft, PATCH it public, read again
+        self.assertEqual(io_.ran[6][0][2:], [f'repos/{REPO}/releases?per_page=100'])
+        self.assertEqual(io_.ran[7][0][2:], ['-X', 'PATCH', f'repos/{REPO}/releases/{RID}', '-F', 'draft=false'])
+        self.assertEqual((io_.reads, io_.patched, io_.deleted, io_.slept), (2, [RID], [], []))
         gpgv, qemu, gh = io_.ran[2][0], io_.ran[3][0], io_.ran[5][0]
         self.assertEqual(gpgv[:5], [fd.GPGV, '--keyring', fd.KEYRING, '--status-fd', '1'])
         self.assertEqual(qemu[:8], [fd.QEMU_IMG, 'convert', '-f', 'qcow2', '-O', 'vhdx', '-o',
@@ -189,6 +263,7 @@ class Build(unittest.TestCase):
         self.assertEqual(gh[:4], [fd.GH, 'release', 'create', f'disk-noble-{SERIAL}'])
         self.assertEqual(gh[gh.index('--target') + 1], SHA)
         self.assertEqual([Path(a).name for a in gh[4:6]], [f'noble-{SERIAL}.vhdx', f'noble-{SERIAL}.qcow2'])  # one release, both
+        self.assertEqual(gh[6], '--draft')  # the release is not public until its digests were read back
         self.assertEqual(io_.fetched, [BASE + 'SHA256SUMS', BASE + 'SHA256SUMS.gpg', BASE + fd.IMAGE])
 
     def test_the_qcow2_is_made_from_the_same_verified_input_uncompressed(self):
@@ -220,7 +295,7 @@ class Build(unittest.TestCase):
     def test_only_gh_sees_the_token(self):
         io_ = FakeIo()
         build(io_)
-        self.assertEqual([TOKEN in env.values() for _, env in io_.ran], [True, True, False, False, False, True, True])
+        self.assertEqual([TOKEN in env.values() for _, env in io_.ran], [True, True, False, False, False, True, True, True, True])
         self.assertEqual(io_.ran[5][1]['GH_REPO'], REPO)
 
     def test_a_bad_signature_stops_before_the_image(self):
@@ -335,8 +410,9 @@ class Build(unittest.TestCase):
         self.refused('convert-failed', FakeIo(qemu=1))
         self.refused('publish-failed', FakeIo(gh=1))
 
+
     def test_an_existing_release_or_tag_is_refused_before_any_fetch(self):
-        for kw in ({'release_exists': True}, {'tag_exists': True}):
+        for kw in ({'release_exists': True}, {'tag_exists': True}, {'tag_exists': True, 'draft_exists': True}):
             with self.subTest(kw=kw):
                 io_ = FakeIo(**kw)
                 self.refused('tag-exists', io_)
@@ -369,32 +445,182 @@ class Build(unittest.TestCase):
     def test_only_the_exact_tag_counts_and_a_longer_tag_sharing_the_prefix_does_not(self):
         self.assertEqual(build(FakeIo())['disk']['sha256'], sha(VHDX))  # the fake always lists disk-noble-<serial>.2 and 0
         self.refused('tag-exists', FakeIo(check_out='[{"ref": "refs/tags/x"}, {"ref": "refs/tags/disk-noble-%s"}]' % SERIAL))
-        self.refused('tag-exists', FakeIo(check_out=f'[{{"tagName": "disk-noble-{SERIAL}", "isDraft": true}}]'))
+        self.refused('draft-left', FakeIo(check_out=f'[{{"tagName": "disk-noble-{SERIAL}", "isDraft": true}}]'))
+        self.refused('tag-exists', FakeIo(check_out=f'[{{"tagName": "disk-noble-{SERIAL}", "isDraft": false}}]'))
+        self.refused('tag-exists', FakeIo(check_out=f'[{{"tagName": "disk-noble-{SERIAL}"}}]'))  # not a draft for sure: no
 
-    def test_the_published_asset_is_read_back_and_must_match_what_was_hashed(self):
-        name, good = f'noble-{SERIAL}.vhdx', 'sha256:' + sha(VHDX)
-        qname, qgood = f'noble-{SERIAL}.qcow2', 'sha256:' + sha(QCOW2)
-        both = [{'name': name, 'digest': good}, {'name': qname, 'digest': qgood}]
-        for readback in ((1, ''), (0, ''), (0, 'not json'), (0, '[]'), (0, '{}'), (0, '{"assets": []}'),
-                         (0, json.dumps({'assets': [{'name': name, 'digest': 'sha256:' + sha(b'other')}]})),
-                         (0, json.dumps({'assets': [{'name': name, 'digest': None}]})),
-                         (0, json.dumps({'assets': [{'name': name, 'digest': sha(VHDX)}]})),
-                         (0, json.dumps({'assets': [{'name': 'other.vhdx', 'digest': good}]})),
-                         (0, json.dumps({'assets': [{'name': name, 'digest': good}]})),  # the qcow2 is not there
-                         (0, json.dumps({'assets': [{'name': name, 'digest': good}, {'name': 'x', 'digest': qgood}]})),
-                         (0, json.dumps({'assets': [{'name': name, 'digest': good}, {'name': qname, 'digest': good}]})),
-                         (0, json.dumps({'assets': [{'name': name, 'digest': good}] * 2})),
-                         (0, json.dumps({'assets': [*both, {'name': 'x', 'digest': good}]}))):
+    def test_a_draft_with_no_ref_is_draft_left_before_any_fetch_and_a_published_release_stays_tag_exists(self):
+        io_ = FakeIo(draft_exists=True)  # an interrupted run's draft: GitHub made no tag for it
+        self.refused('draft-left', io_)
+        self.assertEqual((io_.fetched, io_.tools()), ([], ['gh api', 'gh release']))
+        both = FakeIo(check_out=f'[{{"tagName": "disk-noble-{SERIAL}", "isDraft": true}}, '
+                                f'{{"tagName": "disk-noble-{SERIAL}", "isDraft": false}}]')
+        self.refused('tag-exists', both)  # one published row among the drafts
+        self.refused('tag-exists', FakeIo(tag_exists=True, draft_exists=True))  # a draft that has a ref
+
+    NAME, QNAME = f'noble-{SERIAL}.vhdx', f'noble-{SERIAL}.qcow2'
+    GOOD, QGOOD = 'sha256:' + sha(VHDX), 'sha256:' + sha(QCOW2)
+
+    def rows_of(self, *assets: dict, draft: bool = True, extra: tuple = ()) -> tuple[int, str]:
+        return 0, json.dumps([draft_row(f'disk-noble-{SERIAL}', list(assets), draft), *extra])
+
+    def publish_refusal(self, why: str, io_: FakeIo) -> str:
+        """Run the build to the refusal `why` and return what it wrote to stderr."""
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.refused(why, io_)
+        return quiet(err.getvalue())
+
+    def both(self, **over) -> list[dict]:
+        return [{'name': self.NAME, 'digest': over.get('v', self.GOOD)}, {'name': self.QNAME, 'digest': over.get('q', self.QGOOD)}]
+
+    def test_an_unread_draft_is_retried_four_times_then_deleted_and_never_published(self):
+        good = self.both()
+        other = draft_row(f'disk-noble-{SERIAL}', good)
+        cases = [(1, ''), (0, ''), (0, 'not json'), (0, '[]'), (0, '{}'), (0, 'null'),
+                 (0, json.dumps([{**other, 'assets': None}])), (0, json.dumps([{**other, 'assets': 'x'}])),
+                 (0, json.dumps([{k: v for k, v in other.items() if k != 'assets'}])),
+                 self.rows_of({'name': self.NAME, 'digest': None}, {'name': self.QNAME, 'digest': self.QGOOD}),
+                 self.rows_of({'name': self.NAME}, {'name': self.QNAME, 'digest': self.QGOOD}),
+                 self.rows_of(*good, extra=(other,)),  # two rows for the tag: not one
+                 (0, json.dumps([{**other, 'id': 'x'}])),  # a draft that names no usable id
+                 self.rows_of(*good, draft=False)]  # no draft row at all
+        for readback in cases:
             with self.subTest(readback=readback):
-                self.refused('publish-mismatch', FakeIo(readback=readback))
-        self.assertEqual(build(FakeIo(readback=(0, json.dumps({'assets': both[::-1]}))))['disk_qcow2']['sha256'], sha(QCOW2))
+                io_ = FakeIo(readback=readback)
+                self.publish_refusal('publish-unread', io_)
+                self.assertEqual((io_.reads, io_.slept, io_.patched), (fd.READ_TRIES + 1, [fd.READ_PAUSE] * 3, []))
+
+    def test_an_unread_draft_is_deleted_only_when_the_fresh_read_shows_one_draft(self):
+        unread = self.rows_of({'name': self.NAME, 'digest': None}, {'name': self.QNAME, 'digest': self.QGOOD})
+        for readback, deleted in ((unread, [RID]), (self.rows_of(*self.both(), draft=False), []), ((1, ''), []), ((0, '[]'), [])):
+            with self.subTest(readback=readback):
+                io_ = FakeIo(readback=readback)  # the scripted answer is every read, drop_draft's own included
+                self.publish_refusal('publish-unread', io_)
+                self.assertEqual(io_.deleted, deleted)
+
+    def test_a_wrong_digest_or_asset_set_is_a_mismatch_read_once_deleted_and_never_published(self):
+        n, q, g, qg = self.NAME, self.QNAME, self.GOOD, self.QGOOD
+        cases = [self.both(v='sha256:' + sha(b'other')), self.both(v=sha(VHDX)), self.both(v='sha512:' + sha(VHDX)),
+                 self.both(q=g), self.both(v=7), self.both(v=''),
+                 [{'name': n, 'digest': g}], [], [{'name': n, 'digest': g}, {'name': 'x', 'digest': qg}],
+                 [{'name': 'other.vhdx', 'digest': g}, {'name': q, 'digest': qg}],
+                 [{'name': n, 'digest': g}] * 2, [*self.both(), {'name': 'x', 'digest': g}],
+                 [{'name': n, 'digest': 'sha256:' + sha(b'o')}, {'name': q, 'digest': None}],  # a wrong digest outranks a null
+                 [{'name': n, 'digest': g}, {'name': None, 'digest': qg}], [{'name': n, 'digest': g}, {'name': [1], 'digest': qg}]]
+        for assets in cases:
+            with self.subTest(assets=assets):
+                io_ = FakeIo(readback=[self.rows_of(*assets)])
+                self.publish_refusal('publish-mismatch', io_)
+                self.assertEqual((io_.reads, io_.slept, io_.patched, io_.deleted), (2, [], [], [RID]))
+
+    def test_the_published_assets_are_checked_in_either_order_and_the_unread_then_good_read_publishes(self):
+        io_ = FakeIo(readback=[self.rows_of(*self.both()[::-1])])
+        self.assertEqual(build(io_)['disk_qcow2']['sha256'], sha(QCOW2))
+        for first in ((1, ''), (0, 'junk'), self.rows_of({'name': self.NAME, 'digest': None}, *self.both()[1:])):
+            with self.subTest(first=first):
+                io_ = FakeIo(readback=[first])  # one unanswered read, then the fake GitHub answers truthfully
+                self.assertEqual(build(io_)['disk']['sha256'], sha(VHDX))
+                self.assertEqual((io_.reads, io_.slept, io_.patched, io_.deleted), (3, [fd.READ_PAUSE], [RID], []))
+
+    def test_a_failed_create_deletes_a_draft_row_of_this_tag_and_nothing_else(self):
+        for how in ({'gh': 1}, {'timeout': True}):
+            for leftover, deleted in (('draft', [RID]), ('published', []), ('other', []), ('none', [])):
+                with self.subTest(how=how, leftover=leftover):
+                    io_ = FakeIo(leftover=leftover, **how)
+                    self.refused('tool-timeout' if how.get('timeout') else 'publish-failed', io_)
+                    self.assertEqual((io_.deleted, io_.patched), (deleted, []))
+                    limits = [t for (argv, _), t in zip(io_.ran, io_.timeouts) if argv[:3] == [fd.GH, 'release', 'create']]
+                    self.assertEqual(limits, [fd.UPLOAD_TIMEOUT])  # the create had its own limit
+
+    def test_a_create_that_is_killed_is_not_followed_by_a_delete_for_a_missing_tool(self):
+        class NoGh(FakeIo):
+            def create(self, argv):
+                raise fd.Refused('tool-missing')
+        io_ = NoGh()
+        self.refused('tool-missing', io_)
+        self.assertEqual((io_.reads, io_.deleted), (0, []))
+
+    def test_a_delete_that_fails_is_named_and_the_first_refusal_stays_the_word(self):
+        io_ = FakeIo(gh=1, delete=1)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.refused('publish-failed', io_)
+        self.assertEqual((io_.deleted, quiet(err.getvalue())), ([RID], 'fleet-disk: draft-not-deleted\n'))
+        io_ = FakeIo(gh=1, readback=(1, ''))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.refused('publish-failed', io_)
+        self.assertEqual((io_.deleted, quiet(err.getvalue())), ([], 'fleet-disk: draft-unread\n'))  # unreadable: no delete
+
+    def test_a_patch_that_failed_on_a_still_draft_release_deletes_it_and_prints_the_unverified_digests(self):
+        io_ = FakeIo(patch=1)
+        err = self.publish_refusal('publish-failed', io_)
+        self.assertEqual((io_.patched, io_.deleted), ([RID], [RID]))
+        self.assertEqual(err, f'fleet-disk: patch-failed\nunverified {self.NAME} sha256:{sha(VHDX)}\n'
+                              f'unverified {self.QNAME} sha256:{sha(QCOW2)}\n')
+        self.assertNotIn('{', err)  # not lock-shaped: nothing to paste
+        io_ = FakeIo(patch=1, patch_raises=True)  # a PATCH that timed out
+        self.publish_refusal('publish-failed', io_)
+        self.assertEqual(io_.deleted, [RID])
+
+    def test_a_patch_that_failed_but_took_effect_is_verified_not_deleted(self):
+        for kw in ({'patch': 1, 'patch_takes': True}, {'patch_raises': True, 'patch_takes': True}):
+            with self.subTest(kw=kw), contextlib.redirect_stderr(io.StringIO()):
+                io_ = FakeIo(**kw)
+                self.assertEqual(build(io_)['disk']['sha256'], sha(VHDX))
+                self.assertEqual((io_.patched, io_.deleted), ([RID], []))
+
+    def test_a_patch_that_failed_is_never_deleted_on_one_stale_draft_read(self):
+        stale, pub = self.rows_of(*self.both()), self.rows_of(*self.both(), draft=False)
+        for kw in ({'patch': 1, 'patch_raises': True}, {'patch': 1}):  # a timed-out PATCH, a nonzero exit: both may have applied
+            with self.subTest(kw=kw), contextlib.redirect_stderr(io.StringIO()):
+                io_ = FakeIo(readback=[None, stale, pub], **kw)  # the draft read, a stale draft read, then it is public
+                self.assertEqual(build(io_)['disk']['sha256'], sha(VHDX))
+                self.assertEqual((io_.patched, io_.deleted, io_.reads), ([RID], [], 3))
+        broken = (1, '')
+        for reads in ([stale, stale, broken, stale], [stale, broken, stale, stale]):  # one unread read breaks "every read"
+            with self.subTest(reads=len(reads)):
+                io_ = FakeIo(patch=1, patch_raises=True, readback=[None, *reads])
+                self.publish_refusal('publish-unread', io_)
+                self.assertEqual((io_.patched, io_.deleted), ([RID], []))
+
+    def test_a_published_release_that_cannot_be_read_back_is_never_deleted(self):
+        pre = self.rows_of(*self.both())
+        for patch, after in ((0, (1, '')), (1, (1, '')), (0, (0, 'junk')), (1, (0, '[]'))):
+            with self.subTest(patch=patch, after=after):
+                io_ = FakeIo(patch=patch, patch_takes=True, readback=[pre, *[after] * fd.READ_TRIES])
+                err = self.publish_refusal('publish-unread', io_)
+                self.assertEqual((io_.patched, io_.deleted, io_.reads), ([RID], [], 1 + fd.READ_TRIES))
+                self.assertIn(f'unverified {self.NAME} sha256:{sha(VHDX)}\n', err)
+        io_ = FakeIo(patch=0, patch_takes=False)  # PATCH said yes, every read says draft: a stale read, not a reason to delete
+        self.publish_refusal('publish-unread', io_)
+        self.assertEqual((io_.patched, io_.deleted), ([RID], []))
+
+    def test_a_digest_that_changes_after_the_release_is_public_is_a_mismatch_with_no_delete(self):
+        io_ = FakeIo(changed={f'noble-{SERIAL}.qcow2': 'sha256:' + sha(b'swapped')})
+        err = self.publish_refusal('publish-mismatch', io_)
+        self.assertEqual((io_.patched, io_.deleted, io_.reads), ([RID], [], 2))  # public and immutable: never deleted
+        self.assertIn(f'unverified {self.QNAME} sha256:{sha(QCOW2)}\n', err)
+        two = self.rows_of(*self.both(), draft=False, extra=(draft_row(f'disk-noble-{SERIAL}'),))
+        post = FakeIo(readback=[None] + [two] * fd.READ_TRIES)
+        self.publish_refusal('publish-unread', post)  # two rows after the PATCH: not one
+        moved = FakeIo(readback=[None] + [(0, json.dumps([draft_row(f'disk-noble-{SERIAL}', self.both(), False, rid=7)]))] * 4)
+        self.publish_refusal('publish-unread', moved)  # a published row that is not the draft that was PATCHed
+        self.assertEqual((post.deleted, moved.deleted), ([], []))
+
+    def test_a_refusal_before_the_patch_prints_no_unverified_digest(self):
+        wrong = self.rows_of(*self.both(v=sha(VHDX)))
+        for why, kw in (('publish-failed', {'gh': 1}), ('publish-unread', {'readback': (1, '')}),
+                        ('publish-mismatch', {'readback': [wrong]})):
+            with self.subTest(why=why):
+                self.assertNotIn('unverified', self.publish_refusal(why, FakeIo(**kw)))
 
     def test_slow_tools_get_a_timeout_and_the_convert_a_longer_one(self):
         io_ = FakeIo()
         build(io_)
         self.assertEqual(io_.timeouts, [fd.TOOL_TIMEOUT, fd.TOOL_TIMEOUT, fd.TOOL_TIMEOUT, fd.CONVERT_TIMEOUT,
-                                        fd.CONVERT_TIMEOUT, fd.TOOL_TIMEOUT, fd.TOOL_TIMEOUT])
+                                        fd.CONVERT_TIMEOUT, fd.UPLOAD_TIMEOUT] + [fd.TOOL_TIMEOUT] * 3)  # the create has its own
         self.assertLess(fd.CONVERT_TIMEOUT + fd.FETCH_DEADLINE, 60 * 60)
+        self.assertGreater(fd.UPLOAD_TIMEOUT, fd.TOOL_TIMEOUT)  # the upload of two assets outlives a gpgv or a read
+        self.assertLess(fd.CONVERT_TIMEOUT + fd.UPLOAD_TIMEOUT, 60 * 60)  # and with the convert it stays under the job limit
 
     def test_an_asset_of_2_gib_or_more_is_refused_before_the_upload(self):
         small = fd.MAX_ASSET
@@ -449,7 +675,9 @@ class Arm64(unittest.TestCase):
             'disk_arm64': {'url': f'https://github.com/{REPO}/releases/download/{ARM_TAG}/{ARM_ASSET}',
                            'sha256': sha(zst), 'size': len(zst), 'raw_sha256': sha(RAW), 'raw_size': len(RAW)},
             'vfkit': {'version': 'v0.6.4', 'url': fd.VFKIT_URL, 'sha256': VFKIT_PIN, 'size': len(VFKIT)}})
-        self.assertEqual(io_.tools(), ['gh api', 'gh release', 'gpgv', 'qemu-img', 'zstd', 'zstd', 'gh release', 'gh api'])
+        self.assertEqual(io_.tools(), ['gh api', 'gh release', 'gpgv', 'qemu-img', 'zstd', 'zstd', 'gh release', 'gh api',
+                                       'gh api', 'gh api'])
+        self.assertEqual((io_.patched, io_.deleted), ([RID], []))
         self.assertEqual(io_.fetched, [ARM_BASE + 'SHA256SUMS', ARM_BASE + 'SHA256SUMS.gpg', fd.VFKIT_URL,
                                        ARM_BASE + fd.IMAGE_ARM64])  # the cheap evidence first, the big image last
         self.assertEqual(io_.limits['vfkit'], len(VFKIT))  # upstream may not serve more than the pinned size
@@ -460,11 +688,11 @@ class Arm64(unittest.TestCase):
                                 str(work / f'noble-arm64-{ARM_SERIAL}.raw')])
         self.assertEqual(comp[:5], [fd.ZSTD, '-19', '-T0', '-q', '-o'])
         self.assertEqual(expand[:3], [fd.ZSTD, '-d', '-q'])
-        self.assertEqual((gh[3], gh[gh.index('--target') + 1]), (ARM_TAG, SHA))
+        self.assertEqual((gh[3], gh[gh.index('--target') + 1], '--draft' in gh), (ARM_TAG, SHA, True))
         for argv, env in io_.ran:
             self.assertTrue(argv[0].startswith('/usr/bin/'))
             self.assertEqual(env['PATH'], '/usr/bin')
-        self.assertEqual([TOKEN in env.values() for _, env in io_.ran], [True, True, False, False, False, False, True, True])
+        self.assertEqual([TOKEN in env.values() for _, env in io_.ran], [True, True, False, False, False, False, True, True, True, True])
 
     def test_the_serial_the_key_and_the_environment_are_refused_before_any_network_call(self):
         cases = (('serial', {'serial': 'current'}), ('serial-not-pinned', {'serial': '20260930'}),
@@ -586,14 +814,24 @@ class Arm64(unittest.TestCase):
         self.assertEqual(arm_build(ArmIo(check_out=amd))['disk_arm64']['url'].split('/')[-2], ARM_TAG)
         self.assertEqual(self.refused('tag-exists', ArmIo(tag_exists=True)).fetched, [])  # tag_is_free is shared with amd64
 
-    def test_the_published_asset_is_read_back_and_must_match_what_was_hashed(self):
+    def test_the_draft_is_read_back_and_a_wrong_or_unread_one_is_deleted_by_its_arm64_tag(self):
         good = {'name': ARM_ASSET, 'digest': 'sha256:' + sha(ZST + RAW)}
-        for readback in ((1, ''), (0, json.dumps({'assets': [{**good, 'digest': 'sha256:' + sha(b'other')}]})),
-                         (0, json.dumps({'assets': [good, {**good, 'name': 'extra'}]}))):
-            with self.subTest(readback=readback):
-                self.refused('publish-mismatch', ArmIo(readback=readback))
-        arm_build(ArmIo(readback=(0, json.dumps({'assets': [good]}))))
+        rows = lambda *assets, draft=True: (0, json.dumps([draft_row(ARM_TAG, list(assets), draft)]))  # noqa: E731
+        for why, readback in (('publish-mismatch', rows({**good, 'digest': 'sha256:' + sha(b'other')})),
+                              ('publish-mismatch', rows(good, {**good, 'name': 'extra'})),
+                              ('publish-unread', (1, '')), ('publish-unread', rows({**good, 'digest': None}))):
+            with self.subTest(why=why, readback=readback), contextlib.redirect_stderr(io.StringIO()):
+                io_ = self.refused(why, ArmIo(readback=readback if why == 'publish-unread' else [readback]))
+                self.assertEqual(io_.patched, [])
+                self.assertEqual(io_.deleted, [] if readback == (1, '') else [RID])
+        arm_build(ArmIo(readback=[rows(good)]))
 
+    def test_a_draft_of_this_tag_is_draft_left_and_a_failed_create_deletes_only_this_tags_draft(self):
+        self.assertEqual(self.refused('draft-left', ArmIo(draft_exists=True)).fetched, [])
+        for kw, deleted in (({}, [RID]), ({'leftover': 'other'}, []), ({'leftover': 'published'}, [])):
+            with self.subTest(kw=kw):
+                self.assertEqual(self.refused('publish-failed', ArmIo(gh=1, **kw)).deleted, deleted)
+        self.assertEqual(self.refused('tool-timeout', ArmIo(timeout=True)).deleted, [RID])
 
 class Arm64Pins(unittest.TestCase):
     """What the script ships, with nothing patched."""
@@ -691,6 +929,56 @@ class Main(unittest.TestCase):
         self.assertEqual(sorted(entries['vfkit']), ['sha256', 'size', 'url', 'version'])
         self.assertNotIn(TOKEN, out.getvalue())
 
+    def cleanup(self, io_: FakeIo, *argv: str, **env: str) -> tuple[int, str, str]:
+        return self.go(['cleanup', *(argv or (SERIAL,))], io_, **{**self.ENV, **env})
+
+    def test_cleanup_deletes_the_draft_of_that_tag_and_says_so(self):
+        io_ = FakeIo(rows=[draft_row(f'disk-noble-{SERIAL}', [])])
+        self.assertEqual(self.cleanup(io_), (0, '', 'fleet-disk: cleanup deleted\n'))
+        self.assertEqual((io_.deleted, io_.rows, io_.tools()), ([RID], [], ['gh api', 'gh api']))
+        self.assertEqual(io_.ran[1][0], [fd.GH, 'api', '-X', 'DELETE', f'repos/{REPO}/releases/{RID}'])
+        self.assertTrue(all(env['GH_TOKEN'] == TOKEN for _, env in io_.ran))
+
+    def test_cleanup_never_deletes_a_published_release_a_draft_of_another_tag_or_nothing(self):
+        mine = f'disk-noble-{SERIAL}'
+        for rows, word in (([draft_row(mine, [], False)], 'kept'), ([draft_row(mine + '-x')], 'none'),
+                           ([draft_row('disk-noble-arm64-' + SERIAL)], 'none'), ([], 'none')):
+            with self.subTest(rows=rows):
+                io_ = FakeIo(rows=rows)
+                self.assertEqual(self.cleanup(io_), (0, '', f'fleet-disk: cleanup {word}\n'))
+                self.assertEqual((io_.deleted, io_.tools()), ([], ['gh api']))
+
+    def test_cleanup_that_cannot_read_or_delete_fails_in_words_and_deletes_nothing_unread(self):
+        mine = [draft_row(f'disk-noble-{SERIAL}', [])]
+        io_ = FakeIo(rows=mine, readback=(1, ''))
+        self.assertEqual(self.cleanup(io_), (fd.REFUSED, '', 'fleet-disk: draft-unread\nfleet-disk: cleanup unreadable\n'))
+        self.assertEqual(io_.deleted, [])
+        two = (0, json.dumps([draft_row(f'disk-noble-{SERIAL}')] * 2))  # two rows of the tag: which is ours?
+        io_ = FakeIo(readback=two)
+        self.assertEqual(self.cleanup(io_)[2], 'fleet-disk: draft-ambiguous\nfleet-disk: cleanup ambiguous\n')
+        self.assertEqual(io_.deleted, [])
+        io_ = FakeIo(rows=mine, delete=1)
+        self.assertEqual(self.cleanup(io_), (fd.REFUSED, '', 'fleet-disk: draft-not-deleted\nfleet-disk: cleanup failed\n'))
+
+    def test_cleanup_takes_the_arm64_tag_and_refuses_a_bad_serial_or_environment_before_any_call(self):
+        io_ = ArmIo(rows=[draft_row(ARM_TAG), draft_row(f'disk-noble-{ARM_SERIAL}', rid=7)])
+        self.assertEqual(self.cleanup(io_, 'arm64', ARM_SERIAL)[0], 0)
+        self.assertEqual(io_.deleted, [RID])  # the arm64 draft, not the amd64 one of the same serial
+        for argv, env, word in ((('current',), {}, 'serial'), ((SERIAL,), {'GH_TOKEN': ''}, 'release-env'),
+                                ((SERIAL,), {'GITHUB_SHA': ''}, 'release-env')):
+            with self.subTest(word=word):
+                io_ = FakeIo(rows=[draft_row(f'disk-noble-{SERIAL}')])
+                self.assertEqual(self.cleanup(io_, *argv, **env), (fd.REFUSED, '', f'fleet-disk: refused {word}\n'))
+                self.assertEqual((io_.ran, io_.deleted), ([], []))
+        self.assertEqual(self.go(['cleanup'], FakeIo())[0], fd.USAGE)
+
+    def test_cleanup_after_a_good_build_keeps_the_published_release(self):
+        self.pin(FPR)
+        io_ = FakeIo()
+        self.assertEqual(self.go([SERIAL], io_, **self.ENV)[0], 0)
+        self.assertEqual(self.cleanup(io_), (0, '', 'fleet-disk: cleanup kept\n'))
+        self.assertEqual((io_.deleted, [r['draft'] for r in io_.rows]), ([], [False]))
+
     def test_the_disk_url_names_this_repo_when_run_there(self):
         self.pin(FPR)
         env = {**self.ENV, 'GITHUB_REPOSITORY': 'mirrorstack-ai/fleet-disk'}
@@ -771,11 +1059,40 @@ class Real(unittest.TestCase):
             with self.assertRaisesRegex(fd.Refused, '^fetch-timeout$'):
                 fd.Real().fetch(src.as_uri(), Path(tmp, 'dest'), 1 << 20)
 
+    def test_sleep_waits_the_given_seconds(self):
+        waited = []
+        real, fd.time.sleep = fd.time.sleep, waited.append
+        try:
+            fd.Real().sleep(0.5)
+        finally:
+            fd.time.sleep = real
+        self.assertEqual(waited, [0.5])
+        self.assertEqual((fd.READ_TRIES, fd.READ_PAUSE, fd.UPLOAD_TIMEOUT), (4, 5, 1500))
+
     def test_valid_fingerprints_reads_both_ends_of_a_validsig(self):
         self.assertEqual(fd.valid_fingerprints(validsig(FPR.lower()) + 'noise\n[GNUPG:] GOODSIG x\n'), {FPR})
         self.assertEqual(fd.valid_fingerprints('[GNUPG:] VALIDSIG short\n'), set())
         sub = f'[GNUPG:] VALIDSIG {OTHER} 2026-09-30 {SIGNED} 0 4 0 1 10 01 {FPR}\n'
         self.assertEqual(fd.valid_fingerprints(sub), {OTHER, FPR})
+
+
+class Readme(unittest.TestCase):
+    TEXT = (ROOT / 'README.md').read_text(encoding='utf-8')
+
+    def test_the_draft_flow_and_the_leftover_draft_cure_are_written_down(self):
+        for need in ('created as a draft', '`publish-unread`', '`publish-mismatch`', '`draft-left`', '`tag-exists`',
+                     'bin/fleet-disk.py cleanup <arch> <serial>', 'unverified <asset> sha256:<hex>', 'delete the draft by hand'):
+            self.assertIn(need, self.TEXT)
+
+    def test_the_disk_environment_is_not_called_a_boundary_and_the_probe_is_read_only(self):
+        section = self.TEXT.split('\n## One-time repo settings\n', 1)[1].split('\n## ', 1)[0]
+        section = ' '.join(section.split())
+        self.assertIn('so it is not a boundary', section)
+        self.assertIn("gh api \"repos/$repo/rulesets\"", section)
+        self.assertIn('environments/disk/secrets', section)
+        self.assertIn('refs/tags/disk-', section)
+        self.assertEqual(re.findall(r'gh api.*?(?:-X|--method| -f | -F )', section), [])  # reads only
+        self.assertEqual(section.count('FAIL'), 3)  # the lead-in and the two probe lines
 
 
 class Workflows(unittest.TestCase):
@@ -817,12 +1134,26 @@ class Workflows(unittest.TestCase):
 
     def test_the_input_reaches_the_script_only_through_env(self):
         runs = re.findall(r'(?m)^\s+(?:- )?run: (.*)$', self.DISK)
-        self.assertEqual(runs[-1], 'python3 bin/fleet-disk.py "$ARCH" "$SERIAL"')
+        self.assertEqual(runs[-2:], ['python3 bin/fleet-disk.py "$ARCH" "$SERIAL"',
+                                     'python3 bin/fleet-disk.py cleanup "$ARCH" "$SERIAL"'])
         self.assertIn('SERIAL: ${{ inputs.serial }}', self.DISK)
         self.assertIn('ARCH: ${{ inputs.arch }}', self.DISK)
         self.assertIn('GH_TOKEN: ${{ github.token }}', self.DISK)
         for run in runs:
             self.assertNotIn('${{', run)
+
+    def test_the_last_step_always_deletes_a_leftover_draft_with_only_the_arch_the_serial_and_the_token(self):
+        last = self.DISK.rsplit('\n      - ', 1)[1]  # the job's final step
+        self.assertEqual(last.split('\n')[0], 'if: always()')
+        self.assertEqual(re.findall(r'(?m)^ +(\w+):(?: |$)', last), ['env', 'ARCH', 'SERIAL', 'GH_TOKEN', 'run'])
+        self.assertIn('run: python3 bin/fleet-disk.py cleanup "$ARCH" "$SERIAL"', last)
+        self.assertNotIn('${{', last.split('run:')[1])  # no expression in a shell line
+        self.assertEqual(self.DISK.count('if: always()'), 1)
+        self.assertEqual(self.DISK.count('\n      - '), 4)  # checkout, apt, build, cleanup: no other step
+
+    def test_the_workflow_says_the_empty_environment_is_not_a_boundary(self):
+        self.assertIn('holds no secret or variable, so it is not a boundary', re.sub(r'\n\s*# ', ' ', self.DISK))
+        self.assertNotIn('The boundary is the environment', self.DISK)
 
     def test_the_disk_workflow_installs_only_qemu_utils_and_zstd_with_apt(self):
         self.assertEqual(re.findall(r'apt-get install (.*)', self.DISK), ['-y --no-install-recommends qemu-utils zstd'])

@@ -5,7 +5,10 @@ and its qcow2 magic, converts it with `qemu-img convert -O vhdx` (Hyper-V) and `
 (Linux L1), publishes both as the release assets of tag disk-noble-<serial> in this repo and prints the three lock
 entries to paste into the fleet's carrier.lock.json: `disk_input` (the signed upstream image), `disk` (the VHDX) and
 `disk_qcow2` (the qcow2, with its size; qemu-img's output is not promised byte-reproducible, so the owner's signature
-over the lock is what vouches for each). It never edits the lock and refuses to overwrite a tag.
+over the lock is what vouches for each). The release is made as a DRAFT, its asset digests are read back by release id,
+and only an exact match is made public: nothing irreversible comes before the last check that can refuse. It never
+edits the lock and refuses to overwrite a tag; a draft an interrupted run left is refused as `draft-left`, and
+`fleet-disk.py cleanup [amd64|arm64] <serial>` (the workflow's last step) deletes it.
 `fleet-disk.py arm64 <serial>` (the macOS lane) takes the same chain for Ubuntu's noble arm64 image at the ONE
 pinned serial: the signed sha must equal the pinned one, vfkit's upstream bytes are re-checked against their pin, the
 image becomes a raw GPT disk with an EFI System Partition (what vfkit's EFI boot needs) and a zstd of it is the one
@@ -54,6 +57,8 @@ QCOW2_OPTS = 'compat=1.1'  # the Linux disk, uncompressed and with no backing fi
 MAX_ASSET = 2 << 30  # GitHub release assets must be under 2 GiB: refuse here rather than fail at upload
 CHUNK = 1 << 20
 TOOL_TIMEOUT, CONVERT_TIMEOUT = 600, 1800  # seconds: gpgv and gh, qemu-img; a hung tool must not hold the job
+UPLOAD_TIMEOUT = 1500  # seconds for `gh release create` (the upload); with CONVERT_TIMEOUT it stays under the 60-minute job
+READ_TRIES, READ_PAUSE = 4, 5  # a release read-back: at most this many reads, this many seconds apart
 FETCH_DEADLINE = 1500  # seconds for one whole download; urlopen's timeout is only per socket read
 MAX_SKEW = 86400  # a signature stamped more than a day ahead of the clock is refused
 USAGE, REFUSED = 2, 1
@@ -64,7 +69,7 @@ class Refused(ValueError):
 
 
 class Io(Protocol):
-    """The two things the build does to the world, so a test can fake both (no network, no qemu)."""
+    """The things the build does to the world, so a test can fake all of them (no network, no qemu, no waiting)."""
 
     def fetch(self, url: str, dest: Path, limit: int) -> str:
         """Write url's body to dest, at most limit bytes, and return its sha256 hex."""
@@ -72,6 +77,9 @@ class Io(Protocol):
     def run(self, argv: list[str], env: dict[str, str], timeout: int = TOOL_TIMEOUT) -> tuple[int, str]:
         """Run argv (absolute, no shell, no stdin) under exactly env, at most timeout seconds (default TOOL_TIMEOUT);
         return (exit status, stdout). A tool that outlives its timeout is Refused('tool-timeout')."""
+
+    def sleep(self, seconds: float) -> None:
+        """Wait between two reads of a release."""
 
 
 class Real:
@@ -103,6 +111,9 @@ class Real:
         except OSError:
             raise Refused('tool-missing') from None
         return done.returncode, done.stdout
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
 
 
 BAD_STATUS = frozenset({'BADSIG', 'ERRSIG', 'EXPSIG', 'EXPKEYSIG', 'REVKEYSIG'})  # gpgv exits 0 on these
@@ -190,14 +201,24 @@ def release_env(serial: str, fpr: str, repo: str, sha: str, token: str) -> dict[
     return {'PATH': '/usr/bin', 'GH_TOKEN': token, 'GH_REPO': repo, 'GH_PROMPT_DISABLED': '1'}
 
 
+def tag_name(arch: str, serial: str) -> str:
+    """The release tag of an arch's disk for a serial."""
+    return f'disk-noble-arm64-{serial}' if arch == 'arm64' else f'disk-noble-{serial}'
+
+
 def tag_is_free(io: Io, repo: str, tag: str, env: dict[str, str]) -> None:
-    """A release (drafts included) or a bare tag of that name exists: Refused. Fail closed: any answer but a clean
-    "no such" (a 5xx, a rate limit, a timeout, unreadable output) is tag-check-failed, never "not found"."""
+    """A release (drafts included) or a bare tag of that name exists: Refused. A ref or a published release is
+    `tag-exists`; a draft with no ref is `draft-left` (a run's own interrupted upload: the cure is deleting the draft,
+    which `cleanup` does). Fail closed: any answer but a clean "no such" (a 5xx, a rate limit, a timeout, unreadable
+    output) is tag-check-failed, never "not found"."""
     refs = json_out(io, [GH, 'api', f'repos/{repo}/git/matching-refs/tags/{tag}'], env, list)  # a PREFIX match
     releases = json_out(io, [GH, 'release', 'list', '--limit', '1000', '--json', 'tagName,isDraft'], env, list)
+    same = [r for r in releases if isinstance(r, dict) and r.get('tagName') == tag]
     if (any(isinstance(r, dict) and r.get('ref') == f'refs/tags/{tag}' for r in refs)
-            or any(isinstance(r, dict) and r.get('tagName') == tag for r in releases)):
+            or any(r.get('isDraft') is not True for r in same)):
         raise Refused('tag-exists')
+    if same:
+        raise Refused('draft-left')
 
 
 def signed_image_sum(io: Io, base: str, name: str, work: Path, fpr: str, serial: str, now: float | None) -> str:
@@ -229,29 +250,154 @@ def convert(io: Io, image: Path, out: Path, fmt: str, opts: str = '') -> int:
     return out.stat().st_size
 
 
+def release_rows(io: Io, repo: str, tag: str, env: dict[str, str]) -> list[dict] | None:
+    """The rows of repo's release list (drafts included: `releases/tags/<tag>` does not serve a draft and gh prints no
+    id) whose tag_name is exactly tag; None when the list cannot be read (a nonzero exit, a timeout, not a JSON list).
+    Only the newest 100 releases are read (no pagination): a new draft sorts first, an older one beyond them reads as none."""
+    try:
+        code, out = io.run([GH, 'api', f'repos/{repo}/releases?per_page=100'], env)
+        data = json.loads(out) if code == 0 else None
+    except (Refused, ValueError):
+        data = None
+    return [r for r in data if isinstance(r, dict) and r.get('tag_name') == tag] if isinstance(data, list) else None
+
+
+def sole(rows: list[dict] | None) -> dict | None:
+    """The one row of rows, or None (no row, several, or an unread list)."""
+    return rows[0] if rows is not None and len(rows) == 1 else None
+
+
+def row_id(row: dict) -> int | None:
+    return row['id'] if type(row.get('id')) is int else None
+
+
+def judge_assets(row: dict, want: dict[str, str]) -> str:
+    """`ok` when row's assets are exactly want (name -> `sha256:<hex>`), `mismatch` for a wrong asset-name set or a digest
+    that is present and not the file's (a bare hex included), `unread` for anything GitHub has not answered yet (assets
+    not a list, a null or missing digest). A mismatch outranks an unread."""
+    got = row.get('assets')
+    if not (isinstance(got, list) and all(isinstance(a, dict) for a in got)):
+        return 'unread'
+    if sorted(map(repr, (a.get('name') for a in got))) != sorted(map(repr, want)):
+        return 'mismatch'
+    if any(a.get('digest') is not None and a['digest'] != want[a['name']] for a in got):
+        return 'mismatch'
+    return 'unread' if any(a.get('digest') is None for a in got) else 'ok'
+
+
+def poll(io: Io, repo: str, tag: str, env: dict[str, str], judge):
+    """Read the tag's rows up to READ_TRIES times, READ_PAUSE apart, until judge(rows) answers something but None."""
+    for attempt in range(READ_TRIES):
+        if attempt:
+            io.sleep(READ_PAUSE)
+        if (verdict := judge(release_rows(io, repo, tag, env))) is not None:
+            return verdict
+    return None
+
+
+def drop_draft(io: Io, repo: str, tag: str, env: dict[str, str]) -> str:
+    """Delete the release of exactly this tag, but only if a fresh read shows ONE row that is a draft: a published
+    release is never deleted, nor is a draft of another tag, nor anything when the list is unread or ambiguous. Return
+    deleted | none | kept | unreadable | ambiguous | failed; the last three print their word (Real.run keeps no stderr)."""
+    rows = release_rows(io, repo, tag, env)
+    if rows is None:
+        sys.stderr.write('fleet-disk: draft-unread\n')
+        return 'unreadable'
+    if not rows:
+        return 'none'
+    row = sole(rows)
+    if row is None:
+        sys.stderr.write('fleet-disk: draft-ambiguous\n')
+        return 'ambiguous'
+    if row.get('draft') is not True or row_id(row) is None:
+        return 'kept'
+    try:
+        code = io.run([GH, 'api', '-X', 'DELETE', f'repos/{repo}/releases/{row["id"]}'], env)[0]
+    except Refused:
+        code = 1
+    if code != 0:
+        sys.stderr.write('fleet-disk: draft-not-deleted\n')
+        return 'failed'
+    return 'deleted'
+
+
+def unverified(digests: dict[str, str]) -> None:
+    """The hashed digests, marked as not verified (and not lock-shaped), for a refusal after the release may be public."""
+    for name, digest in digests.items():
+        sys.stderr.write(f'unverified {name} sha256:{digest}\n')
+
+
 def publish(io: Io, repo: str, tag: str, sha: str, env: dict[str, str], assets: list[Path], notes: str) -> dict[str, str]:
-    """Create the release with exactly these assets, then read GitHub's digests back: they must be the files' own.
-    Return each asset's sha256 by name; on a mismatch nothing is printed to sign."""
+    """Create the release as a DRAFT with exactly these assets, read the draft's digests back by release id (up to
+    READ_TRIES reads), and only when they are the files' own make it public (one PATCH, then a second read that must
+    show it published with the same digests). Return each asset's sha256 by name; on a refusal nothing is printed to
+    sign. Before the PATCH any refusal deletes the draft; after it (sent, whatever its exit: a timed-out or failed PATCH may
+    have been applied) a draft is deleted only when the PATCH failed AND all READ_TRIES reads show that draft, a published
+    release is verified, and one that cannot be read is left alone, with the hashed digests printed as `unverified` lines."""
     digests = {a.name: file_sha(a) for a in assets}
-    if io.run([GH, 'release', 'create', tag, *map(str, assets), '--target', sha, '--title', tag, '--notes', notes],
-              env)[0] != 0:
+    want = {name: f'sha256:{digest}' for name, digest in digests.items()}
+    try:
+        made = io.run([GH, 'release', 'create', tag, *map(str, assets), '--draft', '--target', sha, '--title', tag,
+                       '--notes', notes], env, UPLOAD_TIMEOUT)[0] == 0
+    except Refused as why:
+        if str(why) == 'tool-timeout':  # gh was killed with its draft half made: its own cleanup never ran
+            drop_draft(io, repo, tag, env)
+        raise
+    if not made:
+        drop_draft(io, repo, tag, env)
         raise Refused('publish-failed')
-    published = json_out(io, [GH, 'api', f'repos/{repo}/releases/tags/{tag}'], env, dict, 'publish-mismatch')
-    got = published.get('assets')
-    if not (isinstance(got, list) and len(got) == len(digests) and all(isinstance(a, dict) for a in got)
-            and {a.get('name'): a.get('digest') for a in got} == {n: f'sha256:{d}' for n, d in digests.items()}):
-        raise Refused('publish-mismatch')  # what GitHub now serves is not what was hashed
-    return digests
+
+    def draft_state(rows):
+        row = sole(rows)
+        if row is None or row.get('draft') is not True or row_id(row) is None:
+            return None
+        verdict = judge_assets(row, want)
+        return None if verdict == 'unread' else (verdict, row['id'])
+
+    found = poll(io, repo, tag, env, draft_state)
+    if found is None or found[0] != 'ok':
+        drop_draft(io, repo, tag, env)
+        raise Refused('publish-unread' if found is None else 'publish-mismatch')  # nothing is public yet
+    try:
+        patched = io.run([GH, 'api', '-X', 'PATCH', f'repos/{repo}/releases/{found[1]}', '-F', 'draft=false'], env)[0] == 0
+    except Refused:
+        patched = False
+    if not patched:
+        sys.stderr.write('fleet-disk: patch-failed\n')
+
+    seen = {'reads': 0, 'all_draft': True}
+
+    def public_state(rows):
+        seen['reads'] += 1
+        row = sole(rows)
+        if row is None or row_id(row) != found[1]:
+            seen['all_draft'] = False
+            return None
+        if row.get('draft') is True:
+            # the PATCH was sent, so one draft read is never a verdict (a PATCH that timed out or exited nonzero may have
+            # been applied, and a read can be stale): only a draft on EVERY read, of a PATCH that failed, is one
+            return 'draft' if not patched and seen['all_draft'] and seen['reads'] == READ_TRIES else None
+        seen['all_draft'] = False
+        verdict = judge_assets(row, want) if row.get('draft') is False else 'unread'
+        return None if verdict == 'unread' else verdict
+
+    settled = poll(io, repo, tag, env, public_state)
+    if settled == 'ok':
+        return digests
+    if settled == 'draft':
+        drop_draft(io, repo, tag, env)
+    unverified(digests)
+    raise Refused({'draft': 'publish-failed', 'mismatch': 'publish-mismatch'}.get(settled, 'publish-unread'))
 
 
 def build(io: Io, serial: str, work: Path, repo: str, sha: str, token: str, fpr: str,
           now: float | None = None) -> dict:
     """Fetch, verify, convert and publish serial's disks; return the lock entries. Refusals come before any
     network call (serial, key, repo), then an existing tag or release (a check that cannot be answered refuses too),
-    then in the order the evidence is strongest (signature, sum, magic), then each asset's size; after the upload the
-    published assets are read back and must carry the digests the lock entries will state."""
+    then in the order the evidence is strongest (signature, sum, magic), then each asset's size; the upload is a draft
+    whose assets' digests are read back and must be the ones the lock entries will state before it is made public."""
     env = release_env(serial, fpr, repo, sha, token)
-    tag = f'disk-noble-{serial}'
+    tag = tag_name('amd64', serial)
     tag_is_free(io, repo, tag, env)
     base = f'{BASE}{serial}/'
     want = signed_image_sum(io, base, IMAGE, work, fpr, serial, now)
@@ -292,11 +438,12 @@ def build_arm64(io: Io, serial: str, work: Path, repo: str, sha: str, token: str
     """The macOS lane's disk: the pinned serial's signed noble arm64 image as a zstd'd raw GPT/EFI disk, the one asset
     of disk-noble-arm64-<serial>; vfkit's upstream bytes are re-checked on the way. Refusals come before any network
     call (serial and its pin, key, repo), then an existing tag, then signature, signed sum (it must be
-    ARM64_IMAGE_SHA256), vfkit (sha and size), image, raw layout, asset size and round trip; the upload is read back."""
+    ARM64_IMAGE_SHA256), vfkit (sha and size), image, raw layout, asset size and round trip; the draft upload is read
+    back before it is public."""
     env = release_env(serial, fpr, repo, sha, token)
     if serial != ARM64_SERIAL:
         raise Refused('serial-not-pinned')
-    tag = f'disk-noble-arm64-{serial}'
+    tag = tag_name('arm64', serial)
     tag_is_free(io, repo, tag, env)
     base = f'{BASE}{serial}/'
     want = signed_image_sum(io, base, IMAGE_ARM64, work, fpr, serial, now)
@@ -328,17 +475,23 @@ def build_arm64(io: Io, serial: str, work: Path, repo: str, sha: str, token: str
 
 
 def main(argv: list[str], environ: dict[str, str], io: Io) -> int:
-    """`fleet-disk.py [amd64|arm64] <serial>`, with GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN in the environment."""
+    """`fleet-disk.py [amd64|arm64] <serial>`, with GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN in the environment;
+    `fleet-disk.py cleanup [amd64|arm64] <serial>` deletes that tag's leftover draft release (and nothing else)."""
     args = argv[1:]
+    cleanup = args[:1] == ['cleanup']
+    args = args[1:] if cleanup else args
     arch = args.pop(0) if len(args) == 2 and args[0] in ARCHES else 'amd64'
     if len(args) != 1:
-        sys.stderr.write('usage: fleet-disk.py [amd64|arm64] <serial>\n')
+        sys.stderr.write('usage: fleet-disk.py [cleanup] [amd64|arm64] <serial>\n')
         return USAGE
+    job = (args[0], environ.get('GITHUB_REPOSITORY', ''), environ.get('GITHUB_SHA', ''), environ.get('GH_TOKEN', ''))
     try:
+        if cleanup:
+            status = drop_draft(io, job[1], tag_name(arch, args[0]), release_env(job[0], CLOUDIMAGE_KEY_FPR, *job[1:]))
+            sys.stderr.write(f'fleet-disk: cleanup {status}\n')
+            return 0 if status in ('deleted', 'none', 'kept') else REFUSED
         with tempfile.TemporaryDirectory(dir=environ.get('RUNNER_TEMP') or None) as tmp:
-            job = (io, args[0], Path(tmp), environ.get('GITHUB_REPOSITORY', ''), environ.get('GITHUB_SHA', ''),
-                   environ.get('GH_TOKEN', ''), CLOUDIMAGE_KEY_FPR)
-            entries = build_arm64(*job) if arch == 'arm64' else build(*job)
+            entries = (build_arm64 if arch == 'arm64' else build)(io, job[0], Path(tmp), *job[1:], CLOUDIMAGE_KEY_FPR)
     except Refused as why:
         sys.stderr.write(f'fleet-disk: refused {why}\n')
         return REFUSED
