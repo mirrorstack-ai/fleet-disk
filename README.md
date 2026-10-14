@@ -368,7 +368,7 @@ network access to python.org for the ZIP, or `--python-zip PATH`).
 The gate that matters is the `smoke` job of `install.yml` (above): the release folder is committed only in the fleet repository,
 so the plan fetches the loaders from the fleet `release` tip, and each runner builds its own fixture from them with
 `make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh` and runs the same steps and rows as this
-workflow, minus the experimental `keychain` row. `boot-smoke.yml` stays as a dispatch (and for edits of the builder and the
+workflow, minus the experimental `keychain` row. `boot-smoke.yml` stays as a dispatch and as a PR-path trigger (`release/install-*/bootstrap.*`, which now rarely fires, and edits of the builder and the
 driver); a dispatch that finds no complete pair fails. The smoke ends the good run in `kvm` on a hosted runner (no `/dev/kvm`),
 and never runs the install itself.
 

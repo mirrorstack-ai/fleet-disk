@@ -2996,6 +2996,8 @@ class Workflow(unittest.TestCase):
         self.assertIn("if: github.ref == 'refs/heads/release' && inputs.mode == 'sign'\n", head)
         self.assertIn('    needs: plan\n', head)
         self.assertIn('    runs-on: ${{ matrix.runner }}\n', head)
+        self.assertIn('    timeout-minutes: 25\n', head)   # a hung hosted leg must not hold the release for the 360 minute default
+        self.assertIn('    strategy:\n      fail-fast: false\n      matrix:\n        include:\n', head)   # one red leg must not cancel the others' per-OS evidence
         self.assertIn('    permissions: {}\n', head)   # no token scope: the job reads nothing of this repository's but its public files
         for bad in ('secrets.', 'vars.', 'environment', 'github.token', 'GH_TOKEN', 'needs.', 'outputs:', 'install-stage',
                     'FLEET_READ', 'continue-on-error', 'self-hosted', 'actions/cache'):
@@ -3038,6 +3040,9 @@ class Workflow(unittest.TestCase):
         self.assertLess(plan.index('      - id: plan\n'), plan.index('      - id: loaders\n'))   # after every offline check
         self.assertLess(plan.index('      - id: loaders\n'), plan.index('name: loaders\n'))
         step = self.step_text('plan', 'loaders')
+        self.assertTrue(step.startswith('        env:\n'), step[:40])   # no `if:` before env: nothing may gate the step into a skip
+        self.assertNotIn('\n        if:', step)
+        self.assertIn('"$TIP:release/install-$SERIAL/$f"', self.run_loaders_body())   # the plan's own tip; HEAD is unborn in the real job
         self.assertIn('SERIAL: ${{ steps.plan.outputs.serial }}', step)
         self.assertIn('TIP: ${{ steps.plan.outputs.tip }}', step)
         self.assertNotIn('secrets.', step)
@@ -3079,6 +3084,10 @@ class Workflow(unittest.TestCase):
             rt, tip = self.loaders_repo(tmp, {'bootstrap.sh': self.SH, 'bootstrap.ps1': self.PS1, 'install.json': b'{}\n', 'kit.json': b'{}\n'})
             folder = rt / 'fleet' / 'release' / 'install-7'
             self.assertEqual((folder / 'bootstrap.ps1').read_bytes(), self.PS1.replace(b'\n', b'\r\n'))   # the premise: CRLF on disk
+            fleet = rt / 'fleet'   # a later commit on the branch: reading HEAD or the branch, not the tip, would hand on other bytes
+            (fleet / 'release' / 'install-7' / 'bootstrap.sh').write_bytes(b'#!/bin/sh\necho later\n')
+            for args in (('add', '-A'), ('commit', '-q', '-m', 'later')):
+                subprocess.run([fp.GIT, '-C', str(fleet), *args], env=GIT_ENV, check=True, capture_output=True, text=True)
             done = self.run_loaders(tmp, rt, tip=tip)
             self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
             out = rt / 'loaders'
