@@ -25,7 +25,9 @@ keys, both computed by the Worker front, K5).
     reserves: it stays readable behind a live (found, not revoked, in range,
     unexpired) invite until that invite expires, even when every download is
     used. This is deliberate (the bootstrap may fetch the pair after the bundle).
-  - A failed decision is one budget write; a 429 writes nothing.
+  - A failed decision is one budget write; a 429 writes nothing. The prune of old budget rows runs once per 10-minute
+    bucket (the last pruned bucket is kept in `meta` as `fails_pruned`), not on every failure: the `fails` table has no
+    index on `bucket`, so each prune scans it.
 - `release({rid})` gives a cut download back (at most 3 per invite).
 - `reject({src, rid})` is a fault after a yes (R2 missing, wrong size or sha256).
 - `admin(role, ts_ms, op, args)` after the Worker has verified the Ed25519 signature.
@@ -91,7 +93,8 @@ budget. Once the signature is good, replies are JSON and may say why (400 bad-re
 ### Measured on staging (K6), not here
 
 (a) a real client cut fires the release; (c) R2 refuses wrong bytes and overwrites (a second put of different bytes to an existing key returns null on real R2, and the wildcard `etagDoesNotMatch: '*'` is honoured); (d) the
-Free over-quota status; (g) CPU time. The unit tests use stand-ins and say nothing about these.
+Free over-quota status; (g) CPU time; (h) rows read per failed decision, against the Free plan's 5 million rows read a day
+(read the staging Durable Object's rows-read metric before and after a known number of failed decisions). The unit tests use stand-ins and say nothing about these.
 
 ## Shared decision vectors (G-K3-1)
 
