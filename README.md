@@ -53,7 +53,7 @@ refused as unlisted.
 
 Actions, then `install`, then Run workflow on the `release` branch (the only ref the jobs accept) with `serial` and
 `min_serial` (the lowest serial this publish may carry, normally the previous release's); `mode` pubkey only prints the
-signing key's public line and fingerprint, and `mode` floor runs only the floor job (below). Seven jobs run in order:
+signing key's public line and fingerprint, `mode` floor runs only the floor job and `mode` untag only the three untag jobs (both below). Seven jobs run in order:
 
 - **plan** (Environment `release`, read-only deploy key `FLEET_READ` on the fleet repository, held in `/dev/shm` and wiped
   by a trap on every path) reads the folder from the fleet `release` tip as git blobs, never a checkout. It refuses unless the folder is exactly the files above as plain files, the
@@ -184,7 +184,7 @@ stderr (`first refusal <word>`).
 | `draft-left` | a draft of an install tag exists (a run's upload was killed before it was public) | a repo writer runs `gh release delete install-<n> --yes` (the tag stays), then re-runs |
 | `release-left` | a release of the tag exists and the publisher could not read, judge or remove it | read the release page; if it is immutable and right, the serial is used: take the next one; a draft or mutable one: `gh release delete install-<n> --yes`, then re-run |
 | `tag-exists` | a published release of the tag exists | read the release page; if it is immutable and right, the serial is used |
-| `tag-moved` | the tag is on another commit, or not a lightweight commit tag, and has no release | the deploy key deletes the tag by hand (no workflow mode removes a release-less tag until AF42) |
+| `tag-moved` | the tag is on another commit, or not a lightweight commit tag, and has no release | a tag on another commit: `mode` untag with this `serial` removes it (see **Untag**); an annotated or other tag object, which untag refuses, the deploy key deletes by hand |
 | `not-newer` | a release of this or a higher serial exists | dispatch the next serial |
 | `pin-mismatch` | the pin's serial is below the newest release's, or that pin cannot be read | fix the pin or the serial in the release folder |
 | `immutable-off`, `immutable-unreadable` | the Immutable releases setting is off, or the token cannot read it and `IMMUTABLE_RELEASES_CONFIRMED` is not `yes` | turn it on, or record the confirmation |
@@ -228,6 +228,19 @@ repository and no owner key. The approval exists only once `kit-floor` is made w
 then a dispatch on `release` runs unattended, and the `release` Environment itself has no reviewer (the plan, sign, kit and tag jobs
 would otherwise each wait for one). A floor run shares no concurrency group with the release runs, so it never waits behind one;
 the dashboard variable `KIT_FLOOR` stays the fastest break-glass.
+
+**Untag.** `mode` untag with `serial` set to N removes the tag `install-N` of a run that stopped after the tag job and before the release was made (a
+failed publish leaves such a tag; the serial is otherwise lost), and only a tag that has no release. It is three jobs, in the same concurrency group as a release run. `untag-check` has no
+Environment and no secret, only the job token with `contents: read`: it runs the read-only verb `untag-check --serial N` of the publisher, which refuses
+`tag-missing` (no such tag), `tag-moved` (the tag is not a lightweight commit tag), `tag-exists` or `draft-left` (any release of the tag, published or draft,
+exists: it has a release, so it is not removed; a read-only token may not see a draft, so `draft-left` is only certain once a writer has checked the
+releases page) and otherwise prints `tag install-N sha <sha>, no release` and hands the commit id on. `untag-approve` waits in the Environment `kit-floor`
+(the owner is its required reviewer, it holds no secret and no token) and prints `approved: delete tag install-N at <sha>`. `untag` needs both, runs in the
+Environment `release`, reads only `TAG_KEY` (the deploy key that makes the tag, the one bypass of the `install-*` tag ruleset) and runs no repository code and
+holds no token: it deletes with `git push --force-with-lease=refs/tags/install-N:<sha>` of the empty source, so only a tag still on the checked commit goes (a tag that
+moved after the check is left). Turn the `kit-floor` required reviewer on first (One-time repo settings): without it nothing stops an untag run. Not yet
+measured (the first dispatch shows both): that the ruleset's bypass covers a deletion, and that GitHub refuses to delete a tag an immutable release holds (the
+check already refuses such a tag).
 
 `.gitattributes` marks the vendored files `-text` so no checkout rewrites their line endings.
 A change to the verifier ships as the same two files in both repositories, in the same step: the fleet

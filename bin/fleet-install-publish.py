@@ -167,11 +167,13 @@ TOOL_TIMEOUT, UPLOAD_TIMEOUT = 600, 1800  # seconds: gh queries; the release upl
 USAGE, REFUSED = 2, 1
 USAGE_TEXT = ('usage: fleet-install-publish.py publish|verify <dir> --owner-pub <path> --min-serial N\n'
               '       fleet-install-publish.py plan <fleet-git-dir> --serial N --min-serial N --out <dir>\n'
+              '       fleet-install-publish.py untag-check --serial N\n'
               '  <dir> is release/install-<serial>;\n'
               '  OWNER_PIN_SHA256 is the fingerprint the key must have (plan and publish need it);\n'
               '  SERIES (test or release) is needed by plan and publish;\n'
               '  KIT_HOST (the one host install.json\'s bundle.url may name) is needed by plan and publish;\n'
-              '  plan and publish also need GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN\n')
+              '  plan and publish also need GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN;\n'
+              '  untag-check only reads (GitHub: the tag install-N and the releases) and needs the same three\n')
 DIR_NAME = re.compile(r'install-(0|[1-9][0-9]{0,9})', re.ASCII)  # canonical decimal: install-007 is not install-7
 INSTALL_TAG = re.compile(r'install-(0|[1-9][0-9]{0,9})', re.ASCII)
 OWNER_LINE = re.compile(r'ssh-ed25519 [A-Za-z0-9+/]{68}(?: [ -~]*)?', re.ASCII)  # one key line, an optional comment
@@ -677,6 +679,57 @@ def release_state(io: Io, env: dict[str, str], plan: Plan, sha: str, confirmed: 
               ' confirmation', file=sys.stderr, flush=True)
 
 
+def untag_check(io: Io, env: dict[str, str], serial: int) -> str:
+    """The read-only judgement before the workflow mode `untag` removes the tag install-<serial>: the tag's commit id (40
+    hex), only for a tag that exists, is a lightweight commit tag (an object of type commit) and has no release at all.
+    Else Refused: `tag-missing` (no such tag), `tag-moved` (an annotated or other object), `tag-exists` (a published release
+    of the tag exists: a release holds its tag and it may never go) or `draft-left` (a draft of it exists: remove the draft
+    first, see the README), `tag-check-failed` for an answer that cannot be read (fail closed). A read-only token may not be
+    shown drafts: the read cannot see one, the ref delete then leaves the draft with no tag, which a repo writer removes.
+    Nothing here writes: every call is a GET of gh api or a release list."""
+    tag = f'install-{serial}'
+    refs = json_out(io, [GH, 'api', f'repos/{env["GH_REPO"]}/git/matching-refs/tags/{tag}'], env, list)  # a PREFIX match
+    made = [r for r in refs if isinstance(r, dict) and r.get('ref') == f'refs/tags/{tag}']
+    if not made:
+        raise Refused('tag-missing')
+    if len(made) > 1:
+        raise Refused('tag-check-failed')
+    target = made[0].get('object')
+    sha = target.get('sha') if isinstance(target, dict) else None
+    if not isinstance(target, dict) or target.get('type') != 'commit' or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha):
+        raise Refused('tag-moved')
+    releases = json_out(io, [GH, 'release', 'list', '--limit', '1000', '--json', 'tagName,isDraft'], env, list)
+    mine = [r for r in releases if isinstance(r, dict) and r.get('tagName') == tag]
+    if any(r.get('isDraft') is not True for r in mine):  # a row that does not say draft counts as published: the worse word
+        raise Refused('tag-exists')
+    if mine:
+        raise Refused('draft-left')
+    return sha
+
+
+def untag_check_main(argv: list[str], environ: dict[str, str], io: Io) -> int:
+    """`untag-check --serial N`: 0 and the line `tag install-N sha <sha>, no release` (also the output `sha` and the run
+    summary), 1 refused, 2 usage. Needs GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN (the job's), as plan does."""
+    if len(argv) != 4 or argv[2] != '--serial' or not re.fullmatch(r'(0|[1-9][0-9]{0,9})', argv[3], re.ASCII):
+        sys.stderr.write(USAGE_TEXT)
+        return USAGE
+    serial = int(argv[3])
+    try:
+        sha = untag_check(io, gh_env(environ.get('GITHUB_REPOSITORY', ''), environ.get('GITHUB_SHA', ''),
+                                     environ.get('GH_TOKEN', '')), serial)
+    except Refused as why:
+        sys.stderr.write(f'fleet-install-publish: refused {why.code}\n')
+        print(f'REFUSED {why.code}')
+        return REFUSED
+    line = f'tag install-{serial} sha {sha}, no release'
+    if environ.get('GITHUB_OUTPUT'):
+        with open(environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+            f.write(f'sha={sha}\n')
+    append_summary(environ, line)
+    print(line)
+    return 0
+
+
 def remove_leftover(io: Io, env: dict[str, str], tag: str, known: bool = False, mutable: bool = False) -> None:
     """Remove the release this publish made, if it can be removed safely; Refused('release-left') if a release of the tag
     is still there. Only a release of exactly this tag in a fresh list is touched, with `gh release delete <tag> --yes`
@@ -931,6 +984,8 @@ def main(argv: list[str], environ: dict[str, str], io: Io, run: Run = run_argv, 
     optionally IMMUTABLE_CONFIRMED=yes; plan needs the same three and reads GitHub the same way (it only reads). plan and
     publish need SERIES (test or release), KIT_HOST (the one host the bundle URL may name) and OWNER_PIN_SHA256, the
     fingerprint the signing key must have; verify takes OWNER_PIN_SHA256 and KIT_HOST as optional pins."""
+    if argv[1:2] == ['untag-check']:
+        return untag_check_main(argv, environ, io)
     if argv[1:2] == ['plan']:
         planned = parse_plan_args(argv)
         if planned is None:

@@ -1,5 +1,5 @@
-# Signs and publishes the fleet's install set from the release folder of the fleet repository's `release` branch, in seven
-# jobs and only on this repo's `release` branch (the Environment `release` allows no other):
+# Signs and publishes the fleet's install set from the release folder of the fleet repository's `release` branch, in the jobs
+# below (and sets the kit host's floor or removes a release-less tag, the two modes after them) and only on this repo's `release` branch (the Environment `release` allows no other):
 #   plan     reads release/install-<serial>/ from the fleet `release` tip as git blobs (deploy key FLEET_READ) and runs
 #            every offline check but the signatures, then the read-only GitHub checks (a release or leftover draft of the tag,
 #            the serial and pin against the newest release, the Immutable setting), so a refusal comes before anything is signed.
@@ -31,18 +31,26 @@
 # waits in the Environment `kit-floor` (the owner is its required reviewer, it holds no secret) and prints the value to
 # approve; `floor` needs it and holds KIT_UPLOAD_KEY in `release`. The approval covers raising, lowering and 0. While the
 # Environment `kit-floor` has no required reviewer (README, One-time repo settings) nothing stops a floor run: do not rely on it.
+# The mode `untag` removes the tag install-<serial> of a run that stopped before its release was made (no workflow removed such a
+# tag before; the serial is otherwise lost). Three jobs, in the same group `install`: `untag-check` (no Environment, no secret,
+# a contents: read job token) reads GitHub, refuses unless the tag exists on a commit as a lightweight tag and NO release of it
+# (draft or not) exists, and outputs the tag's commit; `untag-approve` waits in the Environment `kit-floor` (the owner is its
+# required reviewer, it holds no secret) and prints `approved: delete tag install-<serial> at <sha>`; `untag` needs both, runs in
+# `release`, reads only TAG_KEY and deletes the tag with the deploy key's ssh options, a lease on exactly the checked commit
+# (`--force-with-lease=<ref>:<sha>`): a tag that moved since the check is not deleted. It runs no repository code and holds no token.
+# While `kit-floor` has no required reviewer (README, One-time repo settings) nothing stops an untag run: do not rely on it.
 # Inputs reach the scripts only through env:. Which key signs is the constant KEY_SHA256, a reviewed change to this file.
 name: install
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: sign (plan, sign, kit, tag, publish), pubkey (only print the signing key's public line and fingerprint) or floor (set the kit host's floor)
+        description: sign (plan, sign, kit, tag, publish), pubkey (only print the signing key's public line and fingerprint), floor (set the kit host's floor) or untag (remove the tag install-<serial> that has no release)
         type: choice
-        options: [sign, pubkey, floor]
+        options: [sign, pubkey, floor, untag]
         default: sign
       serial:
-        description: the install serial, the folder release/install-<serial> of the fleet repository
+        description: the install serial, the folder release/install-<serial> of the fleet repository (mode untag - the serial whose release-less tag is removed)
         required: false
       min_serial:
         description: the lowest serial this publish may carry (the previous release's serial)
@@ -443,3 +451,66 @@ jobs:
           set -eu
           case "$FLOOR" in '' | *[!0-9]*) echo 'floor is digits only'; exit 1;; esac
           python3 bin/fleet-kit-upload.py floor "$FLOOR"
+  untag-check:
+    if: github.ref == 'refs/heads/release' && inputs.mode == 'untag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
+        with:
+          persist-credentials: false
+      - id: check
+        env:
+          SERIAL: ${{ inputs.serial }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          case "$SERIAL" in '' | *[!0-9]*) echo 'serial is digits only'; exit 1;; esac
+          python3 bin/fleet-install-publish.py untag-check --serial "$SERIAL"
+  untag-approve:
+    if: github.ref == 'refs/heads/release' && inputs.mode == 'untag'
+    needs: untag-check
+    environment: kit-floor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - env:
+          SERIAL: ${{ inputs.serial }}
+          TAG_SHA: ${{ needs.untag-check.outputs.sha }}
+        run: |
+          set -eu
+          case "$SERIAL" in '' | *[!0-9]*) echo 'serial is digits only'; exit 1;; esac
+          case "$TAG_SHA" in '' | *[!0-9a-f]*) echo 'REFUSED tag sha'; exit 1;; esac
+          [ "${#TAG_SHA}" = 40 ] || { echo 'REFUSED tag sha'; exit 1; }
+          echo "approved: delete tag install-$SERIAL at $TAG_SHA"
+  untag:
+    if: github.ref == 'refs/heads/release' && inputs.mode == 'untag'
+    needs: [untag-check, untag-approve]
+    environment: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - env:
+          TAG_KEY: ${{ secrets.TAG_KEY }}
+          SERIAL: ${{ inputs.serial }}
+          TAG_SHA: ${{ needs.untag-check.outputs.sha }}
+        run: |
+          set -eu
+          umask 077
+          case "$SERIAL" in '' | *[!0-9]*) echo 'serial is digits only'; exit 1;; esac
+          case "$TAG_SHA" in '' | *[!0-9a-f]*) echo 'REFUSED tag sha'; exit 1;; esac
+          [ "${#TAG_SHA}" = 40 ] || { echo 'REFUSED tag sha'; exit 1; }
+          d=$(mktemp -d /dev/shm/untag.XXXXXX)
+          trap 'shred -u "$d/key" 2>/dev/null || true; rm -rf "$d"' EXIT
+          printf '%s\n' "$TAG_KEY" > "$d/key"
+          printf '%s\n' "$GH_HOSTKEY" > "$d/known_hosts"
+          export GIT_SSH_COMMAND="/usr/bin/ssh -i $d/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$d/known_hosts -o GlobalKnownHostsFile=/dev/null -o HostKeyAlgorithms=ssh-ed25519"
+          git init -q "$d/repo"
+          git -C "$d/repo" push -q --force-with-lease="refs/tags/install-$SERIAL:$TAG_SHA" "git@github.com:$GITHUB_REPOSITORY.git" ":refs/tags/install-$SERIAL"
+          echo "deleted tag install-$SERIAL at $TAG_SHA"
