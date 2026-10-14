@@ -2687,6 +2687,101 @@ class ReleaseBody(unittest.TestCase):
                 fp.check_series(serial, series)
 
 
+class UntagCheck(unittest.TestCase):
+    """The read-only verb `untag-check --serial N` (AF42), over the FakeGh: it never writes, and answers with the commit
+    of a lightweight tag that has no release, or with the word that says why the tag may not be removed."""
+
+    ENV = {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN}
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.out, self.summary = Path(self._tmp.name) / 'out', Path(self._tmp.name) / 'summary'
+
+    def check(self, gh, serial: str = str(SERIAL), drop: tuple = ()):
+        env = {k: v for k, v in self.ENV.items() if k not in drop}
+        env.update(GITHUB_OUTPUT=str(self.out), GITHUB_STEP_SUMMARY=str(self.summary))
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = fp.main(['fleet-install-publish.py', 'untag-check', '--serial', serial], env, gh)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_a_tag_with_no_release_passes_prints_its_sha_and_every_call_is_a_read(self):
+        gh = FakeGh(refs=[tag_ref(), tag_ref('install-50', 'cd' * 20)],  # a prefix match of another tag is not this one
+                    releases=[{'tagName': 'install-4', 'isDraft': False}, {'tagName': 'install-6', 'isDraft': True}])
+        code, out, err = self.check(gh)
+        self.assertEqual((code, out, err), (0, f'tag install-{SERIAL} sha {SHA}, no release\n', ''))
+        self.assertEqual(self.out.read_text(), f'sha={SHA}\n')
+        self.assertEqual(self.summary.read_text(), f'tag install-{SERIAL} sha {SHA}, no release\n')
+        self.assertEqual(gh.calls, [['/usr/bin/gh', 'api', f'repos/{REPO}/git/matching-refs/tags/{TAG}'],
+                                    ['/usr/bin/gh', 'release', 'list', '--limit', '1000', '--json', 'tagName,isDraft']])
+        for call in gh.calls:  # no verb that writes, no method, no field: the two GETs of release_state's own reads
+            self.assertNotRegex(' '.join(call), r'(?:^| )(?:create|delete|edit|upload|-X|--method|-f|-F|--field|--input)(?: |$)')
+        self.assertEqual({tuple(sorted(e)) for e in gh.envs}, {('GH_PROMPT_DISABLED', 'GH_REPO', 'GH_TOKEN', 'PATH')})
+
+    def test_each_answer_that_forbids_the_removal_is_its_own_word_and_nothing_is_written(self):
+        draft, shown = {'tagName': TAG, 'isDraft': True}, {'tagName': TAG, 'isDraft': False}
+        for what, refs, releases, word in (
+                ('no tag at all', [], [], 'tag-missing'),
+                ('only another tag it prefixes', [tag_ref('install-50')], [], 'tag-missing'),
+                ('an annotated tag', [tag_ref(kind='tag')], [], 'tag-moved'),
+                ('a tag on a tree', [tag_ref(kind='tree')], [], 'tag-moved'),
+                ('a tag with no object', [{'ref': f'refs/tags/{TAG}'}], [], 'tag-moved'),
+                ('a tag whose sha is no commit id', [tag_ref(sha_='nothex')], [], 'tag-moved'),
+                ('a published release', [tag_ref()], [shown], 'tag-exists'),
+                ('a draft release', [tag_ref()], [draft], 'draft-left'),
+                ('a draft and a published release', [tag_ref()], [draft, shown], 'tag-exists'),
+                ('a release row that does not say draft', [tag_ref()], [{'tagName': TAG}], 'tag-exists')):
+            with self.subTest(what):
+                gh = FakeGh(refs=refs, releases=releases)
+                code, out, _ = self.check(gh)
+                self.assertEqual((code, out), (1, f'REFUSED {word}\n'))
+                self.assertFalse(self.out.exists())  # no output: the approve and untag jobs get no sha
+                self.assertEqual([c[1:3] for c in gh.calls if c[1:3] in (['release', 'create'], ['release', 'delete'])], [])
+        gh = FakeGh(refs=[])
+        self.check(gh)
+        self.assertEqual(len(gh.calls), 1)  # a missing tag stops before the release list is read
+
+    def test_an_answer_that_cannot_be_read_is_tag_check_failed_and_never_a_pass(self):
+        two = [tag_ref(), tag_ref()]
+        for what, gh in (('refs exit 1', self.fake(refs=(1, ''))), ('refs not json', self.fake(refs=(0, 'x'))),
+                         ('refs not a list', self.fake(refs=(0, '{}'))), ('two refs of one name', FakeGh(refs=two)),
+                         ('releases exit 1', self.fake(releases=(1, ''))), ('releases not json', self.fake(releases=(0, 'x'))),
+                         ('releases not a list', self.fake(releases=(0, '{}')))):
+            with self.subTest(what):
+                code, out, _ = self.check(gh)
+                self.assertEqual((code, out), (1, 'REFUSED tag-check-failed\n'))
+                self.assertFalse(self.out.exists())
+
+    @staticmethod
+    def fake(**raw):
+        gh = FakeGh()
+        gh.raw.update(raw)
+        return gh
+
+    def test_a_bad_command_line_is_usage_and_a_job_without_a_token_or_commit_is_release_env_before_any_call(self):
+        for argv in (['untag-check'], ['untag-check', '--serial'], ['untag-check', '--serial', '05'], ['untag-check', '--serial', '-1'],
+                     ['untag-check', '--serial', '5 '], ['untag-check', '--serial', '\u0665'], ['untag-check', '--serial', '5', 'x'],
+                     ['untag-check', '5'], ['untag-check', '--serial', '12345678901']):
+            with self.subTest(argv):
+                gh = FakeGh()
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    self.assertEqual(fp.main(['x', *argv], dict(self.ENV), gh), fp.USAGE)
+                self.assertEqual((gh.calls, stderr.getvalue()), ([], fp.USAGE_TEXT))
+        for name in ('GITHUB_SHA', 'GH_TOKEN', 'GITHUB_REPOSITORY'):
+            with self.subTest(name):
+                gh = FakeGh()
+                self.assertEqual(self.check(gh, drop=(name,))[:2], (1, 'REFUSED release-env\n'))
+                self.assertEqual(gh.calls, [])
+        self.assertIn('fleet-install-publish.py untag-check --serial N', fp.USAGE_TEXT)
+
+    def test_the_serial_of_the_check_is_the_one_asked_about(self):
+        gh = FakeGh(refs=[tag_ref('install-1000', 'cd' * 20)], releases=[])
+        self.assertEqual(self.check(gh, '1000')[:2], (0, f'tag install-1000 sha {"cd" * 20}, no release\n'))
+        self.assertEqual(gh.calls[0][2], f'repos/{REPO}/git/matching-refs/tags/install-1000')
+
+
 class Readme(unittest.TestCase):
     TEXT = (ROOT / 'README.md').read_text(encoding='utf-8')
 
@@ -2708,46 +2803,60 @@ class Readme(unittest.TestCase):
         for word in ('draft-left', 'release-left'):
             self.assertIn(word, fp.PUBLISH_CODES)
 
+    def test_the_readme_names_the_untag_mode_its_three_jobs_and_the_reviewer_setting_that_must_be_on_first(self):
+        section = self.TEXT.split('**Untag.**', 1)[1].split('\n\n', 1)[0]
+        for need in ('`mode` untag', '`untag-check`', '`untag-approve`', '`untag`', '`kit-floor`', 'required reviewer',
+                     'TAG_KEY', '--force-with-lease', 'has no release', 'tag-exists', 'draft-left', 'not a lightweight',
+                     'Turn the `kit-floor` required reviewer on first', 'nothing stops an untag run'):
+            self.assertIn(need, section)
+        self.assertIn('| `tag-moved` |', self.TEXT)
+        self.assertNotIn('until AF42', self.TEXT)  # the stated manual cure moved into the mode
+        self.assertIn('`mode` untag', self.TEXT.split('Seven jobs run in order', 1)[0])  # named where the modes are listed
+
 
 class Workflow(unittest.TestCase):
     TEXT = (ROOT / '.github/workflows/install.yml').read_text(encoding='utf-8')
     DISK = (ROOT / '.github/workflows/disk.yml').read_text(encoding='utf-8')
-    JOBS = {m[1]: m[2] for m in re.finditer(r'(?ms)^  (plan|fixture|smoke|sign|kit|tag|publish|floor-approve|floor):\n(.*?)(?=^  [\w-]+:\n|\Z)',
+    JOBS = {m[1]: m[2] for m in re.finditer(r'(?ms)^  (plan|fixture|smoke|sign|kit|tag|publish|floor-approve|floor|untag-check|untag-approve|untag):\n(.*?)(?=^  [\w-]+:\n|\Z)',
                                             TEXT.split('\njobs:\n', 1)[1])}
 
-    def test_it_is_a_release_branch_dispatch_of_seven_jobs_and_a_floor_job(self):
+    def test_it_is_a_release_branch_dispatch_of_the_seven_signing_jobs_the_floor_pair_and_the_untag_trio(self):
         self.assertRegex(self.TEXT, r'(?m)^on:\n  workflow_dispatch:\n    inputs:\n      mode:\n')
         self.assertEqual(re.findall(r'(?m)^      (\w+):\n        (?:description|required)', self.TEXT),
                          ['mode', 'serial', 'min_serial', 'floor'])
-        self.assertRegex(self.TEXT, r'(?m)^        options: \[sign, pubkey, floor\]\n        default: sign\n')
-        self.assertEqual(list(self.JOBS), ['plan', 'fixture', 'smoke', 'sign', 'kit', 'tag', 'publish', 'floor-approve', 'floor'])
+        self.assertRegex(self.TEXT, r'(?m)^        options: \[sign, pubkey, floor, untag\]\n        default: sign\n')
+        self.assertEqual(list(self.JOBS), ['plan', 'fixture', 'smoke', 'sign', 'kit', 'tag', 'publish', 'floor-approve', 'floor',
+                                                 'untag-check', 'untag-approve', 'untag'])
         self.assertEqual(re.findall(r'(?m)^  ([\w-]+):$', self.TEXT.split('\njobs:\n', 1)[1]), list(self.JOBS))  # and no other job
         for bad in ('pull_request', 'push:', 'self-hosted', 'refs/heads/main', 'actions/cache'):
             self.assertNotIn(bad, self.TEXT)
         for name, job in self.JOBS.items():
             self.assertIn("github.ref == 'refs/heads/release'", job.split('steps:')[0], name)
         self.assertEqual(re.findall(r'runs-on: (.+)', self.TEXT),
-                         ['ubuntu-24.04', 'ubuntu-24.04', '${{ matrix.runner }}'] + ['ubuntu-24.04'] * 6)  # the smoke job is the only hosted-matrix one; the fixture is built once on ubuntu
+                         ['ubuntu-24.04', 'ubuntu-24.04', '${{ matrix.runner }}'] + ['ubuntu-24.04'] * 9)  # the smoke job is the only hosted-matrix one; the fixture is built once on ubuntu
         self.assertEqual([re.findall(r'(?m)^    environment: (\S+)$', j) for j in self.JOBS.values()],
-                         [['release'], [], [], ['release'], ['release'], ['release'], [], ['kit-floor'], ['release']])  # fixture, smoke and publish have none: no secret, no variable of release
+                         [['release'], [], [], ['release'], ['release'], ['release'], [], ['kit-floor'], ['release'], [], ['kit-floor'], ['release']])  # fixture, smoke and publish have none: no secret, no variable of release
 
     def test_only_publish_writes_and_only_contents_and_sign_and_tag_hold_no_token(self):
         self.assertRegex(self.TEXT, r'(?m)^permissions:\n  contents: read\n')
         self.assertEqual(re.findall(r'(\w[\w-]*): write', self.TEXT), ['contents'])
         self.assertIn('    permissions:\n      contents: write\n', self.JOBS['publish'])
-        for name in ('fixture', 'smoke', 'sign', 'tag'):
+        for name in ('fixture', 'smoke', 'sign', 'tag', 'untag-approve', 'untag'):
             self.assertTrue('    permissions: {}\n' in self.JOBS[name] and 'github.token' not in self.JOBS[name])
+        self.assertIn('    permissions:\n      contents: read\n', self.JOBS['untag-check'])  # the one new job with a token: read only
 
     def test_each_secret_is_read_by_one_job_and_the_sign_and_tag_jobs_run_no_action_and_no_repository_code(self):
         self.assertEqual(sorted(re.findall(r'secrets\.(\w+)', self.TEXT)),
-                         ['FLEET_READ', 'FLEET_READ', 'KIT_UPLOAD_KEY', 'KIT_UPLOAD_KEY', 'SIGN_KEY', 'TAG_KEY'])
+                         ['FLEET_READ', 'FLEET_READ', 'KIT_UPLOAD_KEY', 'KIT_UPLOAD_KEY', 'SIGN_KEY', 'TAG_KEY', 'TAG_KEY'])  # TAG_KEY: tag and untag (AF42, on purpose: the deploy key that makes a tag is the one that removes it)
         for name, secrets in (('plan', ['FLEET_READ']), ('sign', ['SIGN_KEY']), ('kit', ['FLEET_READ', 'KIT_UPLOAD_KEY']),
-                              ('tag', ['TAG_KEY']), ('floor', ['KIT_UPLOAD_KEY'])):
+                              ('tag', ['TAG_KEY']), ('floor', ['KIT_UPLOAD_KEY']), ('untag', ['TAG_KEY'])):
             self.assertEqual(re.findall(r'secrets\.(\w+)', self.JOBS[name]), secrets)
         self.assertNotIn('secrets.', self.JOBS['publish'])
         self.assertNotIn('secrets.', self.JOBS['smoke'])
         self.assertNotIn('secrets.', self.JOBS['fixture'])
-        for name in ('sign', 'tag'):
+        for name in ('untag-check', 'untag-approve'):
+            self.assertNotIn('secrets.', self.JOBS[name])
+        for name in ('sign', 'tag', 'untag'):
             for bad in ('uses:', 'checkout', 'fleet-install-publish', 'python', 'RUNNER_WORKSPACE', 'GITHUB_WORKSPACE'):
                 self.assertNotIn(bad, self.JOBS[name], name)
         self.assertEqual(re.findall(r'vars\.(\w+)', self.TEXT), ['IMMUTABLE_RELEASES_CONFIRMED'])
@@ -2798,7 +2907,7 @@ class Workflow(unittest.TestCase):
             self.assertIn(need, step)
         self.assertEqual(self.declared_outputs('plan')['immutable'], ('immutable', 'immutable'))  # still handed to publish
         self.assertIn('IMMUTABLE_CONFIRMED: ${{ needs.plan.outputs.immutable }}', self.JOBS['publish'])
-        self.assertEqual(len(self.JOBS), 9)  # seven, the smoke and its fixture (AF34); AF08's gateway-sign job is still parked
+        self.assertEqual(len(self.JOBS), 12)  # seven, the smoke and its fixture (AF34), the untag trio (AF42); AF08's gateway-sign job is still parked
         self.assertEqual(re.findall(r'vars\.(\w+)', self.TEXT), ['IMMUTABLE_RELEASES_CONFIRMED'])
 
     def test_the_plan_job_reads_the_fleet_over_ssh_with_the_pinned_host_key_and_the_tag_job_never_forces(self):
@@ -2845,7 +2954,8 @@ class Workflow(unittest.TestCase):
         needs = {name: re.findall(r'(?m)^    needs: (.*)$', job) for name, job in self.JOBS.items()}
         self.assertEqual(needs, {'plan': [], 'fixture': ['plan'], 'smoke': ['[plan, fixture]'], 'sign': ['[plan, smoke]'], 'kit': ['[plan, smoke, sign]'],
                                  'tag': ['[plan, smoke, sign, kit]'], 'publish': ['[plan, smoke, sign, kit, tag]'],
-                                 'floor-approve': [], 'floor': ['floor-approve']})
+                                 'floor-approve': [], 'floor': ['floor-approve'],
+                                 'untag-check': [], 'untag-approve': ['untag-check'], 'untag': ['[untag-check, untag-approve]']})
 
     def declared_outputs(self, name: str) -> dict[str, tuple[str, str]]:
         """{output: (step id, step output)} from the job's `outputs:` block."""
@@ -2862,6 +2972,8 @@ class Workflow(unittest.TestCase):
         """The output names the step with this id writes into $GITHUB_OUTPUT."""
         if (name, step_id) == ('plan', 'plan'):  # python writes them: the publisher's own list
             return {'serial', 'tag', 'tip'} | {f'{short}_{kind}' for short, _, _ in fp.SIGNED for kind in ('b64', 'sha')}
+        if (name, step_id) == ('untag-check', 'check'):  # python writes it too: the verb's one output
+            return {'sha'}
         text = self.step_text(name, step_id)
         self.assertIn('>> "$GITHUB_OUTPUT"', text)
         names = set(re.findall(r'echo (\w+)=', text)) | set(re.findall(r"printf '(\w+)=", text))
@@ -3387,6 +3499,171 @@ class Workflow(unittest.TestCase):
                 self.assertIn('UNKNOWN:', text)
                 self.assertIn('review EVERY commit', text)
                 self.assertIn(heads[0], text)  # the whole list stands in for the one that could not be computed
+
+
+    # the untag mode (AF42): three jobs, the only way a release-less tag leaves
+
+    def untag_body(self, name: str) -> str:
+        return self.run_body(name)
+
+    def test_the_untag_jobs_are_only_the_untag_mode_in_the_install_group_and_wired_in_a_line(self):
+        for name in ('untag-check', 'untag-approve', 'untag'):
+            self.assertIn("if: github.ref == 'refs/heads/release' && inputs.mode == 'untag'\n", self.JOBS[name].split('steps:')[0], name)
+            self.assertNotIn('timeout-minutes: 60', self.JOBS[name])
+        self.assertIn("group: ${{ inputs.mode == 'floor' && 'install-floor' || 'install' }}", self.TEXT)  # untag stays in `install`
+        for name in ('plan', 'fixture', 'smoke', 'sign', 'kit', 'tag', 'publish', 'floor-approve', 'floor'):
+            self.assertNotIn("inputs.mode == 'untag'", self.JOBS[name], name)  # no other mode's job runs in an untag run
+        self.assertLess(self.TEXT.index('\n  floor:\n'), self.TEXT.index('\n  untag-check:\n'))
+        self.assertLess(self.TEXT.index('\n  untag-check:\n'), self.TEXT.index('\n  untag-approve:\n'))
+        self.assertLess(self.TEXT.index('\n  untag-approve:\n'), self.TEXT.index('\n  untag:\n'))
+
+    def test_the_untag_check_job_holds_no_secret_no_environment_and_only_a_read_token(self):
+        check = self.JOBS['untag-check']
+        self.assertIn('    permissions:\n      contents: read\n', check)
+        for bad in ('secrets.', 'vars.', 'environment', 'upload-artifact', 'download-artifact', 'actions/cache', 'FLEET_READ', 'TAG_KEY',
+                    'GITHUB_ENV', 'set -x', 'write'):
+            self.assertNotIn(bad, check, bad)
+        self.assertEqual(re.findall(r'uses: (\S+)', check), ['actions/checkout@11d5960a326750d5838078e36cf38b85af677262'])
+        self.assertEqual(check.count('persist-credentials: false'), 1)
+        self.assertEqual(self.declared_outputs('untag-check'), {'sha': ('check', 'sha')})
+        step = self.step_text('untag-check', 'check')
+        for need in ('SERIAL: ${{ inputs.serial }}', 'GH_TOKEN: ${{ github.token }}'):
+            self.assertIn(need, step)
+        self.assertEqual(self.untag_body('untag-check').splitlines()[-1], 'python3 bin/fleet-install-publish.py untag-check --serial "$SERIAL"')
+        self.assertNotIn('inputs.', self.untag_body('untag-check'))  # only through env:
+
+    def test_the_untag_approve_job_waits_in_kit_floor_holds_nothing_and_prints_the_value_it_approves(self):
+        approve = self.JOBS['untag-approve']
+        head = approve.split('steps:')[0]
+        self.assertIn('    needs: untag-check\n', head)
+        self.assertIn('    environment: kit-floor\n', head)
+        self.assertIn('    permissions: {}\n', head)
+        for bad in ('secrets.', 'github.token', 'GH_TOKEN', 'uses:', 'checkout', 'python', 'upload-artifact'):
+            self.assertNotIn(bad, approve, bad)
+        for need in ('SERIAL: ${{ inputs.serial }}', 'TAG_SHA: ${{ needs.untag-check.outputs.sha }}'):
+            self.assertIn(need, approve)
+        self.assertNotIn('inputs.', self.untag_body('untag-approve'))
+        sha40 = 'ab' * 20
+        with tempfile.TemporaryDirectory() as tmp:
+            done, log, _ = self.run_block(Path(tmp), 'untag-approve', {'SERIAL': '7', 'TAG_SHA': sha40})
+            self.assertEqual((done.returncode, done.stdout, log), (0, f'approved: delete tag install-7 at {sha40}\n', ''))
+        for what, env in (('no serial', {'SERIAL': '', 'TAG_SHA': sha40}), ('a serial with a path', {'SERIAL': '7/..', 'TAG_SHA': sha40}),
+                          ('no sha', {'SERIAL': '7', 'TAG_SHA': ''}), ('a short sha', {'SERIAL': '7', 'TAG_SHA': sha40[:39]}),
+                          ('an upper-case sha', {'SERIAL': '7', 'TAG_SHA': sha40.upper()}), ('a ref name', {'SERIAL': '7', 'TAG_SHA': 'refs/heads/release'})):
+            with self.subTest(what), tempfile.TemporaryDirectory() as tmp:
+                done, _, _ = self.run_block(Path(tmp), 'untag-approve', env)
+                self.assertEqual(done.returncode, 1)
+                self.assertNotIn('approved', done.stdout)  # nothing is approved that the delete would not take
+
+    def test_the_untag_job_needs_both_reads_only_the_tag_key_and_runs_no_code_no_token_and_no_force_but_the_lease(self):
+        untag = self.JOBS['untag']
+        head = untag.split('steps:')[0]
+        self.assertIn('    needs: [untag-check, untag-approve]\n', head)
+        self.assertIn('    environment: release\n', head)
+        self.assertIn('    permissions: {}\n', head)
+        self.assertEqual(re.findall(r'secrets\.(\w+)', untag), ['TAG_KEY'])
+        for bad in ('uses:', 'checkout', 'python', 'RUNNER_WORKSPACE', 'GITHUB_WORKSPACE', 'github.token', 'GH_TOKEN', 'fleet-install-publish',
+                    'vars.', 'upload-artifact', 'download-artifact', 'actions/cache', 'StrictHostKeyChecking=no', ' gh '):
+            self.assertNotIn(bad, untag, bad)
+        for need in ('StrictHostKeyChecking=yes', 'IdentitiesOnly=yes', 'GlobalKnownHostsFile=/dev/null', '/dev/shm/untag.', "trap 'shred -u",
+                     'umask 077', 'SERIAL: ${{ inputs.serial }}', 'TAG_SHA: ${{ needs.untag-check.outputs.sha }}'):
+            self.assertIn(need, untag)
+        body = self.untag_body('untag')
+        ssh = [l.strip() for l in body.splitlines() if l.strip().startswith('export GIT_SSH_COMMAND=')]
+        self.assertEqual(len(ssh), 1)
+        for need in ('-o BatchMode=yes', '-o HostKeyAlgorithms=ssh-ed25519'):  # BatchMode: an auth failure fails, it never waits on a prompt
+            self.assertIn(need, ssh[0], need)
+        for other in ('plan', 'tag', 'kit'):  # the same ssh options as every other deploy-key job
+            others = [l.strip() for l in self.JOBS[other].splitlines() if l.strip().startswith('export GIT_SSH_COMMAND=')]
+            self.assertEqual(others, ssh, other)
+        self.assertLess(body.index("trap 'shred"), body.index('"$TAG_KEY" > "$d/key"'))
+        self.assertNotIn('inputs.', body)
+        self.assertEqual(re.findall(r'--force\S*', untag), ['--force-with-lease="refs/tags/install-$SERIAL:$TAG_SHA"'])  # the lease is the one force
+        pushes = [l.strip() for l in body.splitlines() if ' push ' in l]
+        self.assertEqual(pushes, ['git -C "$d/repo" push -q --force-with-lease="refs/tags/install-$SERIAL:$TAG_SHA" '
+                                  '"git@github.com:$GITHUB_REPOSITORY.git" ":refs/tags/install-$SERIAL"'])  # one push, a delete of one tag
+        self.assertNotRegex(untag, r'(?m)\bpush\b.*\s-\w*f')  # no -f
+        self.assertNotRegex(untag, r'(?m)\bpush\b.*[ "]\+')  # no +refspec, no --mirror, no --prune
+        for bad in ('--mirror', '--prune', '--all', '--tags', 'refs/heads', 'git fetch', 'git clone'):
+            self.assertNotIn(bad, body, bad)
+
+    SCRATCH_GIT = {'PATH': '/usr/bin:/bin', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_TERMINAL_PROMPT': '0', 'GIT_AUTHOR_NAME': 'n', 'GIT_AUTHOR_EMAIL': 'n@example.org',
+                   'GIT_COMMITTER_NAME': 'n', 'GIT_COMMITTER_EMAIL': 'n@example.org'}
+
+    def untag_remote(self, tmp: Path) -> tuple[Path, str, str]:
+        """A bare repository standing in for GitHub, with the tag install-7 on the first of two commits: (path, first, second)."""
+        git = lambda *a, cwd=tmp: subprocess.run([fp.GIT, *a], cwd=cwd, env={**self.SCRATCH_GIT, 'HOME': str(tmp)}, check=True, capture_output=True, text=True).stdout.strip()
+        git('init', '-q', '-b', 'release', 'work')
+        work = tmp / 'work'
+        (work / 'f').write_text('1')
+        git('add', 'f', cwd=work)
+        git('commit', '-q', '-m', 'one', cwd=work)
+        first = git('rev-parse', 'HEAD', cwd=work)
+        (work / 'f').write_text('2')
+        git('commit', '-q', '-am', 'two', cwd=work)
+        second = git('rev-parse', 'HEAD', cwd=work)
+        git('tag', 'install-7', first, cwd=work)
+        git('init', '-q', '--bare', 'remote.git')
+        git('push', '-q', str(tmp / 'remote.git'), 'release', 'refs/tags/install-7', cwd=work)
+        return tmp / 'remote.git', first, second
+
+    def run_untag(self, tmp: Path, remote: Path, env: dict):
+        """The `untag` run: block under bash for real, tmpfs stood in by a temp dir and GitHub by the local bare repository."""
+        shm = tmp / 'shm'
+        shm.mkdir(exist_ok=True)
+        body = self.untag_body('untag').replace('/dev/shm/', f'{shm}/').replace('git@github.com:$GITHUB_REPOSITORY.git', str(remote))
+        self.assertIn(str(remote), body)
+        full = {**self.SCRATCH_GIT, 'HOME': str(tmp), 'GH_HOSTKEY': 'github.com ssh-ed25519 AAAA', 'TAG_KEY': 'THROWAWAY-TAG-KEY', **env}
+        done = subprocess.run(['/bin/bash', '-c', body], env=full, capture_output=True, text=True, cwd=tmp)
+        return done, shm
+
+    def remote_tags(self, remote: Path) -> list[str]:
+        return subprocess.run([fp.GIT, '-C', str(remote), 'tag', '-l'], env=self.SCRATCH_GIT, check=True, capture_output=True, text=True).stdout.split()
+
+    @unittest.skipUnless(os.path.exists(fp.GIT), 'git is missing')
+    def test_the_untag_step_deletes_the_tag_only_while_it_is_on_the_checked_commit_and_leaves_no_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            remote, first, second = self.untag_remote(tmp)
+            self.assertEqual(self.remote_tags(remote), ['install-7'])
+            done, shm = self.run_untag(tmp, remote, {'SERIAL': '7', 'TAG_SHA': second})  # the tag moved since the check: the lease refuses
+            self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertEqual(self.remote_tags(remote), ['install-7'])  # still there
+            self.assertEqual(list(shm.iterdir()), [])  # the key is gone on the failure path too
+            self.assertNotIn('THROWAWAY-TAG-KEY', done.stdout + done.stderr)
+            done, shm = self.run_untag(tmp, remote, {'SERIAL': '7', 'TAG_SHA': first})  # control: the checked commit
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertEqual(self.remote_tags(remote), [])
+            self.assertEqual(done.stdout.strip().splitlines()[-1], f'deleted tag install-7 at {first}')
+            self.assertEqual(list(shm.iterdir()), [])
+            self.assertNotIn('THROWAWAY-TAG-KEY', done.stdout + done.stderr)
+
+    @unittest.skipUnless(os.path.exists(fp.GIT), 'git is missing')
+    def test_the_untag_step_removes_exactly_the_named_tag_and_nothing_else(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            remote, first, _ = self.untag_remote(tmp)
+            subprocess.run([fp.GIT, '-C', str(remote), 'tag', 'install-70', first], env=self.SCRATCH_GIT, check=True)
+            heads = subprocess.run([fp.GIT, '-C', str(remote), 'rev-parse', 'release'], env=self.SCRATCH_GIT, check=True, capture_output=True, text=True).stdout
+            done, _ = self.run_untag(tmp, remote, {'SERIAL': '7', 'TAG_SHA': first})
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertEqual(self.remote_tags(remote), ['install-70'])  # a longer name is another tag
+            self.assertEqual(subprocess.run([fp.GIT, '-C', str(remote), 'rev-parse', 'release'], env=self.SCRATCH_GIT, check=True,
+                                            capture_output=True, text=True).stdout, heads)  # the branch is untouched
+
+    @unittest.skipUnless(os.path.exists(fp.GIT), 'git is missing')
+    def test_the_untag_step_takes_digits_and_a_full_lower_case_sha_only_and_touches_nothing_otherwise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            remote, first, _ = self.untag_remote(tmp)
+            for what, env in (('no serial', {'SERIAL': '', 'TAG_SHA': first}), ('a serial with a path', {'SERIAL': '7/../7', 'TAG_SHA': first}),
+                              ('no sha', {'SERIAL': '7', 'TAG_SHA': ''}), ('a short sha', {'SERIAL': '7', 'TAG_SHA': first[:12]}),
+                              ('a ref name', {'SERIAL': '7', 'TAG_SHA': 'release'}), ('a sha with a space', {'SERIAL': '7', 'TAG_SHA': first + ' x'})):
+                with self.subTest(what):
+                    done, shm = self.run_untag(tmp, remote, env)
+                    self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                    self.assertEqual(self.remote_tags(remote), ['install-7'])
+                    self.assertEqual(list(shm.iterdir()), [])  # it stopped before a key was written
 
 
 if __name__ == '__main__':
