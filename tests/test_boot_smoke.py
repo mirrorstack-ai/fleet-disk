@@ -19,6 +19,8 @@ import smoke_driver as sd  # noqa: E402
 
 TOOLS = bool(shutil.which('ssh-keygen') and shutil.which('openssl')) and os.path.exists(mf.PUB.SSH_KEYGEN)
 WF = (ROOT / '.github' / 'workflows' / 'boot-smoke.yml').read_text()
+INSTALL = (ROOT / '.github' / 'workflows' / 'install.yml').read_text()
+SMOKE = re.search(r'(?ms)^  smoke:\n(.*?)(?=^  [\w-]+:\n|\Z)', INSTALL)[1]   # install.yml's gate: the same smoke over the fleet tip's loaders (AF34)
 
 
 class Fixture(unittest.TestCase):
@@ -127,6 +129,57 @@ class Workflow(unittest.TestCase):
         self.assertEqual(sorted(rows), sorted([('windows-2022', 'true'), ('windows-2025', 'true'), ('ubuntu-24.04', 'true'),
                                                 ('ubuntu-22.04', 'false'), ('macos-15', 'true'), ('macos-15', 'true')]))
         self.assertIn('--must-run', WF)
+
+    # install.yml's `smoke` job runs the same rows and steps over the loaders of the release tip, before `sign` (AF34)
+
+    @staticmethod
+    def smoke_rows(text):
+        """(runner, os, trust, must_run) of install.yml's block-style rows."""
+        return re.findall(r'(?m)^          - runner: ([\w.-]+)(?: +#.*)?\n            os: (\w+)\n            trust: ([\w-]+)\n            must_run: (true|false)\n', text)
+
+    def test_the_release_gate_runs_the_same_rows_as_the_dispatch_but_the_experimental_one(self):
+        gate = self.smoke_rows(SMOKE)
+        dispatch = [r for r in re.findall(r'runner: ([a-z0-9.-]+), os: (\w+), trust: ([\w-]+), must_run: (true|false), experimental: (true|false)', WF)
+                    if r[4] == 'false']
+        self.assertEqual(len(gate), 5)
+        self.assertEqual(gate, [r[:4] for r in dispatch])   # a row changed in one file and not the other fails here
+        self.assertEqual(SMOKE.count('          - runner:'), len(gate))   # no row in another shape
+        self.assertNotIn('experimental', SMOKE)
+        self.assertNotIn('keychain', SMOKE)
+
+    def test_only_the_designed_refusal_may_skip_the_cases_in_the_release_gate(self):
+        self.assertEqual(sorted((r[0], r[3]) for r in self.smoke_rows(SMOKE)),
+                         sorted([('windows-2022', 'true'), ('windows-2025', 'true'), ('ubuntu-24.04', 'true'), ('ubuntu-22.04', 'false'), ('macos-15', 'true')]))
+        self.assertEqual(len(re.findall(r'os: ps1', SMOKE)), 2)
+        self.assertEqual(set(re.findall(r'runner: ([a-z0-9.-]+)', SMOKE)), {'windows-2022', 'windows-2025', 'ubuntu-24.04', 'ubuntu-22.04', 'macos-15'})
+        self.assertIn('[ "$BOOT_MUST" = true ] && flag=(--must-run)', SMOKE)
+        self.assertIn('BOOT_MUST: ${{ matrix.must_run }}', SMOKE)
+        self.assertIn('--os "$BOOT_OS" "${flag[@]}"', SMOKE)
+
+    def test_the_release_gate_and_the_dispatch_run_the_same_driver_and_trust_steps(self):
+        for step in ('python tests/fixture/smoke_driver.py probe', 'python tests/fixture/smoke_driver.py control --dir fixture --phase before',
+                     'python tests/fixture/smoke_driver.py control --dir fixture --phase after',
+                     'Import-Certificate -FilePath fixture\\tls\\ca.cer -CertStoreLocation Cert:\\LocalMachine\\Root',
+                     'sudo cp fixture/tls/ca.crt /usr/local/share/ca-certificates/fleet-smoke.crt && sudo update-ca-certificates',
+                     'echo "CURL_CA_BUNDLE=$GITHUB_WORKSPACE/fixture/tls/ca.crt" >> "$GITHUB_ENV"',
+                     'python tests/fixture/smoke_driver.py fixture --dir fixture --os "$BOOT_OS" "${flag[@]}"'):
+            self.assertIn(step + '\n', WF)   # the whole line: a flag added to one copy is not "the same step"
+            self.assertIn(step + '\n', SMOKE)
+        for cond in ("if: matrix.trust != 'none'", "if: matrix.trust == 'root-store'", "if: matrix.trust == 'ca-certificates'",
+                     "if: matrix.trust == 'curl-ca-bundle'"):
+            self.assertIn(cond, SMOKE)
+            self.assertIn(cond, WF)
+        self.assertEqual(SMOKE.count("if: matrix.trust != 'none'"), 2)   # before and after the trust step
+
+    def test_the_release_gate_builds_the_fixture_from_the_loaders_it_was_handed(self):
+        self.assertIn('make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh', SMOKE)
+        self.assertNotIn('--boot-dir', SMOKE)   # the tip's folder is not in this checkout: only the two files cross
+        self.assertNotIn('--no-verify', SMOKE)
+        self.assertIn('name: loaders', SMOKE)
+
+    def test_the_dispatch_stays_and_keeps_the_experimental_row(self):  # its no-loader failure is pinned by the plan-step tests above
+        self.assertIn('workflow_dispatch:', WF)
+        self.assertIn('keychain, must_run: true, experimental: true', WF)   # the experimental row stays here, not in the gate
 
     def test_the_manual_input_is_matched_whole_and_written_without_echo(self):
         plan = WF[WF.index('id: plan'):WF.index('python3 tests/fixture/make_fixture.py')]

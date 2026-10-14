@@ -1,10 +1,16 @@
-# Signs and publishes the fleet's install set from the release folder of the fleet repository's `release` branch, in five
+# Signs and publishes the fleet's install set from the release folder of the fleet repository's `release` branch, in six
 # jobs and only on this repo's `release` branch (the Environment `release` allows no other):
 #   plan     reads release/install-<serial>/ from the fleet `release` tip as git blobs (deploy key FLEET_READ) and runs
 #            every offline check but the signatures, then the read-only GitHub checks (a release or leftover draft of the tag,
 #            the serial and pin against the newest release, the Immutable setting), so a refusal comes before anything is signed.
 #            Its token is contents: read, which may not list a draft release: `draft-left` is only certain in publish (README).
-#   sign     runs no repository code and no third-party action: holds SIGN_KEY only in memory, refuses unless its
+#            After the checks it reads the two bootstraps from the release tip as git blobs (LF; the checked-out ps1 is CRLF) and
+#            hands only those two to `smoke` as the artifact `loaders` (they become public release assets anyway, D317).
+#   smoke    runs the boot smoke over those two bootstraps on hosted Windows, Ubuntu and macOS runners (the fixture builder, a
+#            local HTTPS copy of the release layout signed with a throwaway key; tests/fixture): no secret, no Environment, no
+#            token scope. A red run stops everything after it: `sign` needs it, so nothing is signed over a loader that does
+#            not refuse what it must refuse. It proves the pipeline in VMs (no /dev/kvm: the good run ends in `kvm`), not the install.
+#   sign     needs plan and smoke; runs no repository code and no third-party action: holds SIGN_KEY only in memory, refuses unless its
 #            fingerprint is KEY_SHA256 below, signs the three files, verifies them and wipes the key.
 #   kit      puts the bundle and the gateway record on the kit host. It holds only FLEET_READ and KIT_UPLOAD_KEY (the Ed25519
 #            key whose signature the host takes; it has no Cloudflare power at all). It rebuilds the bundle from the fleet
@@ -112,6 +118,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           IMMUTABLE_CONFIRMED: ${{ steps.immutable.outputs.immutable }}
         run: python3 bin/fleet-install-publish.py plan "$RUNNER_TEMP/fleet" --serial "$SERIAL" --min-serial "$MIN_SERIAL" --out "$RUNNER_TEMP/out"
+      - id: loaders
+        env:
+          SERIAL: ${{ steps.plan.outputs.serial }}
+          TIP: ${{ steps.plan.outputs.tip }}
+        run: |
+          set -eu
+          case "$SERIAL" in '' | *[!0-9]*) echo 'REFUSED loader serial'; exit 1;; esac
+          case "$TIP" in *[!0-9a-f]*) echo 'REFUSED loader tip'; exit 1;; esac
+          [ "${#TIP}" = 40 ] || { echo 'REFUSED loader tip'; exit 1; }
+          mkdir "$RUNNER_TEMP/loaders"
+          for f in bootstrap.sh bootstrap.ps1; do
+            git -C "$RUNNER_TEMP/fleet" show "$TIP:release/install-$SERIAL/$f" > "$RUNNER_TEMP/loaders/$f" || { echo "REFUSED loader $f"; exit 1; }
+            [ -s "$RUNNER_TEMP/loaders/$f" ] || { echo "REFUSED loader $f"; exit 1; }
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: loaders
+          path: ${{ runner.temp }}/loaders
+          retention-days: 1
+          if-no-files-found: error
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -141,9 +167,74 @@ jobs:
           path: ${{ runner.temp }}/out
           include-hidden-files: true
           retention-days: 1
-  sign:
+  smoke:
     needs: plan
-    if: ${{ !cancelled() && github.ref == 'refs/heads/release' && (inputs.mode == 'pubkey' || needs.plan.result == 'success') }}
+    if: github.ref == 'refs/heads/release' && inputs.mode == 'sign'
+    name: smoke ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            os: ps1
+            trust: root-store
+            must_run: true
+          - runner: windows-2025
+            os: ps1
+            trust: root-store
+            must_run: true
+          - runner: ubuntu-24.04
+            os: sh
+            trust: ca-certificates
+            must_run: true
+          - runner: ubuntu-22.04      # refuses `os` before any network: no trust needed
+            os: sh
+            trust: none
+            must_run: false
+          - runner: macos-15
+            os: sh
+            trust: curl-ca-bundle
+            must_run: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: loaders
+          path: loaders
+      - run: python tests/fixture/make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh
+      - run: python tests/fixture/smoke_driver.py probe
+      - if: matrix.trust != 'none'
+        run: python tests/fixture/smoke_driver.py control --dir fixture --phase before
+      - if: matrix.trust == 'root-store'
+        shell: pwsh
+        run: Import-Certificate -FilePath fixture\tls\ca.cer -CertStoreLocation Cert:\LocalMachine\Root
+      - if: matrix.trust == 'ca-certificates'
+        run: sudo cp fixture/tls/ca.crt /usr/local/share/ca-certificates/fleet-smoke.crt && sudo update-ca-certificates
+      - if: matrix.trust == 'curl-ca-bundle'
+        run: echo "CURL_CA_BUNDLE=$GITHUB_WORKSPACE/fixture/tls/ca.crt" >> "$GITHUB_ENV"
+      - if: matrix.trust != 'none'
+        run: python tests/fixture/smoke_driver.py control --dir fixture --phase after
+      - env:
+          BOOT_OS: ${{ matrix.os }}
+          BOOT_MUST: ${{ matrix.must_run }}
+        run: |
+          flag=()
+          [ "$BOOT_MUST" = true ] && flag=(--must-run)
+          python tests/fixture/smoke_driver.py fixture --dir fixture --os "$BOOT_OS" "${flag[@]}"
+  sign:
+    needs: [plan, smoke]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/release' && (inputs.mode == 'pubkey' || (needs.plan.result == 'success' && needs.smoke.result == 'success')) }}
     environment: release
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -195,7 +286,7 @@ jobs:
           printf 'pub=%s\n' "$pub" >> "$GITHUB_OUTPUT"
           echo "signed with key $fp"
   kit:
-    needs: [plan, sign]
+    needs: [plan, smoke, sign]
     if: github.ref == 'refs/heads/release'
     environment: release
     runs-on: ubuntu-24.04
@@ -233,7 +324,7 @@ jobs:
           python3 bin/fleet-kit-upload.py bundle "$d/install" --owner-pub "$d/owner.pub"
           python3 bin/fleet-kit-upload.py gateway --owner-pub "$d/owner.pub"
   tag:
-    needs: [plan, sign, kit]
+    needs: [plan, smoke, sign, kit]
     if: github.ref == 'refs/heads/release'
     environment: release
     runs-on: ubuntu-24.04
@@ -257,7 +348,7 @@ jobs:
           [ "$(git -C "$d/repo" rev-parse FETCH_HEAD)" = "$GITHUB_SHA" ]
           git -C "$d/repo" push -q "git@github.com:$GITHUB_REPOSITORY.git" "$GITHUB_SHA:refs/tags/install-$SERIAL"
   publish:
-    needs: [plan, sign, kit, tag]
+    needs: [plan, smoke, sign, kit, tag]
     if: github.ref == 'refs/heads/release'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
