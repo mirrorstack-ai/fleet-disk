@@ -2712,30 +2712,30 @@ class Readme(unittest.TestCase):
 class Workflow(unittest.TestCase):
     TEXT = (ROOT / '.github/workflows/install.yml').read_text(encoding='utf-8')
     DISK = (ROOT / '.github/workflows/disk.yml').read_text(encoding='utf-8')
-    JOBS = {m[1]: m[2] for m in re.finditer(r'(?ms)^  (plan|smoke|sign|kit|tag|publish|floor-approve|floor):\n(.*?)(?=^  [\w-]+:\n|\Z)',
+    JOBS = {m[1]: m[2] for m in re.finditer(r'(?ms)^  (plan|fixture|smoke|sign|kit|tag|publish|floor-approve|floor):\n(.*?)(?=^  [\w-]+:\n|\Z)',
                                             TEXT.split('\njobs:\n', 1)[1])}
 
-    def test_it_is_a_release_branch_dispatch_of_six_jobs_and_a_floor_job(self):
+    def test_it_is_a_release_branch_dispatch_of_seven_jobs_and_a_floor_job(self):
         self.assertRegex(self.TEXT, r'(?m)^on:\n  workflow_dispatch:\n    inputs:\n      mode:\n')
         self.assertEqual(re.findall(r'(?m)^      (\w+):\n        (?:description|required)', self.TEXT),
                          ['mode', 'serial', 'min_serial', 'floor'])
         self.assertRegex(self.TEXT, r'(?m)^        options: \[sign, pubkey, floor\]\n        default: sign\n')
-        self.assertEqual(list(self.JOBS), ['plan', 'smoke', 'sign', 'kit', 'tag', 'publish', 'floor-approve', 'floor'])
+        self.assertEqual(list(self.JOBS), ['plan', 'fixture', 'smoke', 'sign', 'kit', 'tag', 'publish', 'floor-approve', 'floor'])
         self.assertEqual(re.findall(r'(?m)^  ([\w-]+):$', self.TEXT.split('\njobs:\n', 1)[1]), list(self.JOBS))  # and no other job
         for bad in ('pull_request', 'push:', 'self-hosted', 'refs/heads/main', 'actions/cache'):
             self.assertNotIn(bad, self.TEXT)
         for name, job in self.JOBS.items():
             self.assertIn("github.ref == 'refs/heads/release'", job.split('steps:')[0], name)
         self.assertEqual(re.findall(r'runs-on: (.+)', self.TEXT),
-                         ['ubuntu-24.04', '${{ matrix.runner }}'] + ['ubuntu-24.04'] * 6)  # the smoke job is the only hosted-matrix one
+                         ['ubuntu-24.04', 'ubuntu-24.04', '${{ matrix.runner }}'] + ['ubuntu-24.04'] * 6)  # the smoke job is the only hosted-matrix one; the fixture is built once on ubuntu
         self.assertEqual([re.findall(r'(?m)^    environment: (\S+)$', j) for j in self.JOBS.values()],
-                         [['release'], [], ['release'], ['release'], ['release'], [], ['kit-floor'], ['release']])  # smoke and publish have none: no secret, no variable of release
+                         [['release'], [], [], ['release'], ['release'], ['release'], [], ['kit-floor'], ['release']])  # fixture, smoke and publish have none: no secret, no variable of release
 
     def test_only_publish_writes_and_only_contents_and_sign_and_tag_hold_no_token(self):
         self.assertRegex(self.TEXT, r'(?m)^permissions:\n  contents: read\n')
         self.assertEqual(re.findall(r'(\w[\w-]*): write', self.TEXT), ['contents'])
         self.assertIn('    permissions:\n      contents: write\n', self.JOBS['publish'])
-        for name in ('smoke', 'sign', 'tag'):
+        for name in ('fixture', 'smoke', 'sign', 'tag'):
             self.assertTrue('    permissions: {}\n' in self.JOBS[name] and 'github.token' not in self.JOBS[name])
 
     def test_each_secret_is_read_by_one_job_and_the_sign_and_tag_jobs_run_no_action_and_no_repository_code(self):
@@ -2746,6 +2746,7 @@ class Workflow(unittest.TestCase):
             self.assertEqual(re.findall(r'secrets\.(\w+)', self.JOBS[name]), secrets)
         self.assertNotIn('secrets.', self.JOBS['publish'])
         self.assertNotIn('secrets.', self.JOBS['smoke'])
+        self.assertNotIn('secrets.', self.JOBS['fixture'])
         for name in ('sign', 'tag'):
             for bad in ('uses:', 'checkout', 'fleet-install-publish', 'python', 'RUNNER_WORKSPACE', 'GITHUB_WORKSPACE'):
                 self.assertNotIn(bad, self.JOBS[name], name)
@@ -2797,7 +2798,7 @@ class Workflow(unittest.TestCase):
             self.assertIn(need, step)
         self.assertEqual(self.declared_outputs('plan')['immutable'], ('immutable', 'immutable'))  # still handed to publish
         self.assertIn('IMMUTABLE_CONFIRMED: ${{ needs.plan.outputs.immutable }}', self.JOBS['publish'])
-        self.assertEqual(len(self.JOBS), 8)  # seven and the smoke (AF34); AF08's gateway-sign job is still parked
+        self.assertEqual(len(self.JOBS), 9)  # seven, the smoke and its fixture (AF34); AF08's gateway-sign job is still parked
         self.assertEqual(re.findall(r'vars\.(\w+)', self.TEXT), ['IMMUTABLE_RELEASES_CONFIRMED'])
 
     def test_the_plan_job_reads_the_fleet_over_ssh_with_the_pinned_host_key_and_the_tag_job_never_forces(self):
@@ -2842,7 +2843,7 @@ class Workflow(unittest.TestCase):
 
     def test_each_job_needs_exactly_the_jobs_before_it(self):
         needs = {name: re.findall(r'(?m)^    needs: (.*)$', job) for name, job in self.JOBS.items()}
-        self.assertEqual(needs, {'plan': [], 'smoke': ['plan'], 'sign': ['[plan, smoke]'], 'kit': ['[plan, smoke, sign]'],
+        self.assertEqual(needs, {'plan': [], 'fixture': ['plan'], 'smoke': ['[plan, fixture]'], 'sign': ['[plan, smoke]'], 'kit': ['[plan, smoke, sign]'],
                                  'tag': ['[plan, smoke, sign, kit]'], 'publish': ['[plan, smoke, sign, kit, tag]'],
                                  'floor-approve': [], 'floor': ['floor-approve']})
 
@@ -2990,11 +2991,11 @@ class Workflow(unittest.TestCase):
                   ('ubuntu-24.04', 'sh', 'ca-certificates', 'true'), ('ubuntu-22.04', 'sh', 'none', 'false'),
                   ('macos-15', 'sh', 'curl-ca-bundle', 'true')]
 
-    def test_the_smoke_job_holds_nothing_and_runs_the_designed_rows_over_the_loaders_artifact(self):
+    def test_the_smoke_job_holds_nothing_and_runs_the_designed_rows_over_the_fixture_artifact(self):
         smoke = self.JOBS['smoke']
         head = smoke.split('steps:')[0]
         self.assertIn("if: github.ref == 'refs/heads/release' && inputs.mode == 'sign'\n", head)
-        self.assertIn('    needs: plan\n', head)
+        self.assertIn('    needs: [plan, fixture]\n', head)   # the fixture is built once, before the legs
         self.assertIn('    runs-on: ${{ matrix.runner }}\n', head)
         self.assertIn('    timeout-minutes: 25\n', head)   # a hung hosted leg must not hold the release for the 360 minute default
         self.assertIn('    strategy:\n      fail-fast: false\n      matrix:\n        include:\n', head)   # one red leg must not cancel the others' per-OS evidence
@@ -3011,14 +3012,44 @@ class Workflow(unittest.TestCase):
         self.assertEqual(re.findall(r'uses: (\S+)', smoke),
                          ['actions/checkout@11d5960a326750d5838078e36cf38b85af677262', 'actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065',
                           'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093'])
-        self.assertIn('          name: loaders\n          path: loaders\n', smoke)
-        self.assertIn('python tests/fixture/make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh\n', smoke)
-        self.assertLess(smoke.index('make_fixture.py'), smoke.index('smoke_driver.py probe'))
+        self.assertIn('          name: fixture\n          path: fixture\n', smoke)   # it downloads the fixture; it builds none, and holds no loader
+        self.assertNotIn('make_fixture', smoke)
+        self.assertNotIn('loaders', smoke)
+        self.assertLess(smoke.index('name: fixture'), smoke.index('smoke_driver.py probe'))
         for need in ('smoke_driver.py control --dir fixture --phase before', 'smoke_driver.py control --dir fixture --phase after',
                      'smoke_driver.py fixture --dir fixture --os "$BOOT_OS" "${flag[@]}"', '[ "$BOOT_MUST" = true ] && flag=(--must-run)',
                      'BOOT_OS: ${{ matrix.os }}', 'BOOT_MUST: ${{ matrix.must_run }}'):
             self.assertIn(need, smoke)
         self.assertEqual(smoke.count('persist-credentials: false'), 1)
+
+    # the fixture is built once on ubuntu and shipped to every leg, as boot-smoke.yml does (run 38633686710: built per leg it was
+    # REFUSED tool on macos-15 and REFUSED verify on windows-2022 and windows-2025; the dispatch shape ran 7/7 green, run 38514272677)
+
+    @staticmethod
+    def steps_of(job: str) -> list[str]:
+        """The text of each `      - ` step of a job, in order."""
+        return re.findall(r'(?ms)^      - .*?(?=^      - |\Z)', job.split('    steps:\n', 1)[1])
+
+    def test_the_fixture_job_builds_it_once_on_ubuntu_from_the_loaders_and_holds_nothing(self):
+        fixture = self.JOBS['fixture']
+        head, body = fixture.split('    steps:\n', 1)
+        self.assertEqual(head, "    needs: plan\n    if: github.ref == 'refs/heads/release' && inputs.mode == 'sign'\n"
+                                "    runs-on: ubuntu-24.04\n    timeout-minutes: 10\n    permissions: {}\n")   # no matrix, no environment, no token scope
+        for bad in ('secrets.', 'vars.', 'environment', 'github.token', 'GH_TOKEN', 'needs.', 'outputs:', 'install-stage',
+                    'FLEET_READ', 'continue-on-error', 'self-hosted', 'actions/cache', 'matrix', '--boot-dir'):
+            self.assertNotIn(bad, fixture, bad)
+        self.assertEqual(re.findall(r'uses: (\S+)', fixture),
+                         ['actions/checkout@11d5960a326750d5838078e36cf38b85af677262', 'actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065',
+                          'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093', 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02'])
+        self.assertIn('          name: loaders\n          path: loaders\n', fixture)
+        self.assertEqual(re.findall(r'(?m)^      - run: (.*)$', fixture),
+                         ['python3 tests/fixture/make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh'])
+        self.assertNotIn('inputs.', body)   # the dispatch inputs reach it through no step
+        self.assertEqual(fixture.count('persist-credentials: false'), 1)
+        self.assertLess(fixture.index('name: loaders'), fixture.index('make_fixture.py'))
+        self.assertLess(fixture.index('make_fixture.py'), fixture.index('name: fixture'))
+        self.assertLess(self.TEXT.index('\n  plan:\n'), self.TEXT.index('\n  fixture:\n'))
+        self.assertLess(self.TEXT.index('\n  fixture:\n'), self.TEXT.index('\n  smoke:\n'))
 
     def test_a_red_smoke_stops_the_signature_and_every_job_after_it(self):
         for name in ('sign', 'kit', 'tag', 'publish'):
@@ -3026,12 +3057,14 @@ class Workflow(unittest.TestCase):
         sign = self.JOBS['sign']
         self.assertIn("needs.smoke.result == 'success'", sign)   # the status check is not left to the default: sign runs with !cancelled()
         self.assertLess(sign.index("needs.plan.result == 'success'"), sign.index("needs.smoke.result == 'success'"))
-        for name in ('floor-approve', 'floor'):   # the floor mode never waits for a smoke
+        for name in ('floor-approve', 'floor'):   # the floor mode never waits for a smoke or its fixture
             self.assertNotIn('smoke', self.JOBS[name])
+            self.assertNotIn('fixture', self.JOBS[name])
+        self.assertNotIn('fixture', sign.split('steps:')[0])   # sign reaches the fixture through smoke, which needs it
         self.assertLess(self.TEXT.index('\n  plan:\n'), self.TEXT.index('\n  smoke:\n'))
         self.assertLess(self.TEXT.index('\n  smoke:\n'), self.TEXT.index('\n  sign:\n'))
 
-    def test_the_plan_job_hands_only_the_two_loaders_to_the_smoke(self):
+    def test_the_plan_job_hands_only_the_two_loaders_to_the_fixture_job(self):
         plan = self.JOBS['plan']
         self.assertEqual(re.findall(r'(?m)^          name: (\S+)$', plan), ['loaders', 'install-stage'])
         up = re.search(r'(?ms)^      - uses: actions/upload-artifact@\w+ +# v4\.6\.2\n        with:\n          name: loaders\n(.*?)(?=^      - |\Z)', plan)

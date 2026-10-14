@@ -53,7 +53,7 @@ refused as unlisted.
 
 Actions, then `install`, then Run workflow on the `release` branch (the only ref the jobs accept) with `serial` and
 `min_serial` (the lowest serial this publish may carry, normally the previous release's); `mode` pubkey only prints the
-signing key's public line and fingerprint, and `mode` floor runs only the floor job (below). Six jobs run in order:
+signing key's public line and fingerprint, and `mode` floor runs only the floor job (below). Seven jobs run in order:
 
 - **plan** (Environment `release`, read-only deploy key `FLEET_READ` on the fleet repository, held in `/dev/shm` and wiped
   by a trap on every path) reads the folder from the fleet `release` tip as git blobs, never a checkout. It refuses unless the folder is exactly the files above as plain files, the
@@ -64,11 +64,16 @@ signing key's public line and fingerprint, and `mode` floor runs only the floor 
   and a `diff --stat` of `.github`, `bin` and `vendor` since the last `install-*` tag (hashes and public files only: these
   logs are public). When the previous release's `source_head` cannot be read or its range cannot be listed the summary says
   `UNKNOWN` and lists the newest 200 fleet commits, never an empty list. The three files to sign leave as base64 outputs with their sha256, the folder as an artifact.
-- **smoke** (no Environment, no secret, `permissions: {}`, hosted runners) runs the boot smoke (below) over the release tip's two
-  loaders on `windows-2022`, `windows-2025`, `ubuntu-24.04`, `ubuntu-22.04` and `macos-15`, before anything is signed: `sign` and
-  every job after it need it, so a red smoke stops the release. The plan's `loaders` step reads `bootstrap.sh` and `bootstrap.ps1`
-  from the tip with `git show` (the LF blobs; the checked-out ps1 is CRLF) and uploads only those two as the artifact `loaders`
-  (they become public release assets anyway; ledger D317). A missing or empty loader fails the plan.
+- **fixture** (no Environment, no secret, `permissions: {}`, `ubuntu-24.04`) downloads the artifact `loaders` and runs
+  `tests/fixture/make_fixture.py` once, on ubuntu, as the fixture job of `boot-smoke.yml` does, then uploads the tree as the
+  artifact `fixture`. The plan's `loaders` step reads `bootstrap.sh` and `bootstrap.ps1` from the tip with `git show` (the LF
+  blobs; the checked-out ps1 is CRLF) and uploads only those two as the artifact `loaders` (they become public release assets
+  anyway; ledger D317). A missing or empty loader fails the plan. Building the fixture on every leg was refused on `macos-15`
+  (`REFUSED tool`) and on both Windows legs (`REFUSED verify`), run 38633686710, so no leg builds it.
+- **smoke** (needs plan and fixture; no Environment, no secret, `permissions: {}`, hosted runners) downloads the artifact `fixture` and
+  runs the boot smoke (below) over the release tip's two loaders on `windows-2022`, `windows-2025`, `ubuntu-24.04`, `ubuntu-22.04`
+  and `macos-15`, before anything is signed: `sign` and every job after it need it, so a red smoke (or a failed fixture, which skips
+  it) stops the release.
 - **sign** (Environment `release`, secret `SIGN_KEY`) runs no repository code and no third-party action. It keeps the key in
   `/dev/shm`, refuses unless `ssh-keygen -lf` of it equals the constant `KEY_SHA256` in `install.yml` (so it refuses while
   that is a placeholder), re-hashes the bytes against the plan's sha256, signs `install.json` (namespace
@@ -366,8 +371,8 @@ changed; hosted runners are VMs, so this proves the pipeline, not hardware. `pyt
 network access to python.org for the ZIP, or `--python-zip PATH`).
 
 The gate that matters is the `smoke` job of `install.yml` (above): the release folder is committed only in the fleet repository,
-so the plan fetches the loaders from the fleet `release` tip, and each runner builds its own fixture from them with
-`make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh` and runs the same steps and rows as this
+so the plan fetches the loaders from the fleet `release` tip, the `fixture` job builds one fixture from them on ubuntu with
+`make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh`, and every runner downloads it and runs the same steps and rows as this
 workflow, minus the experimental `keychain` row. `boot-smoke.yml` stays as a dispatch and as a PR-path trigger (`release/install-*/bootstrap.*`, which now rarely fires, and edits of the builder and the
 driver); a dispatch that finds no complete pair fails. The smoke ends the good run in `kvm` on a hosted runner (no `/dev/kvm`),
 and never runs the install itself.

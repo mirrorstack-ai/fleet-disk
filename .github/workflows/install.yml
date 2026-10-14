@@ -1,16 +1,19 @@
-# Signs and publishes the fleet's install set from the release folder of the fleet repository's `release` branch, in six
+# Signs and publishes the fleet's install set from the release folder of the fleet repository's `release` branch, in seven
 # jobs and only on this repo's `release` branch (the Environment `release` allows no other):
 #   plan     reads release/install-<serial>/ from the fleet `release` tip as git blobs (deploy key FLEET_READ) and runs
 #            every offline check but the signatures, then the read-only GitHub checks (a release or leftover draft of the tag,
 #            the serial and pin against the newest release, the Immutable setting), so a refusal comes before anything is signed.
 #            Its token is contents: read, which may not list a draft release: `draft-left` is only certain in publish (README).
 #            After the checks it reads the two bootstraps from the release tip as git blobs (LF; the checked-out ps1 is CRLF) and
-#            hands only those two to `smoke` as the artifact `loaders` (they become public release assets anyway, D317).
-#   smoke    runs the boot smoke over those two bootstraps on hosted Windows, Ubuntu and macOS runners (the fixture builder, a
-#            local HTTPS copy of the release layout signed with a throwaway key; tests/fixture): no secret, no Environment, no
-#            token scope. A red run stops everything after it: `sign` needs it, so nothing is signed over a loader that does
+#            hands only those two to `fixture` as the artifact `loaders` (they become public release assets anyway, D317).
+#   fixture  builds the boot smoke's fixture ONCE on ubuntu-24.04 from those two loaders (tests/fixture/make_fixture.py: a local HTTPS
+#            copy of the release layout signed with a throwaway key) and hands the tree on as the artifact `fixture`, the shape
+#            boot-smoke.yml runs. Building it on every leg failed on macOS (`REFUSED tool`) and Windows (`REFUSED verify`), run
+#            38633686710. No secret, no Environment, no token scope.
+#   smoke    runs the boot smoke over that fixture on hosted Windows, Ubuntu and macOS runners (the driver, tests/fixture): no secret,
+#            no Environment, no token scope. A red run stops everything after it: `sign` needs it, so nothing is signed over a loader that does
 #            not refuse what it must refuse. It proves the pipeline in VMs (no /dev/kvm: the good run ends in `kvm`), not the install.
-#   sign     needs plan and smoke; runs no repository code and no third-party action: holds SIGN_KEY only in memory, refuses unless its
+#   sign     needs plan and smoke (which needs fixture); runs no repository code and no third-party action: holds SIGN_KEY only in memory, refuses unless its
 #            fingerprint is KEY_SHA256 below, signs the three files, verifies them and wipes the key.
 #   kit      puts the bundle and the gateway record on the kit host. It holds only FLEET_READ and KIT_UPLOAD_KEY (the Ed25519
 #            key whose signature the host takes; it has no Cloudflare power at all). It rebuilds the bundle from the fleet
@@ -167,8 +170,32 @@ jobs:
           path: ${{ runner.temp }}/out
           include-hidden-files: true
           retention-days: 1
-  smoke:
+  fixture:
     needs: plan
+    if: github.ref == 'refs/heads/release' && inputs.mode == 'sign'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: loaders
+          path: loaders
+      - run: python3 tests/fixture/make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: fixture
+          path: fixture
+          retention-days: 1
+          if-no-files-found: error
+  smoke:
+    needs: [plan, fixture]
     if: github.ref == 'refs/heads/release' && inputs.mode == 'sign'
     name: smoke ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
@@ -210,9 +237,8 @@ jobs:
           python-version: "3.12"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
-          name: loaders
-          path: loaders
-      - run: python tests/fixture/make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh
+          name: fixture
+          path: fixture
       - run: python tests/fixture/smoke_driver.py probe
       - if: matrix.trust != 'none'
         run: python tests/fixture/smoke_driver.py control --dir fixture --phase before
