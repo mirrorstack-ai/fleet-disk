@@ -189,6 +189,9 @@ SIGNED = (('install', 'install.json', NS), ('kit', 'kit.json', PIN_NS), ('pin', 
 OS_BOOT = {'win': 'ps1', 'mac': 'sh', 'ubuntu': 'sh'}  # the bootstrap each OS's line runs
 _CURL = "-fsSL --max-redirs 3 --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 120"
 _NOT_RUN = 'Nothing was run. Tell the owner.'
+# the two sentences the fleet's line.py (AF18) adds to the Ubuntu and Windows check lines; held equal by hand and by the literal tests
+_NO_CURL = 'curl is missing, or is the snap one. Run: sudo apt install curl, then paste the line again. Nothing was run.'
+_MANAGED = 'A group policy sets the PowerShell execution policy on this PC, so the file cannot run. ' + _NOT_RUN
 
 
 class Io(Protocol):
@@ -566,25 +569,33 @@ def check_pin_floor(io: Io, env: dict[str, str], tag: str, serial: int) -> None:
 
 
 def check_line(os_name: str, repo: str, serial: int, sha256: str, min_serial: int) -> str:
-    """The paste text for os_name: download to a fresh temp file, compare the sha256, run, delete. Byte for byte the
-    fleet's `check` line (a test pins one), so the line a helper gets from the release page is the one the fleet makes."""
+    """The paste text for os_name: download to a fresh temp file, compare the sha256, run, delete. It is the fleet's
+    `check` line (`fleet.install.line.render`, AF18) with this repository's URL: the Ubuntu line refuses a missing or
+    snap curl (`REFUSED tools`), the Windows line a PC whose group policy sets the execution policy (`REFUSED policy`),
+    the Mac line has neither. No test crosses the two repositories: the two texts are held equal by hand and by the
+    literal tests (`ReleaseBody`), each copied from the fleet's render, so a change there is made here by hand."""
     url = f'https://github.com/{repo}/releases/download/install-{serial}/bootstrap.{OS_BOOT[os_name]}'
     if os_name == 'win':
         return ("$f = Join-Path $env:TEMP ('mirrorstack-' + [guid]::NewGuid().ToString('N') + '.ps1'); "
                 f"& \"$env:SystemRoot\\System32\\curl.exe\" {_CURL} --max-filesize 262144 -o $f '{url}'; "
                 f"if ($LASTEXITCODE -ne 0) {{ 'REFUSED fetch'; 'The download failed. {_NOT_RUN}'; $rc = 1 }} "
                 f"elseif ((Get-FileHash -Algorithm SHA256 $f).Hash -eq '{sha256}') "
-                f"{{ powershell -NoProfile -ExecutionPolicy Bypass -File $f -Serial {serial} -MinSerial {min_serial}; "
-                '$rc = $LASTEXITCODE } '
+                "{ if ((Get-ExecutionPolicy -Scope MachinePolicy) -ne 'Undefined' "
+                "-or (Get-ExecutionPolicy -Scope UserPolicy) -in 'AllSigned', 'Restricted') "
+                f"{{ 'REFUSED policy'; '{_MANAGED}'; $rc = 1 }} "
+                f"else {{ powershell -NoProfile -ExecutionPolicy Bypass -File $f -Serial {serial} -MinSerial {min_serial}; "
+                '$rc = $LASTEXITCODE } } '
                 f"else {{ 'REFUSED boot-hash'; 'The download is not the file the owner signed. {_NOT_RUN}'; $rc = 1 }}; "
                 'Remove-Item -Force -ErrorAction SilentlyContinue $f; cmd /c exit $rc')
     check = 'sha256sum -c -' if os_name == 'ubuntu' else 'shasum -a 256 -c -'
-    return (f'd=$(mktemp -d) && {{ if ! curl {_CURL} --max-filesize 262144 -o "$d/bootstrap.sh" \'{url}\'; '
-            f"then echo 'REFUSED fetch'; echo 'The download failed. {_NOT_RUN}'; rc=1; "
-            f'elif printf \'%s  %s\\n\' \'{sha256}\' "$d/bootstrap.sh" | {check} >/dev/null; '
-            f'then sh "$d/bootstrap.sh" --serial {serial} --min-serial {min_serial}; rc=$?; '
-            f"else echo 'REFUSED boot-hash'; echo 'The download is not the file the owner signed. {_NOT_RUN}'; rc=1; "
-            'fi; rm -rf "$d"; (exit $rc); }')
+    fetch = (f'if ! curl {_CURL} --max-filesize 262144 -o "$d/bootstrap.sh" \'{url}\'; '
+             f"then echo 'REFUSED fetch'; echo 'The download failed. {_NOT_RUN}'; rc=1; "
+             f'elif printf \'%s  %s\\n\' \'{sha256}\' "$d/bootstrap.sh" | {check} >/dev/null; '
+             f'then sh "$d/bootstrap.sh" --serial {serial} --min-serial {min_serial}; rc=$?; '
+             f"else echo 'REFUSED boot-hash'; echo 'The download is not the file the owner signed. {_NOT_RUN}'; rc=1; fi")
+    if os_name == 'ubuntu':  # a stock desktop has no curl and the snap one cannot write the temp file; the Mac line keeps its text
+        fetch = f"c=$(command -v curl); case $c in '' | */snap/*) echo 'REFUSED tools'; echo '{_NO_CURL}'; rc=1 ;; *) {fetch} ;; esac"
+    return f'd=$(mktemp -d) && {{ {fetch}; rm -rf "$d"; (exit $rc); }}'
 
 
 def release_notes(plan: Plan, repo: str) -> str:
