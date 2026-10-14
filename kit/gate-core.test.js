@@ -263,6 +263,37 @@ test('control: a new Gate over the same storage in the same bucket does not prun
   assert.equal(allN(a.storage), 2);
 });
 
+test('a clock that goes backwards still prunes: the guard is "not the last bucket", not "newer than it"', async () => {
+  const bucketOf = (ctx) => Math.floor(ctx.clk.t / LIMITS.bucketMs);
+  const lastPruned = (storage) => Number(storage.db.prepare("SELECT v FROM meta WHERE k = 'fails_pruned'").get().v);
+  const minBucket = (storage) => storage.db.prepare('SELECT COALESCE(MIN(bucket), 0) AS m FROM fails').get().m;
+
+  // A: the clock steps back 3 buckets; the next failure prunes once, then not again.
+  const a = await ready();
+  await dec(a, { tag: TAG2 });
+  a.clk.add(-3 * LIMITS.bucketMs);
+  const seenA = tap(a.storage);
+  await dec(a, { tag: TAG2 });
+  await dec(a, { tag: TAG2 });
+  a.storage.beforeExec = null;
+  assert.equal(seenA.filter((s) => s.q === DEL_FAILS).length, 1, 'one prune after a step back');
+  assert.equal(lastPruned(a.storage), bucketOf(a));
+
+  // B: the clock jumps 400 days ahead and comes back; the stored future bucket must not stop the prune.
+  const b = await ready();
+  await dec(b, { tag: TAG2 });
+  b.clk.add(400 * 24 * H);
+  await dec(b, { tag: TAG2 });
+  b.clk.add(-400 * 24 * H);
+  const seenB = tap(b.storage);
+  await dec(b, { tag: TAG2 });
+  await dec(b, { tag: TAG2 });
+  b.storage.beforeExec = null;
+  assert.equal(seenB.filter((s) => s.q === DEL_FAILS).length, 1, 'one prune after the clock returns');
+  assert.equal(lastPruned(b.storage), bucketOf(b), 'the pruned bucket is the real one, not the future one');
+  assert.ok(minBucket(b.storage) >= bucketOf(b) - 12, 'no row older than keepMs is left');
+});
+
 test('D4: budgets, reservations and invites survive a restart', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'kit-gate-'));
   try {
