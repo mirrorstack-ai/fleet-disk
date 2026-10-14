@@ -2622,19 +2622,62 @@ class PlanJob(unittest.TestCase):
 
 
 class ReleaseBody(unittest.TestCase):
-    UBUNTU = ("d=$(mktemp -d) && { if ! curl -fsSL --max-redirs 3 --proto '=https' --proto-redir '=https' --tlsv1.2 "
-              "--connect-timeout 20 --max-time 120 --max-filesize 262144 -o \"$d/bootstrap.sh\" "
-              "'https://github.com/org/repo/releases/download/install-5/bootstrap.sh'; then echo 'REFUSED fetch'; echo 'The "
-              "download failed. Nothing was run. Tell the owner.'; rc=1; elif printf '%s  %s\\n' '" + 'ab' * 32 + "' "
-              "\"$d/bootstrap.sh\" | sha256sum -c - >/dev/null; then sh \"$d/bootstrap.sh\" --serial 5 --min-serial 3; rc=$?; "
-              "else echo 'REFUSED boot-hash'; echo 'The download is not the file the owner signed. Nothing was run. Tell the "
-              "owner.'; rc=1; fi; rm -rf \"$d\"; (exit $rc); }")
+    """The check line each OS gets on the release page. The fleet's `fleet.install.line.render` (AF18) makes the same
+    text; no test crosses the two repositories, the two are held equal by hand and by these literals, each copied from
+    `line.render(os, 5, 'ab' * 32, 3)` with this repository's URL swapped for org/repo."""
+    SHA = 'ab' * 32
+    # the three literals below are copied from mirrorstack-fleet fleet/install/line.py @77b7fc2 (line.py last changed in e66e08a);
+    # a later fleet edit to the text is made here by hand, and this sha says which fleet text these are
+    UBUNTU = ("d=$(mktemp -d) && { c=$(command -v curl); case $c in '' | */snap/*) echo 'REFUSED tools'; "
+              "echo 'curl is missing, or is the snap one. Run: sudo apt install curl, then paste the line again. Nothing was run.'; "
+              'rc=1 ;; '
+              '*) if ! curl -fsSL --max-redirs 3 --proto \'=https\' --proto-redir \'=https\' --tlsv1.2 --connect-timeout 20 --max-time 120 --max-filesize 262144 -o "$d/bootstrap.sh" \'https://github.com/org/repo/releases/download/install-5/bootstrap.sh\'; '
+              "then echo 'REFUSED fetch'; echo 'The download failed. Nothing was run. Tell the owner.'; rc=1; "
+              "elif printf '%s  %s\\n' '" + SHA + '\' "$d/bootstrap.sh" | sha256sum -c - >/dev/null; '
+              'then sh "$d/bootstrap.sh" --serial 5 --min-serial 3; rc=$?; else echo \'REFUSED boot-hash\'; '
+              "echo 'The download is not the file the owner signed. Nothing was run. Tell the owner.'; rc=1; fi ;; "
+              'esac; rm -rf "$d"; (exit $rc); }')
+
+    MAC = ('d=$(mktemp -d) && { if ! curl -fsSL --max-redirs 3 --proto \'=https\' --proto-redir \'=https\' --tlsv1.2 --connect-timeout 20 --max-time 120 --max-filesize 262144 -o "$d/bootstrap.sh" \'https://github.com/org/repo/releases/download/install-5/bootstrap.sh\'; '
+           "then echo 'REFUSED fetch'; echo 'The download failed. Nothing was run. Tell the owner.'; rc=1; "
+           "elif printf '%s  %s\\n' '" + SHA + '\' "$d/bootstrap.sh" | shasum -a 256 -c - >/dev/null; '
+           'then sh "$d/bootstrap.sh" --serial 5 --min-serial 3; rc=$?; else echo \'REFUSED boot-hash\'; '
+           "echo 'The download is not the file the owner signed. Nothing was run. Tell the owner.'; rc=1; fi; "
+           'rm -rf "$d"; (exit $rc); }')
+
+    WIN = ("$f = Join-Path $env:TEMP ('mirrorstack-' + [guid]::NewGuid().ToString('N') + '.ps1'); "
+           '& "$env:SystemRoot\\System32\\curl.exe" -fsSL --max-redirs 3 --proto \'=https\' --proto-redir \'=https\' --tlsv1.2 --connect-timeout 20 --max-time 120 --max-filesize 262144 -o $f \'https://github.com/org/repo/releases/download/install-5/bootstrap.ps1\'; '
+           "if ($LASTEXITCODE -ne 0) { 'REFUSED fetch'; "
+           "'The download failed. Nothing was run. Tell the owner.'; "
+           "$rc = 1 } elseif ((Get-FileHash -Algorithm SHA256 $f).Hash -eq '" + SHA + "') { if ((Get-ExecutionPolicy -Scope MachinePolicy) -ne 'Undefined' -or (Get-ExecutionPolicy -Scope UserPolicy) -in 'AllSigned', 'Restricted') { 'REFUSED policy'; "
+           "'A group policy sets the PowerShell execution policy on this PC, so the file cannot run. Nothing was run. Tell the owner.'; "
+           '$rc = 1 } else { powershell -NoProfile -ExecutionPolicy Bypass -File $f -Serial 5 -MinSerial 3; '
+           "$rc = $LASTEXITCODE } } else { 'REFUSED boot-hash'; "
+           "'The download is not the file the owner signed. Nothing was run. Tell the owner.'; $rc = 1 }; "
+           'Remove-Item -Force -ErrorAction SilentlyContinue $f; cmd /c exit $rc')
 
     def test_a_line_is_the_text_the_fleet_makes_for_its_check_mode(self):
-        self.assertEqual(fp.check_line('ubuntu', 'org/repo', 5, 'ab' * 32, 3), self.UBUNTU)  # copied from the fleet's render
-        self.assertEqual(fp.check_line('mac', 'org/repo', 5, 'ab' * 32, 3), self.UBUNTU.replace('sha256sum -c -', 'shasum -a 256 -c -'))
-        for want in ('bootstrap.ps1', "-eq '" + 'ab' * 32 + "'", '-Serial 5 -MinSerial 3', 'curl.exe'):
-            self.assertIn(want, fp.check_line('win', 'org/repo', 5, 'ab' * 32, 3))
+        for os_name, want in (('ubuntu', self.UBUNTU), ('mac', self.MAC), ('win', self.WIN)):
+            with self.subTest(os_name):
+                self.assertEqual(fp.check_line(os_name, 'org/repo', 5, self.SHA, 3), want)  # copied from the fleet's render
+
+    def test_each_line_is_one_line_and_the_shell_lines_parse(self):
+        for os_name in ('ubuntu', 'mac', 'win'):
+            line = fp.check_line(os_name, 'org/repo', 5, self.SHA, 3)
+            with self.subTest(os_name):
+                self.assertNotIn('\n', line)
+                if os_name != 'win':
+                    done = subprocess.run(['sh', '-n', '-c', line], capture_output=True, text=True)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_only_the_ubuntu_line_refuses_a_missing_or_snap_curl_and_only_the_windows_line_a_managed_pc(self):
+        for os_name, words in (('ubuntu', ('REFUSED tools', 'sudo apt install curl')), ('mac', ()),
+                               ('win', ('REFUSED policy', 'A group policy sets'))):
+            line = fp.check_line(os_name, 'org/repo', 5, self.SHA, 3)
+            for word in ('REFUSED tools', 'sudo apt install curl', 'REFUSED policy', 'A group policy sets'):
+                self.assertEqual(word in line, word in words, (os_name, word))
+        self.assertIn('sha256sum', fp.check_line('ubuntu', 'org/repo', 5, self.SHA, 3))
+        self.assertIn('shasum -a 256', fp.check_line('mac', 'org/repo', 5, self.SHA, 3))
 
     def test_the_series_decides_which_serials_a_key_may_sign(self):
         for serial, series in ((0, 'test'), (999, 'test'), (1000, 'release'), (2 ** 31, 'release')):
