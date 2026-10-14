@@ -2626,6 +2626,8 @@ class ReleaseBody(unittest.TestCase):
     text; no test crosses the two repositories, the two are held equal by hand and by these literals, each copied from
     `line.render(os, 5, 'ab' * 32, 3)` with this repository's URL swapped for org/repo."""
     SHA = 'ab' * 32
+    # the three literals below are copied from mirrorstack-fleet fleet/install/line.py @77b7fc2 (line.py last changed in e66e08a);
+    # a later fleet edit to the text is made here by hand, and this sha says which fleet text these are
     UBUNTU = ("d=$(mktemp -d) && { c=$(command -v curl); case $c in '' | */snap/*) echo 'REFUSED tools'; "
               "echo 'curl is missing, or is the snap one. Run: sudo apt install curl, then paste the line again. Nothing was run.'; "
               'rc=1 ;; '
@@ -2658,6 +2660,15 @@ class ReleaseBody(unittest.TestCase):
         for os_name, want in (('ubuntu', self.UBUNTU), ('mac', self.MAC), ('win', self.WIN)):
             with self.subTest(os_name):
                 self.assertEqual(fp.check_line(os_name, 'org/repo', 5, self.SHA, 3), want)  # copied from the fleet's render
+
+    def test_each_line_is_one_line_and_the_shell_lines_parse(self):
+        for os_name in ('ubuntu', 'mac', 'win'):
+            line = fp.check_line(os_name, 'org/repo', 5, self.SHA, 3)
+            with self.subTest(os_name):
+                self.assertNotIn('\n', line)
+                if os_name != 'win':
+                    done = subprocess.run(['sh', '-n', '-c', line], capture_output=True, text=True)
+                    self.assertEqual(done.returncode, 0, done.stderr)
 
     def test_only_the_ubuntu_line_refuses_a_missing_or_snap_curl_and_only_the_windows_line_a_managed_pc(self):
         for os_name, words in (('ubuntu', ('REFUSED tools', 'sudo apt install curl')), ('mac', ()),

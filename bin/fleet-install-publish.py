@@ -190,6 +190,7 @@ OS_BOOT = {'win': 'ps1', 'mac': 'sh', 'ubuntu': 'sh'}  # the bootstrap each OS's
 _CURL = "-fsSL --max-redirs 3 --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 120"
 _NOT_RUN = 'Nothing was run. Tell the owner.'
 # the two sentences the fleet's line.py (AF18) adds to the Ubuntu and Windows check lines; held equal by hand and by the literal tests
+# copied from mirrorstack-fleet fleet/install/line.py @77b7fc2 (line.py last changed in e66e08a)
 _NO_CURL = 'curl is missing, or is the snap one. Run: sudo apt install curl, then paste the line again. Nothing was run.'
 _MANAGED = 'A group policy sets the PowerShell execution policy on this PC, so the file cannot run. ' + _NOT_RUN
 
