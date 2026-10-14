@@ -368,9 +368,11 @@ def get_zip(ps1: bytes, version: str, dest: Path) -> None:
 
 
 def publisher(out: Path, c: dict) -> str:
-    """What the publisher's own `verify` says of a case's release folder: `OK install-N` or `REFUSED <code>`."""
+    """What the publisher's own `verify` says of a case's release folder: `OK install-N` or `REFUSED <code>`. It runs inside
+    the case's folder, so the key path is absolute: the workflow's `--out fixture` is relative (boot-smoke run 38514095202
+    read REFUSED key)."""
     done = subprocess.run([sys.executable, str(ROOT / 'bin' / 'fleet-install-publish.py'), 'verify', f'release/install-{c["folder"]}',
-                           '--owner-pub', str(out / 'owner.pub'), '--min-serial', c['args'][1]], cwd=out / c['id'], capture_output=True,
+                           '--owner-pub', str((out / 'owner.pub').resolve()), '--min-serial', c['args'][1]], cwd=out / c['id'], capture_output=True,
                           text=True, env={**os.environ, 'GITHUB_REPOSITORY': 'mirrorstack-ai/fleet-disk'})
     return ' '.join(done.stdout.split()[:2])
 
