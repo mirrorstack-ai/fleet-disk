@@ -168,6 +168,101 @@ test('buckets are deleted after 2 h (on the next failure write)', async () => {
   assert.equal(count(ctx.storage, 'allfails'), 1);
 });
 
+// ---- the prune runs once per bucket (G-AUD-KIT-WORKER-1) ---------------------
+//
+// fails has no index on bucket, so DELETE FROM fails WHERE bucket < ? scans the
+// whole table. Run on every failure it reads about 1,000 rows each, and the
+// Durable Object's Free plan meters 5 million rows read a day.
+
+const DEL_FAILS = 'DELETE FROM fails WHERE bucket < ?';
+const sqlOnly = (q) => q.replace(/\s+/g, ' ').trim();
+
+// Record every statement (and its bindings) the storage is asked to run.
+function tap(storage) {
+  const seen = [];
+  storage.beforeExec = (q, b) => seen.push({ q: sqlOnly(q), b });
+  return seen;
+}
+
+const allN = (storage) => storage.db.prepare('SELECT COALESCE(SUM(n), 0) AS n FROM allfails').get().n;
+const plan = (storage, q, b) => storage.db.prepare(`EXPLAIN QUERY PLAN ${q}`).all(...b).map((r) => r.detail);
+
+test('a failed guess against a full table scans no table: the prune does not run again in the same bucket', async () => {
+  const ctx = make();
+  // reject() writes a failure for any source; decide() would stop at 600 with a 429 and write nothing.
+  for (let i = 0; i < 1200; i++) await ctx.core.reject({ src: hexSrc(i), rid: null });
+  assert.equal(count(ctx.storage, 'fails'), 1200);
+
+  // Control: the engine does report the unindexed prune as a scan in this form.
+  assert.ok(plan(ctx.storage, DEL_FAILS, [0]).some((d) => /^SCAN (TABLE )?fails$/.test(d)), 'the control plan must be a SCAN of fails');
+
+  const seen = tap(ctx.storage);
+  assert.deepEqual(await ctx.core.reject({ src: hexSrc(5000), rid: null }), { status: 404 });
+  ctx.storage.beforeExec = null;
+  assert.ok(seen.length > 0);
+  assert.deepEqual(seen.filter((s) => s.q === DEL_FAILS), [], 'no DELETE FROM fails in the same bucket');
+  for (const { q, b } of seen) {
+    for (const d of plan(ctx.storage, q, b)) assert.ok(!/^SCAN (TABLE )?fails$/.test(d), `${q} -> ${d}`);
+  }
+});
+
+test('24 h at 600 failures an hour from fresh sources: the prune reads under 500,000 rows in all', async () => {
+  const ctx = make();
+  let rows = 0;
+  let deletes = 0;
+  ctx.storage.beforeExec = (q) => {
+    if (sqlOnly(q) !== DEL_FAILS) return;
+    deletes++;
+    rows += count(ctx.storage, 'fails');
+  };
+  let answered404 = 0;
+  for (let i = 0; i < 24 * 600; i++) {
+    ctx.clk.add(6000); // 600 an hour
+    if ((await dec(ctx, { src: hexSrc(i), tag: TAG2 })).status === 404) answered404++;
+  }
+  ctx.storage.beforeExec = null;
+  assert.ok(answered404 > 10000, `the flood must mostly be recorded, got ${answered404}`);
+  assert.ok(deletes >= 144 && deletes <= 146, `one prune per 10-minute bucket, got ${deletes}`);
+  assert.ok(rows < 500000, `the prune read ${rows} rows (12.7 million when it runs on every failure)`);
+});
+
+test('control: failures of every cause in one bucket run one prune; the next bucket runs one more and the old rows go', async () => {
+  const ctx = await ready();
+  const seen = tap(ctx.storage);
+  const prunes = () => seen.filter((s) => s.q === DEL_FAILS).length;
+  await dec(ctx, { tag: TAG2 }); // unknown tag
+  await dec(ctx, { serial: 0 }); // serial out of range
+  await dec(ctx, { serial: 6 }); // bundle not uploaded
+  await ctx.core.reject({ src: hexSrc(7), rid: null }); // a fault after a yes
+  assert.equal(allN(ctx.storage), 4);
+  assert.equal(prunes(), 1, 'one prune for the bucket');
+
+  ctx.clk.add(LIMITS.bucketMs); // the next bucket, the old rows are still inside 2 h
+  await dec(ctx, { tag: TAG2 });
+  assert.equal(prunes(), 2);
+  assert.equal(allN(ctx.storage), 5, 'inside 2 h nothing is deleted');
+
+  ctx.clk.add(3 * H);
+  await dec(ctx, { tag: TAG2 });
+  await dec(ctx, { tag: TAG2 });
+  assert.equal(prunes(), 3, 'exactly one more for the third bucket');
+  assert.equal(count(ctx.storage, 'fails'), 1, 'the old rows are gone');
+  assert.equal(count(ctx.storage, 'allfails'), 1);
+  assert.equal(allN(ctx.storage), 2);
+  ctx.storage.beforeExec = null;
+});
+
+test('control: a new Gate over the same storage in the same bucket does not prune again (kept in meta, not memory)', async () => {
+  const a = await ready();
+  await dec(a, { tag: TAG2 });
+  const b = make({ storage: a.storage, clk: a.clk });
+  const seen = tap(a.storage);
+  assert.deepEqual(await dec(b, { tag: TAG2 }), { status: 404 });
+  a.storage.beforeExec = null;
+  assert.deepEqual(seen.filter((s) => s.q === DEL_FAILS), []);
+  assert.equal(allN(a.storage), 2);
+});
+
 test('D4: budgets, reservations and invites survive a restart', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'kit-gate-'));
   try {

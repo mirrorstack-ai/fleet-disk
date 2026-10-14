@@ -161,9 +161,19 @@ export class GateCore {
     const b = Math.floor(now / LIMITS.bucketMs);
     this.#run('INSERT INTO fails(src, bucket, n) VALUES(?, ?, 1) ON CONFLICT(src, bucket) DO UPDATE SET n = n + 1', src, b);
     this.#run('INSERT INTO allfails(bucket, n) VALUES(?, 1) ON CONFLICT(bucket) DO UPDATE SET n = n + 1', b);
-    const old = Math.floor((now - LIMITS.keepMs) / LIMITS.bucketMs);
-    this.#run('DELETE FROM fails WHERE bucket < ?', old);
-    this.#run('DELETE FROM allfails WHERE bucket < ?', old);
+    // The prune runs once per bucket, not once per failure: the fails table's
+    // only index is (src, bucket), so DELETE ... WHERE bucket < ? scans every
+    // row, about 1,000 of them under a flood, and the Free plan meters 5 million
+    // rows read a day. The trigger is the bucket alone, never the failure cause
+    // (every cause makes the same statements). The last pruned bucket lives in
+    // meta, not in memory, so an evicted Gate does not prune again on each wake.
+    // A later prune changes no answer: #budgetSpent reads only bucket >= min.
+    if (this.#meta('fails_pruned') !== b) {
+      const old = Math.floor((now - LIMITS.keepMs) / LIMITS.bucketMs);
+      this.#run('DELETE FROM fails WHERE bucket < ?', old);
+      this.#run('DELETE FROM allfails WHERE bucket < ?', old);
+      this.#setMeta('fails_pruned', b);
+    }
   }
 
   // ---- public path: decide / release / reject ---------------------------
