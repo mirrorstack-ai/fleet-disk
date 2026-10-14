@@ -3569,6 +3569,13 @@ class Workflow(unittest.TestCase):
                      'umask 077', 'SERIAL: ${{ inputs.serial }}', 'TAG_SHA: ${{ needs.untag-check.outputs.sha }}'):
             self.assertIn(need, untag)
         body = self.untag_body('untag')
+        ssh = [l.strip() for l in body.splitlines() if l.strip().startswith('export GIT_SSH_COMMAND=')]
+        self.assertEqual(len(ssh), 1)
+        for need in ('-o BatchMode=yes', '-o HostKeyAlgorithms=ssh-ed25519'):  # BatchMode: an auth failure fails, it never waits on a prompt
+            self.assertIn(need, ssh[0], need)
+        for other in ('plan', 'tag', 'kit'):  # the same ssh options as every other deploy-key job
+            others = [l.strip() for l in self.JOBS[other].splitlines() if l.strip().startswith('export GIT_SSH_COMMAND=')]
+            self.assertEqual(others, ssh, other)
         self.assertLess(body.index("trap 'shred"), body.index('"$TAG_KEY" > "$d/key"'))
         self.assertNotIn('inputs.', body)
         self.assertEqual(re.findall(r'--force\S*', untag), ['--force-with-lease="refs/tags/install-$SERIAL:$TAG_SHA"'])  # the lease is the one force

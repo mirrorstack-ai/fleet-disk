@@ -1,5 +1,6 @@
 # Signs and publishes the fleet's install set from the release folder of the fleet repository's `release` branch, in the jobs
-# below (and sets the kit host's floor or removes a release-less tag, the two modes after them) and only on this repo's `release` branch (the Environment `release` allows no other):
+# below, and only on this repo's `release` branch (the Environment `release` allows no other). Two more modes follow them: one
+# sets the kit host's floor, one removes a release-less tag:
 #   plan     reads release/install-<serial>/ from the fleet `release` tip as git blobs (deploy key FLEET_READ) and runs
 #            every offline check but the signatures, then the read-only GitHub checks (a release or leftover draft of the tag,
 #            the serial and pin against the newest release, the Immutable setting), so a refusal comes before anything is signed.
@@ -32,7 +33,7 @@
 # approve; `floor` needs it and holds KIT_UPLOAD_KEY in `release`. The approval covers raising, lowering and 0. While the
 # Environment `kit-floor` has no required reviewer (README, One-time repo settings) nothing stops a floor run: do not rely on it.
 # The mode `untag` removes the tag install-<serial> of a run that stopped before its release was made (no workflow removed such a
-# tag before; the serial is otherwise lost). Three jobs, in the same group `install`: `untag-check` (no Environment, no secret,
+# tag before; the serial is otherwise usually lost, only a re-run of all jobs with unchanged bundle bytes recovers it). Three jobs, in the same group `install`: `untag-check` (no Environment, no secret,
 # a contents: read job token) reads GitHub, refuses unless the tag exists on a commit as a lightweight tag and NO release of it
 # (draft or not) exists, and outputs the tag's commit; `untag-approve` waits in the Environment `kit-floor` (the owner is its
 # required reviewer, it holds no secret) and prints `approved: delete tag install-<serial> at <sha>`; `untag` needs both, runs in

@@ -230,7 +230,7 @@ would otherwise each wait for one). A floor run shares no concurrency group with
 the dashboard variable `KIT_FLOOR` stays the fastest break-glass.
 
 **Untag.** `mode` untag with `serial` set to N removes the tag `install-N` of a run that stopped after the tag job and before the release was made (a
-failed publish leaves such a tag; the serial is otherwise lost), and only a tag that has no release. It is three jobs, in the same concurrency group as a release run. `untag-check` has no
+failed publish leaves such a tag; the serial is otherwise usually lost, only a re-run of all jobs with unchanged bundle bytes recovers it), and only a tag that has no release. It is three jobs, in the same concurrency group as a release run. `untag-check` has no
 Environment and no secret, only the job token with `contents: read`: it runs the read-only verb `untag-check --serial N` of the publisher, which refuses
 `tag-missing` (no such tag), `tag-moved` (the tag is not a lightweight commit tag), `tag-exists` or `draft-left` (any release of the tag, published or draft,
 exists: it has a release, so it is not removed; a read-only token may not see a draft, so `draft-left` is only certain once a writer has checked the
@@ -238,9 +238,10 @@ releases page) and otherwise prints `tag install-N sha <sha>, no release` and ha
 (the owner is its required reviewer, it holds no secret and no token) and prints `approved: delete tag install-N at <sha>`. `untag` needs both, runs in the
 Environment `release`, reads only `TAG_KEY` (the deploy key that makes the tag, the one bypass of the `install-*` tag ruleset) and runs no repository code and
 holds no token: it deletes with `git push --force-with-lease=refs/tags/install-N:<sha>` of the empty source, so only a tag still on the checked commit goes (a tag that
-moved after the check is left). Turn the `kit-floor` required reviewer on first (One-time repo settings): without it nothing stops an untag run. Not yet
+moved after the check is left). The release check is made once, in `untag-check`: `untag` does not read the releases again after the approval wait, so a release
+made by hand between the check and the approval is not seen (the `install` concurrency group stops another install run, not a repository writer). Turn the `kit-floor` required reviewer on first (One-time repo settings): without it nothing stops an untag run. Not yet
 measured (the first dispatch shows both): that the ruleset's bypass covers a deletion, and that GitHub refuses to delete a tag an immutable release holds (the
-check already refuses such a tag).
+check already refuses such a tag); the first real dispatch should also confirm that GitHub refuses the tag delete when a release holds the tag.
 
 `.gitattributes` marks the vendored files `-text` so no checkout rewrites their line endings.
 A change to the verifier ships as the same two files in both repositories, in the same step: the fleet
