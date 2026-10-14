@@ -11,9 +11,23 @@ fetches that image with Ubuntu's `SHA256SUMS` and `SHA256SUMS.gpg`, verifies the
 `qemu-img` into a VHDX and into an uncompressed `compat=1.1` qcow2 (the Linux disk), publishes both as the release
 `disk-noble-<serial>` and prints the three lock entries (`disk_input`, `disk` and `disk_qcow2`: a url and a sha256 each, and
 the qcow2's size). A release or tag that already exists is refused, and so is any
-check that cannot be answered (fail closed); after the upload the published assets' digests are read back and must equal the
-printed ones. A signature stamped before the serial's date or in the future is refused. A VHDX or qcow2 of 2 GiB or more is
-refused (GitHub's release asset limit).
+check that cannot be answered (fail closed). The release is created as a draft: its assets' digests are read back by release id
+(up to four reads, five seconds apart) and the draft is made public only when they equal the hashed files, so nothing
+irreversible comes before the last check that can refuse. A digest GitHub has not computed yet is retried and then refused as
+`publish-unread`; a wrong digest or asset set is `publish-mismatch` at once. Both delete the draft first. A refusal after the
+PATCH was sent (the release may be public; the second read must show it published with the same digests) prints `unverified <asset> sha256:<hex>`
+lines to stderr: those are the hashed values, not verified entries, so do not pin from them. A signature stamped before the
+serial's date or in the future is refused. A VHDX or qcow2 of 2 GiB or more is refused (GitHub's release asset limit).
+
+A draft that an interrupted run left (a cancelled job, the upload's time limit) makes the next dispatch for that serial refuse
+`draft-left`, apart from `tag-exists` (a published release or a tag). The workflow's last step always runs
+`bin/fleet-disk.py cleanup <arch> <serial>`, which deletes that tag's draft and nothing else (a published release, or a
+draft of another tag, is never deleted); if it cannot, delete the draft by hand under the repository's Releases (writers see
+drafts there). A draft never made a tag, so deleting it should free the serial (a GitHub behaviour to measure once on a scratch repository
+with Immutable releases before the first real dispatch). The cleanup step runs after every build, green ones too, and exits 1
+when it cannot read the release list (only the newest 100 releases are read): a red last step after a green build step means
+the build result stands, so look for a leftover draft. It also deletes a draft that a PATCH exiting 0 left reading as a draft on every
+read of the build step, if its own read still shows a draft then (GitHub reads are normally consistent).
 
 ## How the arm64 disk (macOS lane) is built
 
@@ -129,6 +143,44 @@ Not enforced here: that a first release under a new owner key follows a
 published handoff from the old key (a new key starts a new series instead: a serial-floor jump). The owner's own check of a
 release is `VERIFY.txt`'s `ssh-keygen` line.
 
+The plan job makes the same read-only checks before anything is signed, stored on the kit host or tagged (after its offline
+ones and before it writes the bytes to sign): a published release of the tag (`tag-exists`), a leftover draft of any install
+tag (`draft-left`), the tag on another commit or not a lightweight commit tag (`tag-moved`; an absent tag is fine, the tag job
+makes it), a serial not above the newest release (`not-newer`), a pin below that release's (`pin-mismatch`), the Immutable
+setting off or unreadable without the owner's confirmation (`immutable-off`, `immutable-unreadable`), and a missing
+`GITHUB_REPOSITORY`, `GITHUB_SHA` or `GH_TOKEN` (`release-env`). `publish` makes them again as the final authority. The plan
+only reads: it creates and deletes nothing.
+
+What plan guarantees is `tag-exists`, `tag-moved`, `not-newer`, `pin-mismatch` and the Immutable checks. `draft-left` is only
+certain in `publish`: GitHub generally shows draft releases only to a token with write access, the plan job's token is
+`contents: read` and is not widened for this, so a leftover draft may pass plan and be first named by `publish`, after sign,
+kit and tag. That stops before the create, so nothing irreversible has happened, but it is a re-run after the delete. To
+measure once at the first real run, on a scratch repository with Immutable releases, before relying on plan to stop a draft
+early: whether `gh release list` under a `contents: read` token lists a draft of the repository; whether GitHub reports
+`immutable: false` for a moment on a release that later becomes immutable (the publisher deletes on the first read that says
+`false`; if it flips late, delete only after a second read).
+
+Because a release cannot be changed once it is immutable, every refusal comes before the first irreversible step, and what a
+failed publish leaves is named and, when it is safe, removed. When `gh release create` fails or is killed, or the read-back
+says `draft: true` or `immutable: false` (exactly those), the publisher lists the releases and runs
+`gh release delete <tag> --yes` for the release of exactly this tag (never with `--cleanup-tag`: the tag job's tag stays), then
+gives the first refusal. An immutable published release is never deleted. The read-back of the created release is read up to
+three times (5 s, then 15 s apart), only while an answer does not parse; a parsed answer is judged at once. If the delete
+fails, or a release is there that cannot be deleted or read, the word is `release-left` and the first refusal is printed on
+stderr (`first refusal <word>`).
+
+| word | state | cure |
+|---|---|---|
+| `draft-left` | a draft of an install tag exists (a run's upload was killed before it was public) | a repo writer runs `gh release delete install-<n> --yes` (the tag stays), then re-runs |
+| `release-left` | a release of the tag exists and the publisher could not read, judge or remove it | read the release page; if it is immutable and right, the serial is used: take the next one; a draft or mutable one: `gh release delete install-<n> --yes`, then re-run |
+| `tag-exists` | a published release of the tag exists | read the release page; if it is immutable and right, the serial is used |
+| `tag-moved` | the tag is on another commit, or not a lightweight commit tag, and has no release | the deploy key deletes the tag by hand (no workflow mode removes a release-less tag until AF42) |
+| `not-newer` | a release of this or a higher serial exists | dispatch the next serial |
+| `pin-mismatch` | the pin's serial is below the newest release's, or that pin cannot be read | fix the pin or the serial in the release folder |
+| `immutable-off`, `immutable-unreadable` | the Immutable releases setting is off, or the token cannot read it and `IMMUTABLE_RELEASES_CONFIRMED` is not `yes` | turn it on, or record the confirmation |
+| `immutable-not-set` | the created release did not read back immutable and not a draft; it was deleted when it was a draft or mutable | turn the setting on, re-run |
+| `publish-mismatch` | the read-back release is immutable and its assets are not the checked ones | the serial is used and the release stays: take the next serial |
+
 Immutable releases: the job's token usually cannot read the setting (it needs admin). Then the run stops with
 `immutable-unreadable` until the owner records their confirmation as the Environment variable
 `IMMUTABLE_RELEASES_CONFIRMED=yes` on `release` (the plan job passes it on to publish). A setting that reads as off always stops the run.
@@ -237,7 +289,21 @@ ref's workflow file). The real boundary is set in the repo, not in code:
 
 - Create the Environment `release` first (Settings, Environments), restricted to the `release` branch with admins unable to
   bypass, and put `SIGN_KEY`, `TAG_KEY`, `FLEET_READ` and `KIT_UPLOAD_KEY` in it. The disk build has its own Environment `disk`
-  (restricted to `main`), so nothing about `release` gates or reaches it.
+  (restricted to `main`), so nothing about `release` gates or reaches it. `disk` holds no secret or variable, so it is not a
+  boundary: it only restricts the dispatch to `main`, and the job's write power is the workflow file's `contents: write`.
+  No ruleset covers the `disk-*` tags yet, so anyone with push access can take a `disk-noble-<serial>` name. The ruleset
+  (creation, update, deletion, with a deploy key stored in `disk` as its only bypass) is the owner's step; until then the
+  entries to pin come only from the log of a run on `main`. A read-only probe, run by hand with an admin token, prints
+  FAIL until both exist:
+
+  ```sh
+  repo=mirrorstack-ai/fleet-disk
+  for id in $(gh api "repos/$repo/rulesets" --jq '.[].id'); do
+    gh api "repos/$repo/rulesets/$id" --jq '.conditions.ref_name.include[]?'
+  done | grep -q 'refs/tags/disk-' && echo 'ok: a ruleset covers refs/tags/disk-*' || echo 'FAIL: no ruleset covers refs/tags/disk-*'
+  gh api "repos/$repo/environments/disk/secrets" --jq '.total_count' | grep -qv '^0$' \
+    && echo 'ok: the disk environment holds a secret' || echo 'FAIL: the disk environment holds no secret (no tag key)'
+  ```
 - Create the Environment `kit-floor`, restricted to the `release` branch, with the owner (or the team `security`) as required
   reviewer and admins unable to bypass, and no secret. It is the only gate on a floor run (`floor-approve`); `release` has no
   reviewer, so a release run is unattended during the test phase.

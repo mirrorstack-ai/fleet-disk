@@ -40,12 +40,21 @@ UNBAKED = 'ssh-ed25519 UNBAKED'
 # the base-URL lines, pinned: each must match the bootstrap exactly once or the build refuses (`@` is host:port)
 REWRITE = {
     'sh': [(r'^RELEASES=https://github\.com/mirrorstack-ai/fleet-disk/releases/download$',
-            'RELEASES=https://@/releases/download')],
+            'RELEASES=https://@/releases/download'),
+           # python_mac's download root, ahead of the line's trailing comment (the lookahead keeps it out of the match)
+           (r'^PBS=https://github\.com/astral-sh/python-build-standalone/releases/download(?=[ \t]+#|$)',
+            'PBS=https://@/pbs/releases/download')],
     'ps1': [(r"^\$Release = 'https://github\.com/mirrorstack-ai/fleet-disk/releases/download'$",
              "$Release = 'https://@/releases/download'"),
             (r"^\$PythonUrl = 'https://www\.python\.org/ftp/python/\{0\}/python-\{0\}-embed-amd64\.zip'$",
-             "$PythonUrl = 'https://@/python/{0}/python-{0}-embed-amd64.zip'")],
+             "$PythonUrl = 'https://@/python/{0}/python-{0}-embed-amd64.zip'"),
+            # the elevated re-fetch inside curl.exe's argument string: only the URL, matched ahead of its file name so a reshaped line still counts
+            (r"https://github\.com/mirrorstack-ai/fleet-disk/releases/download/(?=install-\{0\}/bootstrap\.ps1')",
+             'https://@/releases/download/')],
 }
+# the one live line that may still name github.com: the sh kit-host deny pattern. It keeps the name out, so it is excused only
+# byte for byte, once, and only in the sh copy; no other live github.com or python.org line is
+DENY = {'sh': "    '' | .* | *. | *..* | *[!a-z0-9.-]* | github.com | *.github.com | *githubusercontent.com) host= ;;", 'ps1': None}
 CNF = """[req]
 distinguished_name = dn
 prompt = no
@@ -117,10 +126,32 @@ def bake(name: str, data: bytes, key: str, expires: str) -> bytes:
     return text.encode('ascii')
 
 
-def check_copy(orig: bytes, copy: bytes, changed: int) -> None:
-    """The copy differs from the original in exactly `changed` lines and no live line still names github.com or python.org."""
+def lf(data: bytes) -> bytes:
+    """CRLF (a Windows checkout of the .ps1) becomes LF; a CR that is not half of a CRLF refuses, so the copies hold no CR."""
+    data = data.replace(b'\r\n', b'\n')
+    if b'\r' in data:
+        raise Refused('rewrite')
+    return data
+
+
+HOSTS = ('github.com', 'githubusercontent.com', 'python.org')  # check_copy tests the lower-cased line against these
+
+
+def check_copy(name: str, orig: bytes, copy: bytes, changed: int) -> None:
+    """The copy differs from the original in exactly `changed` lines and no live line still names github.com, githubusercontent.com
+    or python.org (in any letter case), except the one DENY line of `name`, once, unchanged. A line whose first non-blank character
+    is # counts as a comment and is not examined: inside a heredoc or a here-string such a line is data, a known limit (the loaders
+    carry neither with a URL in it, and the line-count and changed-line checks still hold)."""
     a, b = orig.decode('ascii').split('\n'), copy.decode('ascii').split('\n')
-    live = [x for x in b if not x.lstrip().startswith('#') and ('github.com' in x or 'python.org' in x)]
+    excuse = [DENY[name]] if DENY[name] in a else []  # only a line the original already held
+    live = []
+    for x in b:
+        if x.lstrip().startswith('#') or not any(h in x.lower() for h in HOSTS):
+            continue
+        if x in excuse:
+            excuse.remove(x)
+        else:
+            live.append(x)
     if len(a) != len(b) or sum(x != y for x, y in zip(a, b)) != changed or live:
         raise Refused('rewrite')
 
@@ -128,7 +159,7 @@ def check_copy(orig: bytes, copy: bytes, changed: int) -> None:
 def prepare(name: str, raw: bytes, host: str, port: int, key: str, expires: str) -> bytes:
     """One bootstrap copy: base rewritten, throwaway key and expiry baked, and nothing else changed."""
     copy = bake(name, rewrite(name, raw, host, port), key, expires)
-    check_copy(raw, copy, len(REWRITE[name]) + 2)
+    check_copy(name, raw, copy, len(REWRITE[name]) + 2)
     if PUB.baked_values(name, copy) != (key, expires):  # the publisher reads back what was baked
         raise Refused('bake')
     return copy
@@ -337,9 +368,11 @@ def get_zip(ps1: bytes, version: str, dest: Path) -> None:
 
 
 def publisher(out: Path, c: dict) -> str:
-    """What the publisher's own `verify` says of a case's release folder: `OK install-N` or `REFUSED <code>`."""
+    """What the publisher's own `verify` says of a case's release folder: `OK install-N` or `REFUSED <code>`. It runs inside
+    the case's folder, so the key path is absolute: the workflow's `--out fixture` is relative (boot-smoke run 38514095202
+    read REFUSED key)."""
     done = subprocess.run([sys.executable, str(ROOT / 'bin' / 'fleet-install-publish.py'), 'verify', f'release/install-{c["folder"]}',
-                           '--owner-pub', str(out / 'owner.pub'), '--min-serial', c['args'][1]], cwd=out / c['id'], capture_output=True,
+                           '--owner-pub', str((out / 'owner.pub').resolve()), '--min-serial', c['args'][1]], cwd=out / c['id'], capture_output=True,
                           text=True, env={**os.environ, 'GITHUB_REPOSITORY': 'mirrorstack-ai/fleet-disk'})
     return ' '.join(done.stdout.split()[:2])
 
@@ -352,7 +385,7 @@ def build(out: Path, ps1: Path, sh: Path, host='127.0.0.1', port=18443, crl_port
     x = Ctx(out, datetime.now(timezone.utc))
     x.crl_port = crl_port
     try:
-        raw = {'ps1': ps1.read_bytes(), 'sh': sh.read_bytes()}
+        raw = {'ps1': lf(ps1.read_bytes()), 'sh': lf(sh.read_bytes())}  # the bases are LF whatever the checkout (the boot-hash-crlf case builds its own CRLF run copy later)
         boots = {n: prepare(n, b, host, port, x.key, x.expires) for n, b in raw.items()}
         make_tls(out / 'tls', host, crl_port, x.now)
         zdest = out / 'python' / version / f'python-{version}-embed-amd64.zip'

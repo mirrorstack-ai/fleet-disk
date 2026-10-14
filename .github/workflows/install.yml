@@ -1,7 +1,9 @@
 # Signs and publishes the fleet's install set from the release folder of the fleet repository's `release` branch, in five
 # jobs and only on this repo's `release` branch (the Environment `release` allows no other):
 #   plan     reads release/install-<serial>/ from the fleet `release` tip as git blobs (deploy key FLEET_READ) and runs
-#            every offline check but the signatures.
+#            every offline check but the signatures, then the read-only GitHub checks (a release or leftover draft of the tag,
+#            the serial and pin against the newest release, the Immutable setting), so a refusal comes before anything is signed.
+#            Its token is contents: read, which may not list a draft release: `draft-left` is only certain in publish (README).
 #   sign     runs no repository code and no third-party action: holds SIGN_KEY only in memory, refuses unless its
 #            fingerprint is KEY_SHA256 below, signs the three files, verifies them and wipes the key.
 #   kit      puts the bundle and the gateway record on the kit host. It holds only FLEET_READ and KIT_UPLOAD_KEY (the Ed25519
@@ -97,12 +99,18 @@ jobs:
           export GIT_SSH_COMMAND="/usr/bin/ssh -i $d/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$d/known_hosts -o GlobalKnownHostsFile=/dev/null -o HostKeyAlgorithms=ssh-ed25519"
           git init -q "$RUNNER_TEMP/fleet"
           git -C "$RUNNER_TEMP/fleet" fetch -q --no-tags "$FLEET_REPO" '+refs/heads/release:refs/remotes/origin/release'
+      - id: immutable
+        env:
+          CONFIRMED: ${{ vars.IMMUTABLE_RELEASES_CONFIRMED }}
+        run: if [ "$CONFIRMED" = yes ]; then echo immutable=yes >> "$GITHUB_OUTPUT"; fi
       - id: plan
         env:
           SERIAL: ${{ inputs.serial }}
           MIN_SERIAL: ${{ inputs.min_serial }}
           OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}
           KIT_HOST: ${{ env.KIT_HOST }}
+          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_CONFIRMED: ${{ steps.immutable.outputs.immutable }}
         run: python3 bin/fleet-install-publish.py plan "$RUNNER_TEMP/fleet" --serial "$SERIAL" --min-serial "$MIN_SERIAL" --out "$RUNNER_TEMP/out"
       - env:
           GH_TOKEN: ${{ github.token }}
@@ -127,10 +135,6 @@ jobs:
               fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-      - id: immutable
-        env:
-          CONFIRMED: ${{ vars.IMMUTABLE_RELEASES_CONFIRMED }}
-        run: if [ "$CONFIRMED" = yes ]; then echo immutable=yes >> "$GITHUB_OUTPUT"; fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: install-stage
