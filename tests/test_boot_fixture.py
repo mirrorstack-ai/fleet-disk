@@ -154,6 +154,16 @@ class Built(unittest.TestCase):
         self.assertEqual(mf.bake('ps1', twin, key, exp), (self.out / 'good-ps1' / 'run' / 'bootstrap.ps1').read_bytes())
         self.assertEqual(len(crlf['cases']), len(self.meta['cases']))
 
+    def test_a_relative_out_as_the_workflow_passes_it_still_verifies(self):
+        here = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            meta = mf.build(Path('fx-rel'), self.tmp / 'a.ps1', self.tmp / 'a.sh', zip_path=self.tmp / 'z.zip')
+        finally:
+            os.chdir(here)
+        self.assertEqual(len(meta['cases']), len(self.meta['cases']))
+        self.assertTrue((self.tmp / 'fx-rel' / 'owner.pub').is_file())
+
     def test_every_case_has_a_folder_and_the_table_is_complete(self):
         ids = {c['id'] for c in self.meta['cases']}
         self.assertEqual(len(ids), len(self.meta['cases']))
