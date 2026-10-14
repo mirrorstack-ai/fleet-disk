@@ -2712,29 +2712,30 @@ class Readme(unittest.TestCase):
 class Workflow(unittest.TestCase):
     TEXT = (ROOT / '.github/workflows/install.yml').read_text(encoding='utf-8')
     DISK = (ROOT / '.github/workflows/disk.yml').read_text(encoding='utf-8')
-    JOBS = {m[1]: m[2] for m in re.finditer(r'(?ms)^  (plan|sign|kit|tag|publish|floor-approve|floor):\n(.*?)(?=^  [\w-]+:\n|\Z)',
+    JOBS = {m[1]: m[2] for m in re.finditer(r'(?ms)^  (plan|fixture|smoke|sign|kit|tag|publish|floor-approve|floor):\n(.*?)(?=^  [\w-]+:\n|\Z)',
                                             TEXT.split('\njobs:\n', 1)[1])}
 
-    def test_it_is_a_release_branch_dispatch_of_five_jobs_and_a_floor_job(self):
+    def test_it_is_a_release_branch_dispatch_of_seven_jobs_and_a_floor_job(self):
         self.assertRegex(self.TEXT, r'(?m)^on:\n  workflow_dispatch:\n    inputs:\n      mode:\n')
         self.assertEqual(re.findall(r'(?m)^      (\w+):\n        (?:description|required)', self.TEXT),
                          ['mode', 'serial', 'min_serial', 'floor'])
         self.assertRegex(self.TEXT, r'(?m)^        options: \[sign, pubkey, floor\]\n        default: sign\n')
-        self.assertEqual(list(self.JOBS), ['plan', 'sign', 'kit', 'tag', 'publish', 'floor-approve', 'floor'])
+        self.assertEqual(list(self.JOBS), ['plan', 'fixture', 'smoke', 'sign', 'kit', 'tag', 'publish', 'floor-approve', 'floor'])
         self.assertEqual(re.findall(r'(?m)^  ([\w-]+):$', self.TEXT.split('\njobs:\n', 1)[1]), list(self.JOBS))  # and no other job
         for bad in ('pull_request', 'push:', 'self-hosted', 'refs/heads/main', 'actions/cache'):
             self.assertNotIn(bad, self.TEXT)
         for name, job in self.JOBS.items():
             self.assertIn("github.ref == 'refs/heads/release'", job.split('steps:')[0], name)
-        self.assertEqual(re.findall(r'runs-on: (\S+)', self.TEXT), ['ubuntu-24.04'] * 7)
+        self.assertEqual(re.findall(r'runs-on: (.+)', self.TEXT),
+                         ['ubuntu-24.04', 'ubuntu-24.04', '${{ matrix.runner }}'] + ['ubuntu-24.04'] * 6)  # the smoke job is the only hosted-matrix one; the fixture is built once on ubuntu
         self.assertEqual([re.findall(r'(?m)^    environment: (\S+)$', j) for j in self.JOBS.values()],
-                         [['release'], ['release'], ['release'], ['release'], [], ['kit-floor'], ['release']])  # publish has none: no secret, no variable of release
+                         [['release'], [], [], ['release'], ['release'], ['release'], [], ['kit-floor'], ['release']])  # fixture, smoke and publish have none: no secret, no variable of release
 
     def test_only_publish_writes_and_only_contents_and_sign_and_tag_hold_no_token(self):
         self.assertRegex(self.TEXT, r'(?m)^permissions:\n  contents: read\n')
         self.assertEqual(re.findall(r'(\w[\w-]*): write', self.TEXT), ['contents'])
         self.assertIn('    permissions:\n      contents: write\n', self.JOBS['publish'])
-        for name in ('sign', 'tag'):
+        for name in ('fixture', 'smoke', 'sign', 'tag'):
             self.assertTrue('    permissions: {}\n' in self.JOBS[name] and 'github.token' not in self.JOBS[name])
 
     def test_each_secret_is_read_by_one_job_and_the_sign_and_tag_jobs_run_no_action_and_no_repository_code(self):
@@ -2744,6 +2745,8 @@ class Workflow(unittest.TestCase):
                               ('tag', ['TAG_KEY']), ('floor', ['KIT_UPLOAD_KEY'])):
             self.assertEqual(re.findall(r'secrets\.(\w+)', self.JOBS[name]), secrets)
         self.assertNotIn('secrets.', self.JOBS['publish'])
+        self.assertNotIn('secrets.', self.JOBS['smoke'])
+        self.assertNotIn('secrets.', self.JOBS['fixture'])
         for name in ('sign', 'tag'):
             for bad in ('uses:', 'checkout', 'fleet-install-publish', 'python', 'RUNNER_WORKSPACE', 'GITHUB_WORKSPACE'):
                 self.assertNotIn(bad, self.JOBS[name], name)
@@ -2753,7 +2756,7 @@ class Workflow(unittest.TestCase):
     def test_the_actions_are_sha_pinned_the_same_as_disk_and_no_credential_stays_in_git(self):
         self.assertEqual(re.findall(r'uses: (actions/checkout@\S+)', self.TEXT)[0], re.findall(r'uses: (actions/checkout@\S+)', self.DISK)[0])
         for uses in re.findall(r'uses: (\S+)', self.TEXT):
-            self.assertRegex(uses, r'^actions/(?:checkout|upload-artifact|download-artifact)@[0-9a-f]{40}$')
+            self.assertRegex(uses, r'^actions/(?:checkout|setup-python|upload-artifact|download-artifact)@[0-9a-f]{40}$')
         self.assertEqual(self.TEXT.count('persist-credentials: false'), self.TEXT.count('actions/checkout@'))
 
     def test_the_key_fingerprint_series_and_host_key_are_constants_of_the_file(self):
@@ -2795,7 +2798,7 @@ class Workflow(unittest.TestCase):
             self.assertIn(need, step)
         self.assertEqual(self.declared_outputs('plan')['immutable'], ('immutable', 'immutable'))  # still handed to publish
         self.assertIn('IMMUTABLE_CONFIRMED: ${{ needs.plan.outputs.immutable }}', self.JOBS['publish'])
-        self.assertEqual(len(self.JOBS), 7)  # no job is added (AF08's gateway job is parked)
+        self.assertEqual(len(self.JOBS), 9)  # seven, the smoke and its fixture (AF34); AF08's gateway-sign job is still parked
         self.assertEqual(re.findall(r'vars\.(\w+)', self.TEXT), ['IMMUTABLE_RELEASES_CONFIRMED'])
 
     def test_the_plan_job_reads_the_fleet_over_ssh_with_the_pinned_host_key_and_the_tag_job_never_forces(self):
@@ -2816,7 +2819,7 @@ class Workflow(unittest.TestCase):
         self.assertNotIn('StrictHostKeyChecking=no', self.TEXT)
 
     def test_the_publish_job_gets_the_key_from_the_sign_job_and_the_fingerprint_from_the_constant(self):
-        for need in ('PUB: ${{ needs.sign.outputs.pub }}', 'OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}', 'needs: [plan, sign, kit, tag]',
+        for need in ('PUB: ${{ needs.sign.outputs.pub }}', 'OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}', 'needs: [plan, smoke, sign, kit, tag]',
                      'IMMUTABLE_CONFIRMED: ${{ needs.plan.outputs.immutable }}', '--owner-pub "$RUNNER_TEMP/owner.pub"'):
             self.assertIn(need, self.JOBS['publish'])
 
@@ -2840,8 +2843,9 @@ class Workflow(unittest.TestCase):
 
     def test_each_job_needs_exactly_the_jobs_before_it(self):
         needs = {name: re.findall(r'(?m)^    needs: (.*)$', job) for name, job in self.JOBS.items()}
-        self.assertEqual(needs, {'plan': [], 'sign': ['plan'], 'kit': ['[plan, sign]'], 'tag': ['[plan, sign, kit]'],
-                                 'publish': ['[plan, sign, kit, tag]'], 'floor-approve': [], 'floor': ['floor-approve']})
+        self.assertEqual(needs, {'plan': [], 'fixture': ['plan'], 'smoke': ['[plan, fixture]'], 'sign': ['[plan, smoke]'], 'kit': ['[plan, smoke, sign]'],
+                                 'tag': ['[plan, smoke, sign, kit]'], 'publish': ['[plan, smoke, sign, kit, tag]'],
+                                 'floor-approve': [], 'floor': ['floor-approve']})
 
     def declared_outputs(self, name: str) -> dict[str, tuple[str, str]]:
         """{output: (step id, step output)} from the job's `outputs:` block."""
@@ -2885,7 +2889,7 @@ class Workflow(unittest.TestCase):
         self.assertIn('run: cd "$RUNNER_TEMP/stage" && python3 "$GITHUB_WORKSPACE/bin/fleet-install-publish.py" publish '
                       '"release/install-$SERIAL"', publish)  # the publisher wants the relative release/install-N
         upload = re.findall(r'(?m)^          name: (\S+)$', self.JOBS['plan'])
-        self.assertEqual((upload, re.findall(r'(?m)^          name: (\S+)$', publish)), (['install-stage'], ['install-stage']))
+        self.assertEqual((upload, re.findall(r'(?m)^          name: (\S+)$', publish)), (['loaders', 'install-stage'], ['install-stage']))
 
     # the kit job and the floor job
 
@@ -2896,9 +2900,9 @@ class Workflow(unittest.TestCase):
         return '\n'.join(line[10:] for line in body[1].splitlines())
 
     def test_tag_and_publish_both_need_kit_and_kit_needs_the_signatures_not_the_tag(self):
-        self.assertIn('    needs: [plan, sign]\n', self.JOBS['kit'])
-        self.assertIn('    needs: [plan, sign, kit]\n', self.JOBS['tag'])
-        self.assertIn('    needs: [plan, sign, kit, tag]\n', self.JOBS['publish'])
+        self.assertIn('    needs: [plan, smoke, sign]\n', self.JOBS['kit'])
+        self.assertIn('    needs: [plan, smoke, sign, kit]\n', self.JOBS['tag'])
+        self.assertIn('    needs: [plan, smoke, sign, kit, tag]\n', self.JOBS['publish'])
         self.assertLess(self.TEXT.index('\n  sign:\n'), self.TEXT.index('\n  kit:\n'))
         self.assertLess(self.TEXT.index('\n  kit:\n'), self.TEXT.index('\n  tag:\n'))
 
@@ -2947,7 +2951,7 @@ class Workflow(unittest.TestCase):
         self.assertEqual(re.findall(r'^          (\w+): ', kit, re.M),
                          ['INSTALL_B64', 'INSTALL_SHA', 'INSTALL_SIG', 'PUB', 'OWNER_PIN_SHA256', 'KIT_HOST', 'FLEET_READ', 'KIT_UPLOAD_KEY'])
         self.assertEqual(re.findall(r'secrets\.(\w+)', kit), ['FLEET_READ', 'KIT_UPLOAD_KEY'])
-        self.assertIn('    needs: [plan, sign]\n    if: github.ref == \'refs/heads/release\'\n    environment: release\n', kit)
+        self.assertIn('    needs: [plan, smoke, sign]\n    if: github.ref == \'refs/heads/release\'\n    environment: release\n', kit)
 
     def test_the_gateway_record_never_enters_the_folder_the_plan_publishes(self):
         for name in fp.FIXED + fp.KIT_FILES + fp.DATA:
@@ -2976,9 +2980,182 @@ class Workflow(unittest.TestCase):
         self.assertNotIn('inputs.', self.run_body('floor'))
         for job in ('plan',):
             self.assertIn("inputs.mode == 'sign'", self.JOBS[job].split('steps:')[0])
-        self.assertIn("(inputs.mode == 'pubkey' || needs.plan.result == 'success')", self.JOBS['sign'])   # plan is skipped in floor mode, so is sign
+        # plan is skipped in floor mode, so is sign; a smoke that did not succeed stops a sign run (AF34), pubkey mode needs neither
+        self.assertIn("(inputs.mode == 'pubkey' || (needs.plan.result == 'success' && needs.smoke.result == 'success'))", self.JOBS['sign'])
         for bad in ('upload-artifact', 'GITHUB_STEP_SUMMARY', 'set -x', 'FLEET_READ', 'gh '):
             self.assertNotIn(bad, floor, bad)
+
+    # the boot smoke before the signature (AF34)
+
+    SMOKE_ROWS = [('windows-2022', 'ps1', 'root-store', 'true'), ('windows-2025', 'ps1', 'root-store', 'true'),
+                  ('ubuntu-24.04', 'sh', 'ca-certificates', 'true'), ('ubuntu-22.04', 'sh', 'none', 'false'),
+                  ('macos-15', 'sh', 'curl-ca-bundle', 'true')]
+
+    def test_the_smoke_job_holds_nothing_and_runs_the_designed_rows_over_the_fixture_artifact(self):
+        smoke = self.JOBS['smoke']
+        head = smoke.split('steps:')[0]
+        self.assertIn("if: github.ref == 'refs/heads/release' && inputs.mode == 'sign'\n", head)
+        self.assertIn('    needs: [plan, fixture]\n', head)   # the fixture is built once, before the legs
+        self.assertIn('    runs-on: ${{ matrix.runner }}\n', head)
+        self.assertIn('    timeout-minutes: 25\n', head)   # a hung hosted leg must not hold the release for the 360 minute default
+        self.assertIn('    strategy:\n      fail-fast: false\n      matrix:\n        include:\n', head)   # one red leg must not cancel the others' per-OS evidence
+        self.assertIn('    permissions: {}\n', head)   # no token scope: the job reads nothing of this repository's but its public files
+        for bad in ('secrets.', 'vars.', 'environment', 'github.token', 'GH_TOKEN', 'needs.', 'outputs:', 'install-stage',
+                    'FLEET_READ', 'continue-on-error', 'self-hosted', 'actions/cache'):
+            self.assertNotIn(bad, smoke, bad)
+        self.assertNotIn('inputs.', smoke.split('steps:')[1])   # the dispatch inputs reach it through no step
+        rows = re.findall(r'(?m)^          - runner: ([\w.-]+)(?: +#.*)?\n            os: (\w+)\n            trust: ([\w-]+)\n            must_run: (true|false)\n',
+                          smoke)
+        self.assertEqual(rows, self.SMOKE_ROWS)   # block style, one key a line; the keychain row stays in boot-smoke.yml
+        self.assertEqual(smoke.count('          - runner:'), 5)
+        self.assertNotIn('keychain', smoke)
+        self.assertEqual(re.findall(r'uses: (\S+)', smoke),
+                         ['actions/checkout@11d5960a326750d5838078e36cf38b85af677262', 'actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065',
+                          'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093'])
+        self.assertIn('          name: fixture\n          path: fixture\n', smoke)   # it downloads the fixture; it builds none, and holds no loader
+        self.assertNotIn('make_fixture', smoke)
+        self.assertNotIn('loaders', smoke)
+        self.assertLess(smoke.index('name: fixture'), smoke.index('smoke_driver.py probe'))
+        for need in ('smoke_driver.py control --dir fixture --phase before', 'smoke_driver.py control --dir fixture --phase after',
+                     'smoke_driver.py fixture --dir fixture --os "$BOOT_OS" "${flag[@]}"', '[ "$BOOT_MUST" = true ] && flag=(--must-run)',
+                     'BOOT_OS: ${{ matrix.os }}', 'BOOT_MUST: ${{ matrix.must_run }}'):
+            self.assertIn(need, smoke)
+        self.assertEqual(smoke.count('persist-credentials: false'), 1)
+
+    # the fixture is built once on ubuntu and shipped to every leg, as boot-smoke.yml does (run 38633686710: built per leg it was
+    # REFUSED tool on macos-15 and REFUSED verify on windows-2022 and windows-2025; the dispatch shape ran 7/7 green, run 38514272677)
+
+    @staticmethod
+    def steps_of(job: str) -> list[str]:
+        """The text of each `      - ` step of a job, in order."""
+        return re.findall(r'(?ms)^      - .*?(?=^      - |\Z)', job.split('    steps:\n', 1)[1])
+
+    def test_the_fixture_job_builds_it_once_on_ubuntu_from_the_loaders_and_holds_nothing(self):
+        fixture = self.JOBS['fixture']
+        head, body = fixture.split('    steps:\n', 1)
+        self.assertEqual(head, "    needs: plan\n    if: github.ref == 'refs/heads/release' && inputs.mode == 'sign'\n"
+                                "    runs-on: ubuntu-24.04\n    timeout-minutes: 10\n    permissions: {}\n")   # no matrix, no environment, no token scope
+        for bad in ('secrets.', 'vars.', 'environment', 'github.token', 'GH_TOKEN', 'needs.', 'outputs:', 'install-stage',
+                    'FLEET_READ', 'continue-on-error', 'self-hosted', 'actions/cache', 'matrix', '--boot-dir'):
+            self.assertNotIn(bad, fixture, bad)
+        self.assertEqual(re.findall(r'uses: (\S+)', fixture),
+                         ['actions/checkout@11d5960a326750d5838078e36cf38b85af677262', 'actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065',
+                          'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093', 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02'])
+        self.assertIn('          name: loaders\n          path: loaders\n', fixture)
+        self.assertEqual(re.findall(r'(?m)^      - run: (.*)$', fixture),
+                         ['python3 tests/fixture/make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh'])
+        self.assertNotIn('inputs.', body)   # the dispatch inputs reach it through no step
+        self.assertEqual(fixture.count('persist-credentials: false'), 1)
+        self.assertLess(fixture.index('name: loaders'), fixture.index('make_fixture.py'))
+        self.assertLess(fixture.index('make_fixture.py'), fixture.index('name: fixture'))
+        self.assertLess(self.TEXT.index('\n  plan:\n'), self.TEXT.index('\n  fixture:\n'))
+        self.assertLess(self.TEXT.index('\n  fixture:\n'), self.TEXT.index('\n  smoke:\n'))
+
+    def test_a_red_smoke_stops_the_signature_and_every_job_after_it(self):
+        for name in ('sign', 'kit', 'tag', 'publish'):
+            self.assertRegex(self.JOBS[name], rf'(?m)^    needs: \[plan, smoke[,\]]', name)
+        sign = self.JOBS['sign']
+        self.assertIn("needs.smoke.result == 'success'", sign)   # the status check is not left to the default: sign runs with !cancelled()
+        self.assertLess(sign.index("needs.plan.result == 'success'"), sign.index("needs.smoke.result == 'success'"))
+        for name in ('floor-approve', 'floor'):   # the floor mode never waits for a smoke or its fixture
+            self.assertNotIn('smoke', self.JOBS[name])
+            self.assertNotIn('fixture', self.JOBS[name])
+        self.assertNotIn('fixture', sign.split('steps:')[0])   # sign reaches the fixture through smoke, which needs it
+        self.assertLess(self.TEXT.index('\n  plan:\n'), self.TEXT.index('\n  smoke:\n'))
+        self.assertLess(self.TEXT.index('\n  smoke:\n'), self.TEXT.index('\n  sign:\n'))
+
+    def test_the_plan_job_hands_only_the_two_loaders_to_the_fixture_job(self):
+        plan = self.JOBS['plan']
+        self.assertEqual(re.findall(r'(?m)^          name: (\S+)$', plan), ['loaders', 'install-stage'])
+        up = re.search(r'(?ms)^      - uses: actions/upload-artifact@\w+ +# v4\.6\.2\n        with:\n          name: loaders\n(.*?)(?=^      - |\Z)', plan)
+        self.assertIsNotNone(up)
+        self.assertEqual(up[1], '          path: ${{ runner.temp }}/loaders\n          retention-days: 1\n          if-no-files-found: error\n')
+        self.assertLess(plan.index('      - id: plan\n'), plan.index('      - id: loaders\n'))   # after every offline check
+        self.assertLess(plan.index('      - id: loaders\n'), plan.index('name: loaders\n'))
+        step = self.step_text('plan', 'loaders')
+        self.assertTrue(step.startswith('        env:\n'), step[:40])   # no `if:` before env: nothing may gate the step into a skip
+        self.assertNotIn('\n        if:', step)
+        self.assertIn('"$TIP:release/install-$SERIAL/$f"', self.run_loaders_body())   # the plan's own tip; HEAD is unborn in the real job
+        self.assertIn('SERIAL: ${{ steps.plan.outputs.serial }}', step)
+        self.assertIn('TIP: ${{ steps.plan.outputs.tip }}', step)
+        self.assertNotIn('secrets.', step)
+        self.assertNotIn('${{', self.run_loaders_body())
+
+    def run_loaders_body(self) -> str:
+        return '\n'.join(l[10:] for l in self.step_text('plan', 'loaders').split('        run: |\n', 1)[1].splitlines())
+
+    def loaders_repo(self, tmp: Path, files: dict[str, bytes], crlf_worktree: bool = True) -> tuple[Path, str]:
+        """A fleet repository standing in for the `release` branch (the ps1 checks out as CRLF, as .gitattributes says);
+        (the RUNNER_TEMP holding it as fleet/, its tip)."""
+        fleet = tmp / 'rt' / 'fleet'
+        fleet.mkdir(parents=True)
+        git = lambda *a: subprocess.run([fp.GIT, '-C', str(fleet), *a], env=GIT_ENV, check=True, capture_output=True, text=True).stdout.strip()
+        git('init', '-q', '-b', 'release')
+        (fleet / '.gitattributes').write_text('*.ps1 text eol=crlf\n')
+        folder = fleet / 'release' / 'install-7'
+        folder.mkdir(parents=True)
+        for name, data in files.items():
+            (folder / name).write_bytes(data)
+        git('add', '-A')
+        git('commit', '-q', '-m', 'x')
+        for name in files:   # what a checkout of the tip makes of them: the working tree copy is the smudged one
+            (folder / name).unlink()
+        git('checkout', '-q', 'HEAD', '--', '.')
+        return tmp / 'rt', git('rev-parse', 'HEAD')
+
+    def run_loaders(self, tmp: Path, rt: Path, serial: str = '7', tip: str = '') -> subprocess.CompletedProcess:
+        env = {'PATH': '/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin', 'HOME': str(tmp), 'GIT_CONFIG_NOSYSTEM': '1', 'RUNNER_TEMP': str(rt),
+               'SERIAL': serial, 'TIP': tip}
+        return subprocess.run(['/bin/bash', '--noprofile', '--norc', '-c', self.run_loaders_body()], env=env, capture_output=True, text=True, cwd=tmp)
+
+    SH, PS1 = b'#!/bin/sh\necho sh\n', b'# ps1\n$x = 1\n'
+
+    @unittest.skipUnless(os.path.exists(fp.GIT), 'git is missing')
+    def test_the_loaders_step_reads_the_lf_blobs_though_the_checked_out_ps1_is_crlf_and_uploads_only_those_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            rt, tip = self.loaders_repo(tmp, {'bootstrap.sh': self.SH, 'bootstrap.ps1': self.PS1, 'install.json': b'{}\n', 'kit.json': b'{}\n'})
+            folder = rt / 'fleet' / 'release' / 'install-7'
+            self.assertEqual((folder / 'bootstrap.ps1').read_bytes(), self.PS1.replace(b'\n', b'\r\n'))   # the premise: CRLF on disk
+            fleet = rt / 'fleet'   # a later commit on the branch: reading HEAD or the branch, not the tip, would hand on other bytes
+            (fleet / 'release' / 'install-7' / 'bootstrap.sh').write_bytes(b'#!/bin/sh\necho later\n')
+            for args in (('add', '-A'), ('commit', '-q', '-m', 'later')):
+                subprocess.run([fp.GIT, '-C', str(fleet), *args], env=GIT_ENV, check=True, capture_output=True, text=True)
+            done = self.run_loaders(tmp, rt, tip=tip)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            out = rt / 'loaders'
+            self.assertEqual(sorted(p.name for p in out.iterdir()), ['bootstrap.ps1', 'bootstrap.sh'])   # nothing else of the folder goes out
+            self.assertEqual((out / 'bootstrap.ps1').read_bytes(), self.PS1)   # the blob, not the working tree
+            self.assertNotIn(b'\r', (out / 'bootstrap.ps1').read_bytes())
+            self.assertEqual((out / 'bootstrap.sh').read_bytes(), self.SH)
+
+    @unittest.skipUnless(os.path.exists(fp.GIT), 'git is missing')
+    def test_the_loaders_step_fails_on_a_missing_or_empty_loader_a_bad_serial_or_a_bad_tip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            for what, files, want in (('no ps1', {'bootstrap.sh': self.SH}, 'REFUSED loader bootstrap.ps1'),
+                                      ('no sh', {'bootstrap.ps1': self.PS1}, 'REFUSED loader bootstrap.sh'),
+                                      ('an empty sh', {'bootstrap.sh': b'', 'bootstrap.ps1': self.PS1}, 'REFUSED loader bootstrap.sh'),
+                                      ('neither', {'install.json': b'{}\n'}, 'REFUSED loader bootstrap.sh')):
+                with self.subTest(what):
+                    (tmp / what.replace(' ', '-')).mkdir()
+                    rt, tip = self.loaders_repo(tmp / what.replace(' ', '-'), files)
+                    done = self.run_loaders(tmp, rt, tip=tip)
+                    self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                    self.assertIn(want, done.stdout)
+            (tmp / 'ok').mkdir()
+            rt, tip = self.loaders_repo(tmp / 'ok', {'bootstrap.sh': self.SH, 'bootstrap.ps1': self.PS1})
+            for what, serial, tip_in, want in (('a serial that is another folder', '8', tip, 'REFUSED loader bootstrap.sh'),
+                                               ('a serial with a path in it', '7/../7', tip, 'REFUSED loader serial'),
+                                               ('an empty serial', '', tip, 'REFUSED loader serial'),
+                                               ('a tip that is a name', '7', 'release', 'REFUSED loader tip'),
+                                               ('an empty tip', '7', '', 'REFUSED loader tip'),
+                                               ('a tip that is short', '7', tip[:12], 'REFUSED loader tip')):
+                with self.subTest(what):
+                    shutil.rmtree(rt / 'loaders', ignore_errors=True)
+                    done = self.run_loaders(tmp, rt, serial=serial, tip=tip_in)
+                    self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                    self.assertIn(want, done.stdout)
 
     # those two run blocks, for real, over a stand-in python3 that records what it is given
 
