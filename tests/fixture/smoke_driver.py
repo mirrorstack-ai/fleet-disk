@@ -35,16 +35,26 @@ FLAGS = {'ps1': {'serial': '-Serial', 'min': '-MinSerial', 'ser': '-Ser'},  # `s
 LOGICAL = [(serve.REL, lambda m: m[2]), (serve.PY, lambda m: 'python.zip')]
 
 
-def machine() -> str | None:
-    """The refusal this machine earns before any case-specific step, mirroring the bootstraps' own early checks."""
+# The Ubuntu releases the loaders admit (D310, exact VERSION_ID). Twin: backends.UBUNTU_OK and bootstrap.sh check_machine in
+# mirrorstack-fleet (PV11), each pinned by its own test; the driver must admit at least what the newest release loader admits.
+UBUNTU_OK = ('24.04', '26.04')
+
+
+def machine(osrel: str = '/etc/os-release', arch: str | None = None) -> str | None:
+    """The refusal this machine earns before any case-specific step, mirroring the bootstraps' own early checks.
+    `osrel` and `arch` are the test seam; the hosted call sites pass nothing."""
     if WIN:
         return None if os.path.exists(WIN_KEYGEN) else 'ssh-keygen'
     if platform.system() != 'Linux':
         return None
-    rel = dict(x.strip().replace('"', '').split('=', 1) for x in open('/etc/os-release') if '=' in x)
-    if rel.get('ID') != 'ubuntu' or rel.get('VERSION_ID') != '24.04':
+    try:
+        with open(osrel) as f:
+            rel = dict(x.strip().replace('"', '').split('=', 1) for x in f if '=' in x)
+    except (OSError, ValueError):  # unreadable, like a missing VERSION_ID: not an admitted Ubuntu
         return 'os'
-    return None if platform.machine() in ('x86_64', 'amd64') else 'arch'
+    if rel.get('ID') != 'ubuntu' or rel.get('VERSION_ID') not in UBUNTU_OK:
+        return 'os'
+    return None if (platform.machine() if arch is None else arch) in ('x86_64', 'amd64') else 'arch'
 
 
 def expect(c: dict, mach: str | None, kvm: bool) -> dict:
