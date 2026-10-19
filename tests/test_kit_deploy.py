@@ -1675,12 +1675,14 @@ class OverHttp(unittest.TestCase):
 
     def test_the_slow_runner_control_without_the_replay_clock_asks_for_no_expiry_wait(self):
         # control for the test above: the same slow runner, the replay measuring on the runner's own clock. It then finds
-        # the 5 s already spent and asks for no wait of 2 s or more (the CI failure; there the kit's real clock had also
-        # moved on, so the replay passed and only the count failed. Here nothing really waited, so it refuses at 'expired')
+        # the 5 s already spent and asks for no wait of 2 s or more (the CI failure). Whether the replay then refuses at
+        # 'expired' depends on how much real time the kit's clock saw (CI run 39252169089: it did not refuse), so only the
+        # count is asserted here; test_without_the_clock_moving_the_invite_does_not_expire holds the expiry gate itself
         with slow_runner():
-            with self.assertRaises(kc.Refused) as why:
+            try:
                 self.replay(real_clock=True)
-        self.assertIn('expired', str(why.exception))
+            except kc.Refused as e:
+                self.assertIn('expired', str(e))
         self.assertEqual([s for s, advanced in self.kit.sleeps if advanced], [], self.kit.sleeps)
 
     def test_a_short_wait_really_sleeps_through_the_replays_own_sleep(self):
