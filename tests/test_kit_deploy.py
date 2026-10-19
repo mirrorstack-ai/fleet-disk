@@ -24,7 +24,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stdout
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -183,9 +183,29 @@ class FakeKit:
         self.signed_calls = 0                    # well-formed KitAdmin calls seen, in order (version-propagation flags)
         self.per_target: dict[tuple[str, str | None], int] = {}
         self.admin_log: list[tuple[str, str, str, int, int]] = []  # (role, method, path, ts, status) per signed call
+        self.skew_ms = 0                         # how far this kit's clock runs ahead of the real one (advance() moves it)
+        self.sleeps: list[tuple[float, bool]] = []   # fake_sleep's record: (seconds asked for, True if it moved the clock)
 
     def now(self) -> int:
-        return int(time.time() * 1000)
+        return int(time.time() * 1000 + self.skew_ms)
+
+    def advance(self, ms: float) -> None:
+        """Move the kit's clock forward: invites expire and the 300 s signature window shifts, with no real time spent."""
+        self.skew_ms += ms
+
+    def fake_sleep(self, real=time.sleep):
+        """The `sleep` for run_replay. A wait of 2 s or more is the invite-expiry wait (short_life_ms 2500 + the 2500 ms
+        margin, about 5 s): the kit's clock moves instead of the test waiting. Every shorter wait (cut_wait 0.4, the spacings)
+        is real-time synchronisation with the fake server and really sleeps through `real`. A wait under 2 s that is the
+        expiry wait (a loaded runner already spent more than 3 s) is simply slept for real: correct, only slower."""
+        def sleep(s):
+            advanced = s >= 2.0
+            self.sleeps.append((s, advanced))
+            if advanced:
+                self.advance(s * 1000)
+            else:
+                real(s)
+        return sleep
 
     def verify(self, role: str, ts: str, method: str, path: str, digest: str, sig_hex: str) -> bool:
         with tempfile.TemporaryDirectory() as d:
@@ -582,6 +602,40 @@ class Served:
     def __exit__(self, *a):
         self.server.shutdown()
         self.server.server_close()
+
+
+class ReplayClock:
+    """Stands in for the `time` module inside fleet-kit-check.py for one replay. run_replay asks for its late expiry wait as
+    (short_life_ms + 2500) / 1000 - (time.monotonic() - t_e): 5 s minus the REAL seconds spent since the invite was made.
+    On a slow runner those seconds already exceed 5, so no wait was asked for and the count failed (CI run 39247858912,
+    unit 3.13: `0 != 1`, every wait 0.0 to 0.4 s). Here monotonic() is virtual, one millisecond per read, so the wait is
+    always almost the full 5 s whatever the runner's speed. time(), sleep() and the rest are the real module's: the kit's
+    clock stays real + skew, so the invite still really expires when the fake sleep advances it."""
+    TICK = 0.001
+
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self) -> float:
+        self.t += self.TICK
+        return self.t
+
+    def __getattr__(self, name):               # only reached for what is not defined above
+        return getattr(time, name)
+
+
+@contextmanager
+def slow_runner(step: float = 10.0):
+    """A runner so slow that every read of the process-wide monotonic clock finds `step` more seconds spent. Patched, so
+    nothing really sleeps: it is the clock a replay would measure its own elapsed time with, made to show a slow machine."""
+    spent = [0.0]
+    real = time.monotonic
+
+    def monotonic() -> float:
+        spent[0] += step
+        return real() + spent[0]
+    with mock.patch.object(time, 'monotonic', monotonic):
+        yield
 
 
 def read_pub(gate_dir: str, role: str) -> str:
@@ -1284,12 +1338,16 @@ class OverHttp(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def replay(self, run=None, **flags):
-        kit = FakeKit(self.pubs, **flags)
+    def replay(self, run=None, real_clock=False, **flags):
+        """Runs the replay against a fake kit (kept as self.kit, so a refused replay can still be inspected). Its own elapsed
+        time is measured on a ReplayClock, not on the runner's clock, unless real_clock (only the slow-runner control)."""
+        kit = self.kit = FakeKit(self.pubs, **flags)
         # the readiness streak is the real one (10); only the waits are short here
         kw = dict(big_mib=12, cut_wait=0.4, short_life_ms=2500, ready_spacing=0.0, retry_wait=0.0, log=lambda *_: None)
         kw.update(run or {})
-        with Served(kit) as base:
+        # the expiry wait moves the kit's clock (no real wait); a `sleep` in `run` is the one every shorter wait really uses
+        kw['sleep'] = kit.fake_sleep(kw.get('sleep', time.sleep))
+        with Served(kit) as base, (nullcontext() if real_clock else mock.patch.object(kc, 'time', ReplayClock())):
             client = kc.Client(base, allow_http=True)
             lines = kc.run_replay(client, kc.Admin(client, self.gate_dir), **kw)
         return kit, lines
@@ -1587,13 +1645,86 @@ class OverHttp(unittest.TestCase):
         self.refused('root: status 200, expected 404', managed_robots_on='/')
         self.refused('root: status 200, expected 404', managed_robots_on='/', robots='managed')
 
+    # -- PW08 (G-KITTEST-1): the expiry wait is the kit's clock moving, not about 5 s of sleep per replay ---------------
+    def assert_one_expiry_wait(self, kit):
+        asked = [s for s, advanced in kit.sleeps if advanced]
+        # (a) the wait is still asked for (the live path is exercised) and it moved the kit's clock for it, once; with the
+        # replay's elapsed time on a ReplayClock it is almost the full 5 s, so this holds on any runner
+        self.assertEqual(len(asked), 1, kit.sleeps)
+        self.assertGreaterEqual(asked[0], 4.0)
+        self.assertLessEqual(asked[0], 5.0)
+        self.assertGreaterEqual(kit.skew_ms, asked[0] * 1000)
+        # (b) every other wait stayed real: the two cut_waits are slept (not advanced); no 3 s 503 retry is ever asked for
+        # (the fake cannot answer 503 to the invite POST; if it ever does, the wrapper must exclude that literal 3)
+        real = [s for s, advanced in kit.sleeps if not advanced]
+        self.assertEqual(real.count(0.4), 2, kit.sleeps)
+        self.assertLess(max(real), 2.0)
+        self.assertNotIn(3, [s for s, _ in kit.sleeps])
+
+    def test_the_expiry_wait_costs_no_real_time(self):
+        kit, _ = self.replay()
+        self.assert_one_expiry_wait(kit)
+        # no wall-clock bound on purpose: the record above is the evidence the expiry wait was not slept
+
+    def test_a_slow_runner_still_gets_exactly_one_advanced_expiry_wait(self):
+        # CI run 39247858912 (unit 3.13, 0 != 1): the runner spent the ~5 s before the late wait, so none was asked for.
+        # Every read of the process clock now finds 10 s more spent; the replay must not notice
+        with slow_runner():
+            kit, _ = self.replay()
+        self.assert_one_expiry_wait(kit)
+
+    def test_the_slow_runner_control_without_the_replay_clock_asks_for_no_expiry_wait(self):
+        # control for the test above: the same slow runner, the replay measuring on the runner's own clock. It then finds
+        # the 5 s already spent and asks for no wait of 2 s or more (the CI failure). Whether the replay then refuses at
+        # 'expired' depends on how much real time the kit's clock saw (CI run 39252169089: it did not refuse), so only the
+        # count is asserted here; test_without_the_clock_moving_the_invite_does_not_expire holds the expiry gate itself
+        with slow_runner():
+            try:
+                self.replay(real_clock=True)
+            except kc.Refused as e:
+                self.assertIn('expired', str(e))
+        self.assertEqual([s for s, advanced in self.kit.sleeps if advanced], [], self.kit.sleeps)
+
+    def test_a_short_wait_really_sleeps_through_the_replays_own_sleep(self):
+        # the passthrough: every wait under 2 s reaches the `sleep` the replay was given (a recorder here), so dropping the
+        # real sleep for the cut_waits and spacings would be seen; the expiry wait never reaches it (it moves the clock)
+        rec = []
+        self.replay(run={'sleep': rec.append})
+        self.assertEqual(rec.count(0.4), 2, rec)
+        self.assertLess(max(rec), 2.0, rec)
+
+    def test_without_the_clock_moving_the_invite_does_not_expire(self):
+        # positive control: the replay needs the clock to move; with the expiry wait skipped and the kit's clock held,
+        # the short invite still downloads and the replay refuses at 'expired' (the assertion is not skipped)
+        kit = FakeKit(self.pubs)
+        frozen = int(time.time() * 1000)
+        kit.now = lambda: frozen
+        with Served(kit) as base:
+            client = kc.Client(base, allow_http=True)
+            with self.assertRaises(kc.Refused) as why:
+                kc.run_replay(client, kc.Admin(client, self.gate_dir), big_mib=1, cut_wait=0, short_life_ms=2500,
+                              ready_spacing=0.0, retry_wait=0.0, sleep=lambda s: None, log=lambda *_: None)
+        self.assertIn('expired', str(why.exception))
+
+    def test_the_fake_kit_still_enforces_the_300_s_signature_window_on_its_advanced_clock(self):
+        kit = FakeKit(self.pubs)
+        with Served(kit) as base:
+            client = kc.Client(base, allow_http=True)
+            admin = kc.Admin(client, self.gate_dir)
+            self.assertEqual(admin.call('gateway', 'GET', '/_k/state').status, 200)
+            kit.advance(5000)                           # the replay's expiry wait: far inside the window
+            self.assertEqual(admin.call('gateway', 'GET', '/_k/state').status, 200)
+            kit.advance(300000)                         # past 300 s in all: a signature made now is refused
+            self.assertEqual(admin.call('gateway', 'GET', '/_k/state').status, 404)
+
     def test_the_replay_refuses_a_worker_without_the_upload_key(self):
         pubs = dict(self.pubs, upload='')
         kit = FakeKit(pubs)
         with Served(kit) as base:
             client = kc.Client(base, allow_http=True)
             with self.assertRaises(kc.Refused):
-                kc.run_replay(client, kc.Admin(client, self.gate_dir), big_mib=1, cut_wait=0, short_life_ms=2500, log=lambda *_: None)
+                kc.run_replay(client, kc.Admin(client, self.gate_dir), big_mib=1, cut_wait=0, short_life_ms=2500,
+                              sleep=kit.fake_sleep(), log=lambda *_: None)
 
     def test_the_probe_passes_and_spends_at_most_five_gate_failures(self):
         kit = FakeKit(self.pubs)
