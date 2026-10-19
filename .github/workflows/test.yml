@@ -11,10 +11,11 @@ concurrency:
 jobs:
   unit:
     runs-on: ubuntu-24.04
-    # 20, not 10: measured 2026-10-12, the suite is 523 tests in 600 s on this runner (430 s on a Mac) and the job was
-    # cancelled one second after `OK`. 328 s of it is test_kit_deploy.OverHttp: each replay waits about 6 s of real time for
-    # a short-lived invite to expire, and there are about 55 replays. Shortening that wait is a separate change.
-    timeout-minutes: 20
+    # 10 again (PW08, G-KITTEST-1). It was 20 from 2026-10-12, when the suite measured 600 s on this runner and the job was
+    # cancelled one second after `OK`: 328 s of that was test_kit_deploy.OverHttp, each replay waiting about 5 s of real
+    # time for a short-lived invite to expire. The test's fake kit now moves its own clock for that wait. Read the run's
+    # `unit` duration before trusting 10: if a run is over 300 s, raise this again and record the duration in the gap.
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
