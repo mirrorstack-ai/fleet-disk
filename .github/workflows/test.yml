@@ -11,11 +11,12 @@ concurrency:
 jobs:
   unit:
     runs-on: ubuntu-24.04
-    # 10 again (PW08, G-KITTEST-1). It was 20 from 2026-10-12, when the suite measured 600 s on this runner and the job was
-    # cancelled one second after `OK`: 328 s of that was test_kit_deploy.OverHttp, each replay waiting about 5 s of real
-    # time for a short-lived invite to expire. The test's fake kit now moves its own clock for that wait. Read the run's
-    # `unit` duration before trusting 10: if a run is over 300 s, raise this again and record the duration in the gap.
-    timeout-minutes: 10
+    # 20, not 10: measured 2026-10-12, the suite is 523 tests in 600 s on this runner (430 s on a Mac) and the job was
+    # cancelled one second after `OK`. 328 s of it was test_kit_deploy.OverHttp: each replay waiting about 5 s of real time
+    # for a short-lived invite to expire. PW08 (G-KITTEST-1) moved that wait onto the fake kit's clock, but 10 is not earned
+    # yet: run 39247858912 measured unit (3.13) at 361.8 s for 657 tests, and unit (3.11) was cancelled at the 10-minute
+    # limit (10m15s). Back to 10 only when a run shows both Pythons well under 300 s; record the durations in the gap.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
