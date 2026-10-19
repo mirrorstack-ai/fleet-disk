@@ -6,12 +6,18 @@
 Five `systemd-run` legs over one QEMU argv (`-machine none -S`, no KVM; stdin carries two QMP commands and QEMU exits 0 on `quit`):
   B   the shipped filter (tests/fixture/l1_unit_filter.txt, the twin of mirrorstack-fleet's unit)   must END Result=success
   C   B plus `SystemCallFilter=~seccomp`, the positive control, ALWAYS run                         must END SIGSYS, attributed
-  Cd  C with `-sandbox off`: QEMU then never calls seccomp(2)                                      must END Result=success
   A   `SystemCallFilter=@system-service` alone, the 24.04 failure                                   SIGSYS (attributed) or success
-  Ad  A with `-sandbox off`, run only when A died                                                  must END Result=success
-A SIGSYS is not proof that the UNIT's filter killed QEMU (QEMU 8.2.2's own `-sandbox` deny-list also traps), so every death is
-attributed by (i) a kernel record (syscall=317, comm="qemu-system-x86") that appeared DURING the leg, or (ii) its `-sandbox off`
-twin ending Result=success. A death with neither is INSTRUMENT-BLIND. A smoke that could not run is REFUSED, never a pass.
+  Cd  C with `-sandbox off`, ALWAYS run                                                            INFORMATIONAL only
+  Ad  A with `-sandbox off`, run only when A died                                                  INFORMATIONAL only
+A SIGSYS is not proof that the UNIT's filter killed QEMU, so a death is attributed by ONE thing: a kernel record that appeared DURING
+that leg (before/after, `journalctl -k` and `dmesg`): type=1326, comm="qemu-system-x86", sig=31, syscall=317 (seccomp(2)). A death
+with no such record is INSTRUMENT-BLIND (FAIL), never a pass. A smoke that could not run is REFUSED, never a pass.
+The `-sandbox off` twins attribute nothing and decide nothing: they are printed under `twin (informational): ...`. MEASURED on hosted
+ubuntu-24.04 (run 39247567865, QEMU 8.2.2+ds-0ubuntu1.18, systemd 255): QEMU 8.2.2 calls seccomp(2) even under `-sandbox off`, so Cd and
+Ad died 31/SYS with a kernel record syscall=317 at the same ip as C and A, and the premise "with -sandbox off QEMU never reaches
+seccomp, so the twin must succeed" is FALSE on the real runner; the same run showed the runner logs type=1326 records in both journalctl
+-k and dmesg, and that systemd-analyze colorizes its output even when piped (so the dump is run with SYSTEMD_COLORS=0 and NO_COLOR=1 and
+its ANSI CSI sequences are stripped before it is printed, compared or written).
 The unit's text and QEMU's sandbox word are literals here; each twin repo pins its own copy (the limits are in PW04's entry)."""
 from __future__ import annotations
 
@@ -34,9 +40,16 @@ QMP_IN = '{"execute":"qmp_capabilities"}\n{"execute":"quit"}\n'
 BASE_PROPS = ('User=nobody', 'NoNewPrivileges=yes', 'LimitCORE=0', 'RuntimeMaxSec=20')
 DUMP_CMD = ['systemd-analyze', 'syscall-filter', '@system-service', '@sandbox']
 LEGS = ('B', 'C', 'Cd', 'A', 'Ad')
-UNPINNED = 'UNPINNED'   # the committed placeholder of the dump fixture, until the first hosted run's dump replaces it
+UNPINNED = 'UNPINNED'   # the placeholder a dump fixture may hold before a hosted run's dump is committed (it is pinned now; the guard stays)
+DUMP_ENV = {'SYSTEMD_COLORS': '0', 'NO_COLOR': '1'}   # systemd-analyze colorizes even when piped (run 39247567865)
+ANSI_CSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')   # ESC [ parameter bytes, intermediate bytes, final byte
+TWINS = ('Cd', 'Ad')
+RECORD_FIELDS = (r'\btype=1326\b', r'\bsig=31\b', r'\bsyscall=317\b', r'\bcomm="qemu-system-x86"')
 NOTICE = ("::notice::CONTROL-NOT-REPRODUCED systemd {v}: @sandbox is in @default here (a backport), "
           "the loader's line is redundant on this release and harmless")
+ATTRIBUTED = '{leg} attributed by a kernel record (type=1326, comm="qemu-system-x86", sig=31, syscall=317) during the leg'
+BLIND = ('INSTRUMENT-BLIND: {leg} died 31/SYS with no kernel record (type=1326, comm="qemu-system-x86", sig=31, syscall=317) '
+         'during the leg; the -sandbox off twins do not attribute')
 
 
 class Result(NamedTuple):
@@ -96,15 +109,24 @@ def parse(out: str) -> Result:
     return Result(True, success and not sig, sig, how)
 
 
-def attribution(leg: Leg, twin: Leg | None) -> list[str]:
-    """(ii) is sound for C only: seccomp(2) is denied before QEMU's own filter loads, so a passing `-sandbox off` twin separates the
-    unit's filter from QEMU's. For A the twin drops the whole sandbox, so (ii) cannot tell the unit's filter from QEMU's deny-list
-    trapping: A's attribution is advisory and decides INSTRUMENT-BLIND only, never the control's PASS."""
+def is_record(line: str) -> bool:
+    return all(re.search(f, line) for f in RECORD_FIELDS)
+
+
+def attributed(leg: Leg) -> bool:
+    """The kernel record is the only attribution. The `-sandbox off` twins cannot give one: QEMU 8.2.2 calls seccomp(2) under them too."""
+    return any(is_record(x) for x in leg.records)
+
+
+def twin_lines(legs: dict[str, Leg]) -> list[str]:
+    """What the twins did, for the log. Nothing reads them: they neither fail the run nor attribute a death."""
     got = []
-    if leg.records:
-        got.append('(i) kernel record')
-    if twin is not None and twin.res.success:
-        got.append('(ii) -sandbox off twin ended Result=success')
+    for name in TWINS:
+        leg = legs.get(name)
+        if leg is not None:
+            how = leg.res.how if leg.res.valid else leg.res.how + ' (nothing observed)'
+            got.append(f'twin (informational): {name} (-sandbox off) {how}; kernel records during the leg: {len(leg.records)}')
+            got.extend(f'  {x}' for x in leg.records)
     return got
 
 
@@ -126,35 +148,25 @@ def judge(legs: dict[str, Leg], dump: str, version: str) -> Verdict:
         elif not legs['B'].res.success:
             bad.append(f"B: ended {legs['B'].res.how}, not Result=success")
     if usable('C'):
-        c, cd = legs['C'], legs.get('Cd')
+        c = legs['C']
         if c.res.success:
             bad.append('INSTRUMENT-BLIND: the control leg did not die')
         elif not c.res.sys:
             bad.append(f'INSTRUMENT-BLIND: the control leg died but not by SIGSYS ({c.res.how})')
+        elif attributed(c):
+            notes.append(ATTRIBUTED.format(leg='C'))
         else:
-            how = attribution(c, cd)
-            if how:
-                notes.append('C attributed by ' + ' and '.join(how))
-            else:
-                bad.append('INSTRUMENT-BLIND: C died 31/SYS with no kernel record and its -sandbox off twin did not end Result=success')
-    if usable('Cd') and not legs['Cd'].res.success:
-        bad.append(f"Cd: the -sandbox off twin ended {legs['Cd'].res.how}, it must end Result=success")
+            bad.append(BLIND.format(leg='C'))
     if usable('A'):
-        a, ad = legs['A'], legs.get('Ad')
+        a = legs['A']
         if a.res.success:
             notes.append(NOTICE.format(v=version))
         elif not a.res.sys:
             bad.append(f'A: died but not by SIGSYS ({a.res.how})')
+        elif attributed(a):
+            notes.append(ATTRIBUTED.format(leg='A'))
         else:
-            how = attribution(a, ad)
-            if how:
-                notes.append('A attributed by ' + ' and '.join(how))
-            else:
-                bad.append('INSTRUMENT-BLIND: A died 31/SYS with no kernel record and no Result=success from its -sandbox off twin')
-        if ad is not None and ad.res.valid and not ad.res.success:
-            bad.append(f'Ad: the -sandbox off twin ended {ad.res.how}, it must end Result=success')
-        elif ad is not None and not ad.res.valid:
-            bad.append(f'Ad: {ad.res.how} in the output (nothing observed)')
+            bad.append(BLIND.format(leg='A'))
     if dump == 'differs':
         bad.append('DUMP-DIFFERS: the syscall-filter dump moved against tests/fixture/ubuntu2404-filter-dump.txt (an image bump changed the tables)')
     elif dump == 'unpinned':
@@ -166,9 +178,11 @@ def judge(legs: dict[str, Leg], dump: str, version: str) -> Verdict:
     return Verdict('FAIL' if bad else 'PASS', tuple(bad), tuple(notes))
 
 
-def real_run(argv: list[str], stdin: str | None = None, timeout: int = 120) -> tuple[int | None, str]:
+def real_run(argv: list[str], stdin: str | None = None, timeout: int = 120, env: dict[str, str] | None = None) -> tuple[int | None, str]:
+    """`env` is added to this process's environment, never a replacement of it."""
     try:
-        p = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace', timeout=timeout)
+        p = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace', timeout=timeout,
+                           env=None if env is None else {**os.environ, **env})
     except FileNotFoundError:
         return 127, ''
     except subprocess.TimeoutExpired as e:
@@ -178,13 +192,17 @@ def real_run(argv: list[str], stdin: str | None = None, timeout: int = 120) -> t
 
 
 def kernel_records(run: Callable, el: list[str]) -> collections.Counter:
-    """The kernel lines naming a seccomp(2) call (x86-64 syscall 317) by qemu: `journalctl -k` and `dmesg`, whole."""
+    """The audit lines (type=1326) of qemu being killed (sig=31) at a seccomp(2) call (x86-64 syscall 317): `journalctl -k` and `dmesg`, whole."""
     seen = collections.Counter()
     for argv in (el + ['journalctl', '-k', '--no-pager', '-o', 'short-iso'], el + ['dmesg']):
         for line in run(argv)[1].splitlines():
-            if re.search(r'syscall=317\b', line) and 'comm="qemu-system-x86"' in line:
+            if is_record(line):
                 seen[line] += 1
     return seen
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_CSI.sub('', text)
 
 
 def normal(text: str) -> str:
@@ -214,12 +232,12 @@ def smoke(run: Callable = real_run, *, which: Callable = shutil.which, exists: C
     version = m.group(1) if m else 'unknown'
     out(f'systemd: {ver[0] if ver else "unknown"}')
     qver = (run([QEMU, '--version'])[1].strip().splitlines() or ['unknown'])[0]
-    ndef = sum('@sandbox' in x for x in run(['systemd-analyze', 'syscall-filter', '@default'])[1].splitlines())
+    ndef = sum('@sandbox' in x for x in strip_ansi(run(['systemd-analyze', 'syscall-filter', '@default'], env=DUMP_ENV)[1]).splitlines())
     out('kernel: ' + run(['uname', '-r'])[1].strip())
     out(f'qemu: {qver}')
     out(f'@default lines naming @sandbox: {ndef}')
     out('::endgroup::')
-    dump_text = normal(run(DUMP_CMD)[1])
+    dump_text = normal(strip_ansi(run(DUMP_CMD, env=DUMP_ENV)[1]))
     out('::group::systemd-analyze syscall-filter @system-service @sandbox')
     out(dump_text)
     out('::endgroup::')
@@ -257,6 +275,8 @@ def smoke(run: Callable = real_run, *, which: Callable = shutil.which, exists: C
     if a.res.valid and not a.res.success:
         go('Ad')
     verdict = judge(legs, dump, version)
+    for n in twin_lines(legs):
+        out(n)
     for n in verdict.notes:
         out(n)
     for r in verdict.reasons:

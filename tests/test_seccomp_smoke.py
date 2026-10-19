@@ -22,6 +22,8 @@ SYS = 'Running as unit: run-u2.service\nFinished with result: signal\nMain proce
 EXIT1 = 'Running as unit: run-u3.service\nFinished with result: exit-code\nMain processes terminated with: code=exited/status=1\n'
 RECORD = 'Oct 19 05:00:01 host kernel: audit: type=1326 audit(1.2:3): uid=65534 comm="qemu-system-x86" sig=31 arch=c000003e syscall=317 compat=0 code=0x80000000'
 DUMP = '@system-service\n    # Default set\n    brk\n@sandbox\n    landlock_create_ruleset\n    seccomp\n'
+# what systemd-analyze printed on the hosted runner even into a pipe: ESC [ 0 m before each group name, plus the shapes it could grow
+COLORED = DUMP.replace('    brk', '    \x1b[0mbrk').replace('    seccomp', '    \x1b[1;31mseccomp\x1b[0m').replace('@sandbox', '\x1b[38;5;196m@sandbox\x1b[K')
 
 
 def props(argv):
@@ -39,16 +41,17 @@ def leg_of(argv):
 
 
 class Fake:
-    """A machine: `outcome` maps a leg to what systemd-run printed; a leg listed in `records` logs the kernel line when it ran."""
+    """A machine: `outcome` maps a leg to what systemd-run printed; a leg listed in `records` logs the kernel line when it ran.
+    The defaults are the hosted run 39247567865: B succeeds, C and A die 31/SYS, and so do their `-sandbox off` twins, each with a record."""
 
-    def __init__(self, B=OK, C=SYS, Cd=OK, A=SYS, Ad=OK, records=('C', 'A'), version='systemd 255 (255.4-1ubuntu8.6)', dump=DUMP,
+    def __init__(self, B=OK, C=SYS, Cd=SYS, A=SYS, Ad=SYS, records=('C', 'Cd', 'A', 'Ad'), version='systemd 255 (255.4-1ubuntu8.6)', dump=DUMP,
                  record=RECORD, dmesg_only=False):
         self.outcome = dict(B=B, C=C, Cd=Cd, A=A, Ad=Ad)
         self.records, self.version, self.dump = set(records), version, dump
         self.record, self.dmesg_only = record, dmesg_only   # the kernel line a dying leg logs; dmesg_only: journalctl -k sees nothing, dmesg does
-        self.kernel, self.ran, self.calls, self.stdin = [], [], [], []
+        self.kernel, self.ran, self.calls, self.stdin, self.analyze_env = [], [], [], [], []
 
-    def run(self, argv, stdin=None, timeout=120):
+    def run(self, argv, stdin=None, timeout=120, env=None):
         argv = list(argv)
         self.calls.append(argv)
         if argv[:2] == ['sudo', '-n']:
@@ -67,6 +70,7 @@ class Fake:
         if argv[0] == 'systemd':
             return 0, self.version + '\n+PAM +AUDIT\n'
         if argv[0] == 'systemd-analyze':
+            self.analyze_env.append(env)
             return 0, self.dump if argv[2:] == ['@system-service', '@sandbox'] else '@default\n    @sandbox\n    brk\n'
         if argv[0] == 'uname':
             return 0, '6.11.0-azure\n'
@@ -148,7 +152,9 @@ class Verdicts(unittest.TestCase):
         f, code, out = self.run_smoke()
         self.assertEqual((code, out[-1]), (0, 'PASS'))
         self.assertEqual(f.ran, ['B', 'C', 'Cd', 'A', 'Ad'])
-        self.assertIn('C attributed by (i) kernel record and (ii) -sandbox off twin ended Result=success', out)
+        self.assertIn(ss.ATTRIBUTED.format(leg='C'), out)
+        self.assertIn(ss.ATTRIBUTED.format(leg='A'), out)
+        self.assertFalse([x for x in out if '(ii)' in x or x.startswith('::error::')])
 
     def test_b_dying_31_sys_is_fail(self):
         _, code, out = self.run_smoke(B=SYS)
@@ -169,32 +175,91 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('INSTRUMENT-BLIND: the control leg died but not by SIGSYS (Result=exit-code status=1)', out[-1])
 
-    def test_a_control_that_dies_with_no_record_and_a_dying_twin_is_instrument_blind(self):
-        _, code, out = self.run_smoke(Cd=SYS, records=())
-        self.assertEqual(code, 1)
-        self.assertIn('INSTRUMENT-BLIND: C died 31/SYS with no kernel record', out[-1])
-        self.assertIn('Cd: the -sandbox off twin ended', out[-1])
-
-    def test_a_control_that_dies_with_no_record_but_a_passing_twin_is_pass_by_attribution_ii(self):
-        _, code, out = self.run_smoke(records=())
+    def test_the_twins_dying_sys_do_not_fail_the_run_and_are_printed_as_informational(self):
+        # the measured runner: QEMU 8.2.2 calls seccomp(2) under -sandbox off too, so Cd and Ad die 31/SYS with a record
+        f, code, out = self.run_smoke()
         self.assertEqual((code, out[-1]), (0, 'PASS'))
-        self.assertIn('C attributed by (ii) -sandbox off twin ended Result=success', out)
-        self.assertIn('A attributed by (ii) -sandbox off twin ended Result=success', out)
+        self.assertIn('twin (informational): Cd (-sandbox off) Result=signal status=SYS; kernel records during the leg: 1', out)
+        self.assertIn('twin (informational): Ad (-sandbox off) Result=signal status=SYS; kernel records during the leg: 1', out)
+        for name in ('Cd', 'Ad'):
+            i = out.index(next(x for x in out if x.startswith(f'twin (informational): {name} ')))
+            self.assertEqual(out[i + 1], '  ' + RECORD)   # any record the twin made is printed under its line
+        self.assertFalse([x for x in out if x.startswith('::error::')])
 
-    def test_a_death_attributed_by_a_record_alone_is_pass_when_the_twin_was_not_run(self):
-        leg = lambda n, out, rec=(): ss.Leg(n, ss.parse(out), rec)  # noqa: E731
-        legs = {'B': leg('B', OK), 'C': leg('C', SYS, (RECORD,)), 'Cd': leg('Cd', OK), 'A': leg('A', SYS, (RECORD,))}
-        v = ss.judge(legs, 'same', '255')
-        self.assertEqual((v.status, v.notes[-1]), ('PASS', 'A attributed by (i) kernel record'))
-        legs['A'] = leg('A', SYS)
-        self.assertEqual(ss.judge(legs, 'same', '255').status, 'FAIL')   # no record and no twin result: blind
-        del legs['Cd']
-        self.assertIn('Cd: not run', ss.judge(legs, 'same', '255').reasons)
+    def test_the_twins_ending_in_any_way_never_fail_the_run(self):
+        for twin in (SYS, OK, EXIT1, ''):
+            f, code, out = self.run_smoke(Cd=twin, Ad=twin)
+            self.assertEqual((code, out[-1]), (0, 'PASS'), repr(twin))
+            self.assertEqual(f.ran, ['B', 'C', 'Cd', 'A', 'Ad'])
+        _, _, out = self.run_smoke(Cd='', Ad='')
+        self.assertIn('twin (informational): Cd (-sandbox off) no Result= line and no exit status (nothing observed); kernel records during the leg: 1', out)
 
-    def test_a_dying_with_no_record_and_no_twin_result_is_instrument_blind(self):
-        _, code, out = self.run_smoke(records=('C',), Ad=SYS)
+    def test_c_with_a_valid_new_record_and_dying_twins_is_pass_whatever_the_twins_logged(self):
+        for records in (('C', 'A'), ('C', 'Cd', 'A', 'Ad')):
+            _, code, out = self.run_smoke(Cd=SYS, Ad=SYS, records=records)
+            self.assertEqual((code, out[-1]), (0, 'PASS'), records)
+            self.assertIn(ss.ATTRIBUTED.format(leg='C'), out)
+        _, _, out = self.run_smoke(records=('C', 'A'))
+        self.assertIn('twin (informational): Cd (-sandbox off) Result=signal status=SYS; kernel records during the leg: 0', out)
+
+    def test_a_twin_can_no_longer_rescue_a_control_that_died_with_no_record(self):
+        # the positive control of the judge: C dies 31/SYS and logs nothing; Cd (and Ad) end Result=success, which used to attribute it
+        _, code, out = self.run_smoke(Cd=OK, Ad=OK, records=('A',))
         self.assertEqual(code, 1)
-        self.assertIn('INSTRUMENT-BLIND: A died 31/SYS with no kernel record', out[-1])
+        self.assertEqual(out[-1], 'FAIL(' + ss.BLIND.format(leg='C') + ')')
+        self.assertFalse([x for x in out if x.startswith('C attributed')])
+        self.assertIn('twin (informational): Cd (-sandbox off) Result=success status=0; kernel records during the leg: 0', out)
+
+    def test_a_twin_can_no_longer_rescue_an_a_that_died_with_no_record(self):
+        f, code, out = self.run_smoke(Cd=OK, Ad=OK, records=('C',))
+        self.assertEqual(code, 1)
+        self.assertEqual(f.ran, ['B', 'C', 'Cd', 'A', 'Ad'])   # Ad still runs, for the log
+        self.assertEqual(out[-1], 'FAIL(' + ss.BLIND.format(leg='A') + ')')
+        self.assertFalse([x for x in out if x.startswith('A attributed')])
+
+    def test_no_record_at_all_is_blind_for_c_and_a_alike(self):
+        _, code, out = self.run_smoke(records=())
+        self.assertEqual(code, 1)
+        self.assertEqual(out[-1], 'FAIL(' + ss.BLIND.format(leg='C') + '; ' + ss.BLIND.format(leg='A') + ')')
+
+    def test_the_judge_reads_no_twin_at_all(self):
+        leg = lambda n, out, rec=(): ss.Leg(n, ss.parse(out), rec)  # noqa: E731
+        legs = {'B': leg('B', OK), 'C': leg('C', SYS, (RECORD,)), 'A': leg('A', SYS, (RECORD,))}
+        v = ss.judge(legs, 'same', '255')   # no Cd, no Ad: they are not required
+        self.assertEqual((v.status, v.notes), ('PASS', (ss.ATTRIBUTED.format(leg='C'), ss.ATTRIBUTED.format(leg='A'))))
+        legs['Cd'], legs['Ad'] = leg('Cd', SYS), leg('Ad', EXIT1, (RECORD,))
+        self.assertEqual(ss.judge(legs, 'same', '255'), v)   # whatever they did, nothing changes
+        legs['Cd'] = leg('Cd', OK)
+        self.assertEqual(ss.judge(legs, 'same', '255'), v)
+        legs['A'] = leg('A', SYS)
+        self.assertEqual(ss.judge(legs, 'same', '255').reasons, (ss.BLIND.format(leg='A'),))   # no record and a twin: still blind
+
+    def test_a_record_must_be_a_type_1326_line_of_sig_31(self):
+        for rec in (RECORD.replace('type=1326', 'type=1300'), RECORD.replace('sig=31', 'sig=9'), RECORD.replace(' type=1326', ''),
+                    'Oct 19 05:00:01 host kernel: qemu-system-x86[7]: segfault comm="qemu-system-x86" syscall=317'):
+            self.assertFalse(ss.is_record(rec), rec)
+            _, code, out = self.run_smoke(Cd=OK, Ad=OK, record=rec)
+            self.assertEqual(code, 1, rec)
+            self.assertIn('INSTRUMENT-BLIND: C died 31/SYS with no kernel record', out[-1])
+        self.assertTrue(ss.is_record(RECORD))
+        # the judge does not trust a record list it was handed: a Leg holding a non-record line is no attribution
+        leg = ss.Leg('C', ss.parse(SYS), ('anything at all',))
+        self.assertFalse(ss.attributed(leg))
+
+    def test_a_control_that_dies_with_no_record_is_blind_even_when_a_twin_dies_with_one(self):
+        # the twin's own record is the twin's, not C's: records are read per leg
+        _, code, out = self.run_smoke(records=('Cd', 'A', 'Ad'))
+        self.assertEqual(code, 1)
+        self.assertEqual(out[-1], 'FAIL(' + ss.BLIND.format(leg='C') + ')')
+
+    def test_a_death_attributed_by_a_record_alone_is_pass(self):
+        leg = lambda n, out, rec=(): ss.Leg(n, ss.parse(out), rec)  # noqa: E731
+        legs = {'B': leg('B', OK), 'C': leg('C', SYS, (RECORD,)), 'A': leg('A', SYS, (RECORD,))}
+        self.assertEqual(ss.judge(legs, 'same', '255').status, 'PASS')
+        legs['A'] = leg('A', SYS)
+        self.assertEqual(ss.judge(legs, 'same', '255').status, 'FAIL')   # no record: blind
+        del legs['A']
+        self.assertIn('A: not run', ss.judge(legs, 'same', '255').reasons)
 
     def test_a_dying_non_sigsys_is_fail(self):
         _, code, out = self.run_smoke(A=EXIT1)
@@ -214,7 +279,7 @@ class Verdicts(unittest.TestCase):
         self.assertIn('INSTRUMENT-BLIND', out[-1])
 
     def test_an_output_with_neither_result_nor_status_is_fail_not_pass(self):
-        for leg in ('B', 'C', 'Cd', 'A'):
+        for leg in ('B', 'C', 'A'):
             _, code, out = self.run_smoke(**{leg: ''})
             self.assertEqual(code, 1, leg)
             self.assertIn(f'{leg}: no Result= line and no exit status', out[-1])
@@ -228,31 +293,28 @@ class Verdicts(unittest.TestCase):
     def test_a_record_that_predates_the_run_is_not_attributed(self):
         f = Fake(records=())
         f.kernel.append(RECORD)   # an old record: present before every leg, so no leg made it
-        _, out = smoke(f)
-        self.assertEqual(out[-1], 'PASS')   # (ii) attributes through the twins
-        self.assertNotIn('(i)', ' '.join(x for x in out if x.startswith('C attributed')))
-        f2 = Fake(records=(), Cd=SYS)
-        f2.kernel.append(RECORD)
-        _, out2 = smoke(f2)
-        self.assertIn('INSTRUMENT-BLIND', out2[-1])
+        code, out = smoke(f)
+        self.assertEqual(code, 1)
+        self.assertEqual(out[-1], 'FAIL(' + ss.BLIND.format(leg='C') + '; ' + ss.BLIND.format(leg='A') + ')')
+        self.assertFalse([x for x in out if ' attributed by ' in x])
+
+    def test_the_same_line_logged_again_during_a_leg_is_a_new_record(self):
+        f = Fake(records=('C', 'A'))
+        f.kernel.append(RECORD)   # an identical old line; the leg adds a second copy, and the before/after difference is one
+        code, out = smoke(f)
+        self.assertEqual((code, out[-1]), (0, 'PASS'))
 
     def test_a_kernel_line_of_another_comm_or_another_syscall_is_not_a_record(self):
         for other in (RECORD.replace('comm="qemu-system-x86"', 'comm="bash"'), RECORD.replace('syscall=317', 'syscall=1')):
-            _, code, out = self.run_smoke(Cd=SYS, record=other)   # Cd dies too, so (ii) cannot rescue C
+            _, code, out = self.run_smoke(Cd=OK, record=other)   # a succeeding twin cannot rescue C either
             self.assertEqual(code, 1, other)
             self.assertIn('INSTRUMENT-BLIND: C died 31/SYS with no kernel record', out[-1])
             self.assertFalse([x for x in out if x.startswith('C attributed')], other)
 
     def test_a_record_that_only_dmesg_shows_still_counts(self):
-        _, code, out = self.run_smoke(Cd=SYS, dmesg_only=True)
-        self.assertIn('C attributed by (i) kernel record', out)
+        _, code, out = self.run_smoke(dmesg_only=True)
+        self.assertIn(ss.ATTRIBUTED.format(leg='C'), out)
         self.assertNotIn('INSTRUMENT-BLIND: C died', out[-1])
-
-    def test_a_dying_a_whose_twin_printed_nothing_is_fail(self):
-        _, code, out = self.run_smoke(Ad='')
-        self.assertEqual(code, 1)
-        self.assertTrue(out[-1].startswith('FAIL('))
-        self.assertIn('Ad: no Result= line and no exit status in the output (nothing observed)', out[-1])
 
     def test_the_runner_is_printed_first(self):
         _, _, out = self.run_smoke()
@@ -286,9 +348,54 @@ class Dump(unittest.TestCase):
         self.assertEqual(f.ran, ['B', 'C', 'Cd', 'A', 'Ad'])
         self.assertIn(DUMP.strip(), out)   # the dump is printed so it can be committed
 
-    def test_the_committed_fixture_is_the_placeholder_until_the_first_hosted_run_replaces_it(self):
+    def test_the_committed_fixture_is_the_pinned_dump_of_run_39247567865_with_no_escape_byte(self):
+        raw = (ROOT / 'tests/fixture/ubuntu2404-filter-dump.txt').read_bytes()
+        text = raw.decode('utf-8')
+        self.assertNotIn(b'\x1b', raw)
+        self.assertFalse(text.startswith(ss.UNPINNED))
+        self.assertEqual(ss.normal(text) + '\n', text)   # exactly what the driver writes: normalized, one final newline
+        lines = text.splitlines()
+        self.assertEqual((lines[0], '@sandbox' in lines, '    seccomp' in lines), ('@system-service', True, True))
+        self.assertEqual(len(lines), 70)
+
+    def test_the_committed_fixture_is_what_this_driver_compares_against(self):
         text = (ROOT / 'tests/fixture/ubuntu2404-filter-dump.txt').read_text(encoding='utf-8')
-        self.assertTrue(text.startswith(ss.UNPINNED) or '@sandbox' in text)
+        _, out = smoke(Fake(dump=text), dump_fixture=None)   # the file read from disk, as the hosted call does
+        self.assertEqual(out[-1], 'PASS')
+        self.assertNotIn('DUMP-UNPINNED', ' '.join(out))
+
+    def test_a_colored_dump_compares_equal_to_the_plain_one(self):
+        self.assertIn('\x1b', COLORED)
+        self.assertNotEqual(COLORED, DUMP)
+        self.assertEqual(ss.normal(ss.strip_ansi(COLORED)), ss.normal(DUMP))
+        code, out = smoke(Fake(dump=COLORED), dump_fixture=DUMP)
+        self.assertEqual((code, out[-1]), (0, 'PASS'))
+        self.assertFalse([x for x in out if '\x1b' in x], 'an escape byte reached the printed log')
+        self.assertIn(DUMP.strip(), out)
+
+    def test_the_stripped_dump_written_for_the_artifact_has_no_escape_byte(self):
+        with tempfile.TemporaryDirectory() as d:
+            smoke(Fake(dump=COLORED), dump_out=str(Path(d) / 'dump.txt'))
+            raw = (Path(d) / 'dump.txt').read_bytes()
+        self.assertNotIn(b'\x1b', raw)
+        self.assertEqual(raw.decode('utf-8'), DUMP.strip() + '\n')
+
+    def test_strip_ansi_removes_csi_sequences_and_nothing_else(self):
+        for seq in ('\x1b[0m', '\x1b[m', '\x1b[1;31m', '\x1b[38;5;196m', '\x1b[38;2;1;2;3m', '\x1b[K', '\x1b[2J', '\x1b[?25l', '\x1b[4 q'):
+            got = ss.strip_ansi(f'    {seq}@aio{seq}')
+            self.assertEqual(got, '    @aio', repr(seq))
+            self.assertNotIn('\x1b', got)
+        plain = DUMP + '    a [0m b ]\n    #[1;31m\n'
+        self.assertEqual(ss.strip_ansi(plain), plain)   # no ESC: untouched
+        self.assertEqual(ss.strip_ansi(''), '')
+
+    def test_systemd_analyze_is_run_with_colors_off(self):
+        f = Fake()
+        smoke(f)
+        self.assertEqual(len(f.analyze_env), 2)   # the @default count and the dump
+        for env in f.analyze_env:
+            self.assertEqual(env, {'SYSTEMD_COLORS': '0', 'NO_COLOR': '1'})
+        self.assertEqual(ss.DUMP_ENV, {'SYSTEMD_COLORS': '0', 'NO_COLOR': '1'})
 
     def test_an_empty_dump_is_fail(self):
         _, out = smoke(Fake(dump=''))
@@ -338,6 +445,13 @@ class RealRun(unittest.TestCase):
         rc, text = ss.real_run([sys.executable, '-u', '-c', 'import time; print("partial"); time.sleep(5)'], timeout=1)
         self.assertIsNone(rc)
         self.assertEqual(text.strip(), 'partial')
+
+    def test_env_is_added_to_this_processes_environment_not_substituted_for_it(self):
+        code = 'import os; print(os.environ.get("SYSTEMD_COLORS"), os.environ.get("NO_COLOR"), "PATH" in os.environ)'
+        self.assertEqual(ss.real_run([sys.executable, '-c', code], env=ss.DUMP_ENV), (0, '0 1 True\n'))
+        with mock.patch.dict('os.environ', {'SYSTEMD_COLORS': 'always'}):
+            self.assertEqual(ss.real_run([sys.executable, '-c', code], env=ss.DUMP_ENV), (0, '0 1 True\n'))   # the override wins
+            self.assertEqual(ss.real_run([sys.executable, '-c', code]), (0, 'always None True\n'))   # no env: the process's own
 
     def test_stdin_passes_through(self):
         self.assertEqual(ss.real_run([sys.executable, '-c', 'import sys; sys.stdout.write(sys.stdin.read().upper())'], stdin='qmp\n'), (0, 'QMP\n'))

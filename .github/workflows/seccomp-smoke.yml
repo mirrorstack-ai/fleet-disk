@@ -1,11 +1,12 @@
 # Starts QEMU under the L1 unit's SystemCallFilter on a hosted ubuntu-24.04 runner (systemd 255, the release the loader admits),
-# with a positive control that must die by SIGSYS and be attributed (PW04, G-AUD-LINUX-RUN-4 / G-AUD-LINUX-INSTALL-4). The legs,
-# the rules and the twin files are described in tests/fixture/seccomp_smoke.py; the filter text is tests/fixture/l1_unit_filter.txt
-# (the twin of the unit in the fleet repository, each repo pins its own copy). Nothing here is secret, signed or published: the
-# only token is the run's own, and only the `report` job (weekly runs) holds a write scope, issues alone.
-# `-machine none -S` makes none of the calls a guest does: this speaks for QEMU's start-up call only. The first run prints the
-# systemd-analyze dump of @system-service and @sandbox and fails DUMP-UNPINNED until it is committed as the fixture; every later
-# run fails on a difference, so an image bump that moves the tables is seen the day it happens.
+# with a positive control that must die by SIGSYS and be attributed by a kernel record seen during that leg (PW04,
+# G-AUD-LINUX-RUN-4 / G-AUD-LINUX-INSTALL-4). The legs, the rules and the twin files are described in tests/fixture/seccomp_smoke.py
+# (its `-sandbox off` twins are informational: QEMU 8.2.2 calls seccomp(2) there too, run 39247567865). The filter text is
+# tests/fixture/l1_unit_filter.txt (the twin of the unit in the fleet repository, each repo pins its own copy). Nothing here is
+# secret, signed or published: the only token is the run's own, and only the `report` job (weekly runs) holds a write scope, issues alone.
+# `-machine none -S` makes none of the calls a guest does: this speaks for QEMU's start-up call only. Every run prints the
+# systemd-analyze dump of @system-service and @sandbox (colors off, ANSI stripped) and fails DUMP-DIFFERS against the committed
+# fixture (pinned from run 39247567865), so an image bump that moves the tables is seen the day it happens.
 name: seccomp-smoke
 on:
   pull_request:
@@ -64,7 +65,7 @@ jobs:
           title='seccomp-smoke: the weekly run failed'
           body="The weekly seccomp-smoke run failed: $RUN_URL
 
-          Read the log for the leg that ended red (B, C, Cd, A, Ad) and for DUMP-DIFFERS. A moved dump or a failed leg means the runner image changed under the L1 unit's SystemCallFilter; see tests/fixture/seccomp_smoke.py."
+          Read the log for the leg that ended red (B, C, A), for INSTRUMENT-BLIND and for DUMP-DIFFERS. A moved dump or a failed leg means the runner image changed under the L1 unit's SystemCallFilter; see tests/fixture/seccomp_smoke.py."
           open=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
           if [ -n "$open" ]; then
             gh issue comment "$open" --body "Failed again: $RUN_URL"
