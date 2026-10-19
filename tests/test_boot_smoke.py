@@ -97,7 +97,7 @@ class MachineGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             f = Path(t) / 'os-release'
             if text is not None:
-                f.write_text(text)
+                f.write_bytes(text) if isinstance(text, bytes) else f.write_text(text)
             with mock.patch.object(sd, 'WIN', False), mock.patch.object(sd.platform, 'system', return_value='Linux'):
                 return sd.machine(str(f), arch)
 
@@ -115,7 +115,11 @@ class MachineGate(unittest.TestCase):
         for why, text in {'22.04': self.rel('22.04'), '24.10': self.rel('24.10'), '25.10': self.rel('25.10'), '26.10': self.rel('26.10'),
                           '26.04.1 (exact match)': self.rel('26.04.1'), 'debian 26.04': self.rel('26.04', 'debian'),
                           'linuxmint 24.04': self.rel('24.04', 'linuxmint'), 'no VERSION_ID': self.rel(None), 'no ID': 'VERSION_ID="26.04"\n',
-                          'empty file': '', 'unreadable file': None}.items():
+                          'empty file': '', 'unreadable file': None,
+                          'linuxmint ID_LIKE=ubuntu': 'ID=linuxmint\nID_LIKE=ubuntu\nVERSION_ID="26.04"\n',
+                          'ubuntu-core': self.rel('26.04', 'ubuntu-core'), 'Ubuntu caps': self.rel('26.04', 'Ubuntu'),
+                          'empty VERSION_ID': 'ID=ubuntu\nVERSION_ID=""\n',
+                          'undecodable bytes': b'ID=ubuntu\n\xff\xfe\nVERSION_ID="26.04"\n'}.items():
             self.assertEqual(self.gate(text), 'os', why)
 
     def test_a_refused_arch_shows_once_the_os_is_admitted(self):
@@ -148,13 +152,15 @@ class MachineGate(unittest.TestCase):
         """The versions a bootstrap.sh check_machine admits: the arms before `*)` of the case over VERSION_ID."""
         body = text[text.index("sed -n 's/^VERSION_ID=//p')"):]
         arms = body[:body.index('*)')]
-        return set(re.findall(r'(?m)^\s*([0-9][0-9.]*(?:\s*\|\s*[0-9][0-9.]*)*)\)\s*;;', arms)[0].replace(' ', '').split('|'))
+        return set().union(*(a.replace(' ', '').split('|')
+                             for a in re.findall(r'(?m)^\s*([0-9][0-9.]*(?:\s*\|\s*[0-9][0-9.]*)*)\)\s*;;', arms)))
 
     def test_the_loader_arm_reader_reads_both_shapes(self):  # main's one-version arm and PV11's two-version arm
         sh = "  case $(printf '%s\\n' \"$osrel\" | sed -n 's/^VERSION_ID=//p') in\n    {}) ;;\n    *) die os 'x' ;;\n  esac\n"
         self.assertEqual(self.loader_versions(sh.format('24.04')), {'24.04'})
         self.assertEqual(self.loader_versions(sh.format('24.04|26.04')), {'24.04', '26.04'})
         self.assertEqual(self.loader_versions(sh.format('24.04 | 26.04')), {'24.04', '26.04'})
+        self.assertEqual(self.loader_versions(sh.format('24.04) ;;\n    26.10')), {'24.04', '26.10'})  # several arms: a union
 
     def test_the_driver_admits_what_the_newest_release_loader_admits(self):
         # VACUOUS today: fleet-disk has no release/ folder yet (they live in mirrorstack-fleet), so this wakes up when one is
