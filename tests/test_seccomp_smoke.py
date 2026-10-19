@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tests' / 'fixture'))
@@ -39,9 +41,11 @@ def leg_of(argv):
 class Fake:
     """A machine: `outcome` maps a leg to what systemd-run printed; a leg listed in `records` logs the kernel line when it ran."""
 
-    def __init__(self, B=OK, C=SYS, Cd=OK, A=SYS, Ad=OK, records=('C', 'A'), version='systemd 255 (255.4-1ubuntu8.6)', dump=DUMP):
+    def __init__(self, B=OK, C=SYS, Cd=OK, A=SYS, Ad=OK, records=('C', 'A'), version='systemd 255 (255.4-1ubuntu8.6)', dump=DUMP,
+                 record=RECORD, dmesg_only=False):
         self.outcome = dict(B=B, C=C, Cd=Cd, A=A, Ad=Ad)
         self.records, self.version, self.dump = set(records), version, dump
+        self.record, self.dmesg_only = record, dmesg_only   # the kernel line a dying leg logs; dmesg_only: journalctl -k sees nothing, dmesg does
         self.kernel, self.ran, self.calls, self.stdin = [], [], [], []
 
     def run(self, argv, stdin=None, timeout=120):
@@ -54,12 +58,12 @@ class Fake:
             self.ran.append(leg)
             self.stdin.append(stdin)
             if leg in self.records and self.outcome[leg] != OK:
-                self.kernel.append(RECORD)
+                self.kernel.append(self.record)
             return 0, self.outcome[leg]
         if argv[0] == 'journalctl':
-            return 0, '\n'.join(['Oct 19 04:00:00 host kernel: unrelated', *self.kernel]) + '\n'
+            return 0, ('' if self.dmesg_only else '\n'.join(['Oct 19 04:00:00 host kernel: unrelated', *self.kernel]) + '\n')
         if argv[0] == 'dmesg':
-            return 0, ''
+            return 0, ('\n'.join(self.kernel) + '\n') if self.dmesg_only else ''
         if argv[0] == 'systemd':
             return 0, self.version + '\n+PAM +AUDIT\n'
         if argv[0] == 'systemd-analyze':
@@ -135,7 +139,7 @@ class Parse(unittest.TestCase):
 
 class Verdicts(unittest.TestCase):
     def run_smoke(self, **kw):
-        fake_kw = {k: kw.pop(k) for k in list(kw) if k in ('B', 'C', 'Cd', 'A', 'Ad', 'records', 'version', 'dump')}
+        fake_kw = {k: kw.pop(k) for k in list(kw) if k in ('B', 'C', 'Cd', 'A', 'Ad', 'records', 'version', 'dump', 'record', 'dmesg_only')}
         f = Fake(**fake_kw)
         code, out = smoke(f, **kw)
         return f, code, out
@@ -232,10 +236,41 @@ class Verdicts(unittest.TestCase):
         _, out2 = smoke(f2)
         self.assertIn('INSTRUMENT-BLIND', out2[-1])
 
+    def test_a_kernel_line_of_another_comm_or_another_syscall_is_not_a_record(self):
+        for other in (RECORD.replace('comm="qemu-system-x86"', 'comm="bash"'), RECORD.replace('syscall=317', 'syscall=1')):
+            _, code, out = self.run_smoke(Cd=SYS, record=other)   # Cd dies too, so (ii) cannot rescue C
+            self.assertEqual(code, 1, other)
+            self.assertIn('INSTRUMENT-BLIND: C died 31/SYS with no kernel record', out[-1])
+            self.assertFalse([x for x in out if x.startswith('C attributed')], other)
+
+    def test_a_record_that_only_dmesg_shows_still_counts(self):
+        _, code, out = self.run_smoke(Cd=SYS, dmesg_only=True)
+        self.assertIn('C attributed by (i) kernel record', out)
+        self.assertNotIn('INSTRUMENT-BLIND: C died', out[-1])
+
+    def test_a_dying_a_whose_twin_printed_nothing_is_fail(self):
+        _, code, out = self.run_smoke(Ad='')
+        self.assertEqual(code, 1)
+        self.assertTrue(out[-1].startswith('FAIL('))
+        self.assertIn('Ad: no Result= line and no exit status in the output (nothing observed)', out[-1])
+
+    def test_the_runner_is_printed_first(self):
+        _, _, out = self.run_smoke()
+        for prefix in ('systemd: systemd 255', 'kernel: 6.11', 'qemu: QEMU emulator', '@default lines naming @sandbox: 1'):
+            self.assertTrue(any(x.startswith(prefix) for x in out), prefix)
+        self.assertEqual(out[0], '::group::runner')
+        self.assertLess(max(out.index(x) for x in out if x.startswith(('systemd: ', 'kernel: ', 'qemu: ', '@default lines'))),
+                        out.index('::endgroup::'))
+
 
 class Dump(unittest.TestCase):
     def test_a_dump_that_differs_from_the_fixture_is_fail(self):
         _, out = smoke(Fake(), dump_fixture=DUMP + '    mseal\n')
+        self.assertIn('DUMP-DIFFERS', out[-1])
+        self.assertTrue(out[-1].startswith('FAIL('))
+
+    def test_a_dump_that_gained_a_line_against_the_fixture_is_fail(self):
+        _, out = smoke(Fake(dump=DUMP + '    mseal\n'))   # an image bump added a call to @sandbox
         self.assertIn('DUMP-DIFFERS', out[-1])
         self.assertTrue(out[-1].startswith('FAIL('))
 
@@ -265,10 +300,47 @@ class Dump(unittest.TestCase):
         self.assertTrue(any(x.startswith('DUMP-CHECK-SKIPPED') for x in out))
 
     def test_the_dump_is_written_for_the_artifact(self):
-        import tempfile
         with tempfile.TemporaryDirectory() as d:
             smoke(Fake(), dump_out=str(Path(d) / 'sub' / 'dump.txt'))
             self.assertEqual((Path(d) / 'sub' / 'dump.txt').read_text(encoding='utf-8'), DUMP.strip() + '\n')
+
+
+class Main(unittest.TestCase):
+    """The workflow reaches the dump comparison and the artifact only through main()'s argparse wiring."""
+
+    def kwargs_of(self, argv):
+        with mock.patch.object(ss, 'smoke', return_value=7) as m:
+            self.assertEqual(ss.main(argv), 7)   # the exit code is smoke's
+        m.assert_called_once()
+        self.assertEqual(m.call_args.args, ())
+        return m.call_args.kwargs
+
+    def test_the_default_run_compares_the_dump_and_writes_no_file(self):
+        self.assertEqual(self.kwargs_of([]), {'dump_out': None, 'dump_check': True})
+
+    def test_the_flags_reach_smoke(self):
+        self.assertEqual(self.kwargs_of(['--no-dump-check', '--dump-out', 'x']), {'dump_out': 'x', 'dump_check': False})
+        self.assertEqual(self.kwargs_of(['--dump-out', 'seccomp-dump/d.txt']), {'dump_out': 'seccomp-dump/d.txt', 'dump_check': True})
+
+
+class RealRun(unittest.TestCase):
+    """The only function that touches a real process, run on this interpreter."""
+
+    def test_stderr_comes_back_merged_with_stdout_as_systemd_run_logs_there(self):
+        code = 'import sys; sys.stderr.write("Finished with result: success\\n")'
+        self.assertEqual(ss.real_run([sys.executable, '-c', code]), (0, 'Finished with result: success\n'))
+        self.assertEqual(ss.real_run([sys.executable, '-c', 'import sys; sys.stdout.write("o"); sys.stderr.write("e"); sys.exit(3)']), (3, 'oe'))
+
+    def test_a_missing_binary_is_127_never_a_zero(self):
+        self.assertEqual(ss.real_run(['/nonexistent-bin']), (127, ''))
+
+    def test_a_timeout_is_none_and_keeps_what_was_printed(self):
+        rc, text = ss.real_run([sys.executable, '-u', '-c', 'import time; print("partial"); time.sleep(5)'], timeout=1)
+        self.assertIsNone(rc)
+        self.assertEqual(text.strip(), 'partial')
+
+    def test_stdin_passes_through(self):
+        self.assertEqual(ss.real_run([sys.executable, '-c', 'import sys; sys.stdout.write(sys.stdin.read().upper())'], stdin='qmp\n'), (0, 'QMP\n'))
 
 
 class Refused(unittest.TestCase):
@@ -314,6 +386,7 @@ class Workflow(unittest.TestCase):
         self.assertEqual(paths, ['.github/workflows/seccomp-smoke.yml', 'tests/fixture/seccomp_smoke.py', 'tests/fixture/l1_unit_filter.txt',
                                  'tests/fixture/ubuntu2404-filter-dump.txt', 'tests/test_seccomp_smoke.py'])
         self.assertEqual(len(re.findall(r"- cron: '[^']+'", on)), 1)
+        self.assertRegex(on, r"- cron: '\d+ \d+ \* \* \d'")   # weekly: one minute, one hour, one weekday
         for word in ('push:', 'pull_request_target', 'workflow_run', 'self-hosted'):
             self.assertNotIn(word, WF)
 
@@ -343,6 +416,11 @@ class Workflow(unittest.TestCase):
         self.assertIn('    permissions:\n      issues: write\n', self.REPORT)
         self.assertIn("    needs: smoke\n    if: failure() && github.event_name == 'schedule'\n", self.REPORT)
         self.assertNotIn('checkout', self.REPORT)
+
+    def test_the_report_job_searches_for_its_issue_by_the_quoted_title(self):
+        # an unquoted `seccomp-smoke: ...` reads as a search qualifier: a duplicate issue every week, or a red report job
+        self.assertIn('--search "\\"$title\\" in:title"', self.REPORT)
+        self.assertNotIn('--search "$title', self.REPORT)
 
     def test_no_secret_and_no_expression_reaches_a_run_line_except_through_env(self):
         self.assertNotRegex(WF, r'(?i)secrets\.')

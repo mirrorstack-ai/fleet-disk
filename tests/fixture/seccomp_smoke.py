@@ -97,6 +97,9 @@ def parse(out: str) -> Result:
 
 
 def attribution(leg: Leg, twin: Leg | None) -> list[str]:
+    """(ii) is sound for C only: seccomp(2) is denied before QEMU's own filter loads, so a passing `-sandbox off` twin separates the
+    unit's filter from QEMU's. For A the twin drops the whole sandbox, so (ii) cannot tell the unit's filter from QEMU's deny-list
+    trapping: A's attribution is advisory and decides INSTRUMENT-BLIND only, never the control's PASS."""
     got = []
     if leg.records:
         got.append('(i) kernel record')

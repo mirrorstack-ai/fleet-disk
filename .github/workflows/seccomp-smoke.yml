@@ -65,7 +65,7 @@ jobs:
           body="The weekly seccomp-smoke run failed: $RUN_URL
 
           Read the log for the leg that ended red (B, C, Cd, A, Ad) and for DUMP-DIFFERS. A moved dump or a failed leg means the runner image changed under the L1 unit's SystemCallFilter; see tests/fixture/seccomp_smoke.py."
-          open=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          open=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
           if [ -n "$open" ]; then
             gh issue comment "$open" --body "Failed again: $RUN_URL"
           else
