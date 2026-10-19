@@ -1626,6 +1626,14 @@ class OverHttp(unittest.TestCase):
         self.assertNotIn(3, [s for s, _ in kit.sleeps])
         # no wall-clock bound on purpose: the record above is the evidence the expiry wait was not slept
 
+    def test_a_short_wait_really_sleeps_through_the_replays_own_sleep(self):
+        # the passthrough: every wait under 2 s reaches the `sleep` the replay was given (a recorder here), so dropping the
+        # real sleep for the cut_waits and spacings would be seen; the expiry wait never reaches it (it moves the clock)
+        rec = []
+        self.replay(run={'sleep': rec.append})
+        self.assertEqual(rec.count(0.4), 2, rec)
+        self.assertLess(max(rec), 2.0, rec)
+
     def test_without_the_clock_moving_the_invite_does_not_expire(self):
         # positive control: the replay needs the clock to move; with the expiry wait skipped and the kit's clock held,
         # the short invite still downloads and the replay refuses at 'expired' (the assertion is not skipped)
