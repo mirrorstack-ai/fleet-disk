@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tests' / 'fixture'))
 import make_fixture as mf  # noqa: E402
 import smoke_driver as sd  # noqa: E402
+from smoke_driver import UBUNTU_OK  # noqa: E402
 
 TOOLS = bool(shutil.which('ssh-keygen') and shutil.which('openssl')) and os.path.exists(mf.PUB.SSH_KEYGEN)
 WF = (ROOT / '.github' / 'workflows' / 'boot-smoke.yml').read_text()
@@ -87,6 +88,88 @@ class Judge(unittest.TestCase):
         out = f'bootstrap sha256 {self.SHA}\nkey SHA256:fp\nserial 20 valid_until T\nYour code: {sd.CODE}\n'
         self.assertEqual(self.judge(out=out, rc=0, log=[], case=good), [])
         self.assertTrue(self.judge(out=out.replace('Your code', 'My code'), rc=0, log=[], case=good))
+
+
+class MachineGate(unittest.TestCase):
+    """The driver's OS and arch gate (PV11b, G-PC-3), over a temp os-release per case: no real /etc/os-release is read."""
+
+    def gate(self, text, arch='x86_64'):
+        with tempfile.TemporaryDirectory() as t:
+            f = Path(t) / 'os-release'
+            if text is not None:
+                f.write_bytes(text) if isinstance(text, bytes) else f.write_text(text)
+            with mock.patch.object(sd, 'WIN', False), mock.patch.object(sd.platform, 'system', return_value='Linux'):
+                return sd.machine(str(f), arch)
+
+    @staticmethod
+    def rel(vid, id_='ubuntu'):
+        return f'NAME="x"\nID={id_}\n' + (f'VERSION_ID="{vid}"\n' if vid is not None else '') + 'VERSION_CODENAME=x\n'
+
+    def test_ubuntu_24_04_and_26_04_on_x86_64_reach_the_cases(self):
+        self.assertIsNone(self.gate(self.rel('24.04')))  # the control: main's own case
+        self.assertIsNone(self.gate(self.rel('26.04')))  # main refuses this with `os`
+        self.assertIsNone(self.gate(self.rel('26.04'), 'amd64'))
+        self.assertIsNone(self.gate(self.rel('26.04').replace('"', '')))  # an unquoted VERSION_ID
+
+    def test_every_other_os_release_is_refused_os(self):
+        for why, text in {'22.04': self.rel('22.04'), '24.10': self.rel('24.10'), '25.10': self.rel('25.10'), '26.10': self.rel('26.10'),
+                          '26.04.1 (exact match)': self.rel('26.04.1'), 'debian 26.04': self.rel('26.04', 'debian'),
+                          'linuxmint 24.04': self.rel('24.04', 'linuxmint'), 'no VERSION_ID': self.rel(None), 'no ID': 'VERSION_ID="26.04"\n',
+                          'empty file': '', 'unreadable file': None,
+                          'linuxmint ID_LIKE=ubuntu': 'ID=linuxmint\nID_LIKE=ubuntu\nVERSION_ID="26.04"\n',
+                          'ubuntu-core': self.rel('26.04', 'ubuntu-core'), 'Ubuntu caps': self.rel('26.04', 'Ubuntu'),
+                          'empty VERSION_ID': 'ID=ubuntu\nVERSION_ID=""\n',
+                          'undecodable bytes': b'ID=ubuntu\n\xff\xfe\nVERSION_ID="26.04"\n'}.items():
+            self.assertEqual(self.gate(text), 'os', why)
+
+    def test_a_refused_arch_shows_once_the_os_is_admitted(self):
+        for v in UBUNTU_OK:
+            self.assertEqual(self.gate(self.rel(v), 'aarch64'), 'arch', v)
+        self.assertEqual(self.gate(self.rel('22.04'), 'aarch64'), 'os')  # the os is checked first
+
+    def test_the_default_arch_is_this_machines(self):
+        with mock.patch.object(sd.platform, 'machine', return_value='aarch64'):
+            self.assertEqual(self.gate(self.rel('26.04'), None), 'arch')
+        with mock.patch.object(sd.platform, 'machine', return_value='x86_64'):
+            self.assertIsNone(self.gate(self.rel('26.04'), None))
+
+    def test_a_non_linux_machine_does_not_read_the_os_release(self):
+        with mock.patch.object(sd, 'WIN', False), mock.patch.object(sd.platform, 'system', return_value='Darwin'):
+            self.assertIsNone(sd.machine('/nonexistent/os-release', 'arm64'))
+
+    def test_a_26_04_runner_runs_the_cases(self):
+        good = {**Judge.CASE, 'code': None, 'info': 3, 'reqs': ['install.json']}
+        self.assertIsNone(sd.expect(good, self.gate(self.rel('26.04')), True)['code'])
+        self.assertEqual(sd.expect(good, self.gate(self.rel('26.10')), True)['code'], 'os')
+
+    # The same literal lives in mirrorstack-fleet (backends.UBUNTU_OK, pinned by the PV11 twin test next to bootstrap.sh's
+    # check_machine arm); the repos cannot read each other from a test, so each pins it. Change all three together.
+    def test_the_admitted_releases_are_the_pinned_literal(self):
+        self.assertEqual(sd.UBUNTU_OK, ('24.04', '26.04'))
+
+    @staticmethod
+    def loader_versions(text):
+        """The versions a bootstrap.sh check_machine admits: the arms before `*)` of the case over VERSION_ID."""
+        body = text[text.index("sed -n 's/^VERSION_ID=//p')"):]
+        arms = body[:body.index('*)')]
+        return set().union(*(a.replace(' ', '').split('|')
+                             for a in re.findall(r'(?m)^\s*([0-9][0-9.]*(?:\s*\|\s*[0-9][0-9.]*)*)\)\s*;;', arms)))
+
+    def test_the_loader_arm_reader_reads_both_shapes(self):  # main's one-version arm and PV11's two-version arm
+        sh = "  case $(printf '%s\\n' \"$osrel\" | sed -n 's/^VERSION_ID=//p') in\n    {}) ;;\n    *) die os 'x' ;;\n  esac\n"
+        self.assertEqual(self.loader_versions(sh.format('24.04')), {'24.04'})
+        self.assertEqual(self.loader_versions(sh.format('24.04|26.04')), {'24.04', '26.04'})
+        self.assertEqual(self.loader_versions(sh.format('24.04 | 26.04')), {'24.04', '26.04'})
+        self.assertEqual(self.loader_versions(sh.format('24.04) ;;\n    26.10')), {'24.04', '26.10'})  # several arms: a union
+
+    def test_the_driver_admits_what_the_newest_release_loader_admits(self):
+        # VACUOUS today: fleet-disk has no release/ folder yet (they live in mirrorstack-fleet), so this wakes up when one is
+        # committed here. `<=` is the direction that matters (a driver refusing what the loader admits is the failure R9 saw);
+        # a driver admitting MORE than the loader is not caught. Tighten to `==` after the first release folder that carries PV11 (G-PC-22).
+        found = sorted(ROOT.glob('release/install-*'), key=lambda p: int(p.name.split('-')[1]))
+        if not found or not (found[-1] / 'bootstrap.sh').is_file():
+            self.skipTest('no release folder yet')
+        self.assertLessEqual(self.loader_versions((found[-1] / 'bootstrap.sh').read_text()), set(sd.UBUNTU_OK))
 
 
 class Workflow(unittest.TestCase):
