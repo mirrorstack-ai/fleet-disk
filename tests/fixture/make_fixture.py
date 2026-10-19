@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Builds the boot smoke's fixture tree, stdlib only (plus the runner's ssh-keygen and openssl), from the two bootstraps a
 PR carries. It copies them, bakes a THROWAWAY owner key and expiry into the copies with the publisher's own regexes, points
-their base URLs at the local server by pinned regexes (each must match exactly once), and writes one complete release folder
+their base URLs at the local server by pinned regexes (each must match exactly once, except the ps1 elevated re-fetch, which may match once or twice), and writes one complete release folder
 per case, signed with the throwaway key and then damaged the way the case needs. The original files are never changed.
 
   make_fixture.py --out DIR (--boot-dir release/install-N | --ps1 P --sh P) [--host H] [--port N] [--crl-port N]
@@ -40,6 +40,8 @@ UNBAKED = 'ssh-ed25519 UNBAKED'
 # the base-URL lines, pinned: each rule must match the bootstrap exactly once or the build refuses (`@` is host:port), except the
 # ps1 elevated re-fetch, which the loaders carry once per elevated relaunch (the uninstall loader and the remove loader since AF36):
 # REFETCH_MAX sites at most, one at least
+# (sites are counted, not lines: two sites on one line would fail the changed-line count and refuse, the safe direction; a
+# comment carrying the exact shape also counts as a site, and a third one refuses)
 REFETCH_MAX = 2
 REFETCH = r"https://github\.com/mirrorstack-ai/fleet-disk/releases/download/(?=install-\{0\}/bootstrap\.ps1')"
 REWRITE = {
