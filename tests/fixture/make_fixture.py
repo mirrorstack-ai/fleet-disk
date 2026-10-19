@@ -37,7 +37,11 @@ MAX_SIG, MAX_KIT_JSON, MAX_CARRIER_SH, MAX_KIT, MAX_ZIP = 4096, 65536, 262144, 4
 CODE = 'ABCDE 23456 FGHJK MNPQR STVWX YZ012 34567 89ABC'  # the one code the dummy carrier-check prints
 TIME = '%Y-%m-%dT%H:%M:%SZ'
 UNBAKED = 'ssh-ed25519 UNBAKED'
-# the base-URL lines, pinned: each must match the bootstrap exactly once or the build refuses (`@` is host:port)
+# the base-URL lines, pinned: each rule must match the bootstrap exactly once or the build refuses (`@` is host:port), except the
+# ps1 elevated re-fetch, which the loaders carry once per elevated relaunch (the uninstall loader and the remove loader since AF36):
+# REFETCH_MAX sites at most, one at least
+REFETCH_MAX = 2
+REFETCH = r"https://github\.com/mirrorstack-ai/fleet-disk/releases/download/(?=install-\{0\}/bootstrap\.ps1')"
 REWRITE = {
     'sh': [(r'^RELEASES=https://github\.com/mirrorstack-ai/fleet-disk/releases/download$',
             'RELEASES=https://@/releases/download'),
@@ -49,8 +53,7 @@ REWRITE = {
             (r"^\$PythonUrl = 'https://www\.python\.org/ftp/python/\{0\}/python-\{0\}-embed-amd64\.zip'$",
              "$PythonUrl = 'https://@/python/{0}/python-{0}-embed-amd64.zip'"),
             # the elevated re-fetch inside curl.exe's argument string: only the URL, matched ahead of its file name so a reshaped line still counts
-            (r"https://github\.com/mirrorstack-ai/fleet-disk/releases/download/(?=install-\{0\}/bootstrap\.ps1')",
-             'https://@/releases/download/')],
+            (REFETCH, 'https://@/releases/download/')],
 }
 # the one live line that may still name github.com: the sh kit-host deny pattern. It keeps the name out, so it is excused only
 # byte for byte, once, and only in the sh copy; no other live github.com or python.org line is
@@ -108,13 +111,20 @@ def sub_group(rx, text: str, value: str) -> tuple[str, int]:
     return rx.subn(one, text)
 
 
-def rewrite(name: str, data: bytes, host: str, port: int) -> bytes:
+def rewrite_counted(name: str, data: bytes, host: str, port: int) -> tuple[bytes, int]:
+    """The base lines pointed at the fixture host, and how many sites that took (the changed-line count follows it)."""
     text = data.decode('ascii')
+    sites = 0
     for rx, new in REWRITE[name]:
         text, n = re.subn(rx, lambda m: new.replace('@', f'{host}:{port}'), text, flags=re.M)
-        if n != 1:
+        if not (1 <= n <= (REFETCH_MAX if rx == REFETCH else 1)):
             raise Refused('rewrite')
-    return text.encode('ascii')
+        sites += n
+    return text.encode('ascii'), sites
+
+
+def rewrite(name: str, data: bytes, host: str, port: int) -> bytes:
+    return rewrite_counted(name, data, host, port)[0]
 
 
 def bake(name: str, data: bytes, key: str, expires: str) -> bytes:
@@ -158,8 +168,9 @@ def check_copy(name: str, orig: bytes, copy: bytes, changed: int) -> None:
 
 def prepare(name: str, raw: bytes, host: str, port: int, key: str, expires: str) -> bytes:
     """One bootstrap copy: base rewritten, throwaway key and expiry baked, and nothing else changed."""
-    copy = bake(name, rewrite(name, raw, host, port), key, expires)
-    check_copy(name, raw, copy, len(REWRITE[name]) + 2)
+    text, sites = rewrite_counted(name, raw, host, port)
+    copy = bake(name, text, key, expires)
+    check_copy(name, raw, copy, sites + 2)
     if PUB.baked_values(name, copy) != (key, expires):  # the publisher reads back what was baked
         raise Refused('bake')
     return copy
