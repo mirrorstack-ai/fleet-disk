@@ -15,9 +15,14 @@ image becomes a raw GPT disk with an EFI System Partition (what vfkit's EFI boot
 release asset of disk-noble-arm64-<serial>; the lock entries are `disk_arm64_input`, `disk_arm64` and `vfkit`.
 `fleet-disk.py pin [amd64|arm64] <serial>` is the read-only way to get the entries for a lock PR: it asks GitHub for the
 published release of that tag, takes the commit the release names (`target_commitish`), and prints the entries only when
-`compare/main...<sha>` says that commit is on main (`behind` or `identical`); `ahead`, `diverged` or any other answer is
-`pin-not-main`, a read that fails or is not the expected shape is `pin-unread`, a digest that two reads (or the asset's
-bytes) do not agree on is `pin-mismatch`. It writes nothing, holds no secret and prints no line it did not just re-read.
+`compare/main...<sha>` says that commit is on main (`behind` or `identical`) AND the run record of disk.yml (a second read)
+holds a successful workflow_dispatch run on branch main at exactly that commit, the release's author and every asset's
+uploader are github-actions[bot], and the release's publication and every asset's upload fall inside that run's time
+window. `ahead`, `diverged`, any other answer, or no such run is `pin-not-main`; a read that fails or is not the expected
+shape is `pin-unread`; a digest that two reads (or the asset's bytes) do not agree on is `pin-mismatch`. It cannot tell a
+release that run made from one another job of the same bot made at that commit inside that window: the deploy key and the
+ruleset on refs/tags/disk-* stay the wall for that. It writes nothing, holds no secret and prints no line it did
+not just re-read.
 Standalone stdlib. An error names the rule and never echoes a value; every refusal is exit 1, a bad command line 2."""
 from __future__ import annotations
 
@@ -70,6 +75,8 @@ USAGE, REFUSED = 2, 1
 DEFAULT_REPO, MAIN = 'mirrorstack-ai/fleet-disk', 'main'  # `pin` outside Actions: the repo of the releases; their branch
 ON_MAIN = frozenset({'behind', 'identical'})  # compare/main...<sha>: the commit is an ancestor of main, or main's own tip
 PIN_REFUSALS = frozenset({'pin-not-main', 'pin-unread', 'pin-mismatch'})
+BOT, DISK_WORKFLOW = 'github-actions[bot]', '.github/workflows/disk.yml'  # who a run's release belongs to; the run's file
+RUN_SLACK = 30  # seconds a release or asset time may sit outside its run's [created_at, updated_at]: two clocks, one second grain
 LOCK_HEADER = "paste into the fleet's carrier.lock.json, then sign the lock:\n"
 
 
@@ -503,9 +510,11 @@ def asset_names(arch: str, serial: str) -> list[str]:
 
 
 def release_facts(io: Io, repo: str, tag: str, env: dict[str, str], names: list[str]) -> tuple:
-    """Read the release list once and return (release id, target commit, {asset name: (sha256 hex, size)}) of the ONE
-    published release of exactly tag: Refused('pin-unread') unless it is public, names a 40-hex commit, and holds exactly
-    `names`, each with a `sha256:<hex>` digest and a size. A draft, a missing or doubled release or an unread list is none."""
+    """Read the release list once and return (release id, target commit, {asset name: (sha256 hex, size)}, made) of the
+    ONE published release of exactly tag, where made is (author login, published_at, ((asset name, created_at, uploader
+    login), ...)): Refused('pin-unread') unless it is public, names a 40-hex commit, and holds exactly `names`, each with a
+    `sha256:<hex>` digest, a size, a creation time and an uploader, and the release has an author and a publication time.
+    A draft, a missing or doubled release or an unread list is none."""
     row = sole(release_rows(io, repo, tag, env))
     commit = row.get('target_commitish') if row is not None else None
     got = row.get('assets') if row is not None else None
@@ -520,7 +529,24 @@ def release_facts(io: Io, repo: str, tag: str, env: dict[str, str], names: list[
         if m is None or type(a.get('size')) is not int or a['size'] <= 0:
             raise Refused('pin-unread')
         facts[a['name']] = (m[1], a['size'])
-    return row['id'], commit, facts
+    author, uploads = login_of(row.get('author')), [(a['name'], a.get('created_at'), login_of(a.get('uploader'))) for a in got]
+    if (author is None or utc(row.get('published_at')) is None
+            or any(utc(t) is None or who is None for _, t, who in uploads)):
+        raise Refused('pin-unread')
+    return row['id'], commit, facts, (author, row['published_at'], tuple(sorted(uploads)))
+
+
+def login_of(user) -> str | None:
+    """The `login` of a GitHub user object, or None."""
+    return user['login'] if isinstance(user, dict) and isinstance(user.get('login'), str) and user['login'] else None
+
+
+def utc(stamp) -> int | None:
+    """GitHub's `2026-10-21T11:25:23Z` as epoch seconds, or None for anything else."""
+    try:
+        return calendar.timegm(time.strptime(stamp, '%Y-%m-%dT%H:%M:%SZ')) if isinstance(stamp, str) else None
+    except ValueError:
+        return None
 
 
 def require_on_main(io: Io, repo: str, commit: str, env: dict[str, str]) -> None:
@@ -538,10 +564,43 @@ def require_on_main(io: Io, repo: str, commit: str, env: dict[str, str]) -> None
         raise Refused('pin-not-main')
 
 
+def require_main_run(io: Io, repo: str, commit: str, made: tuple, env: dict[str, str]) -> None:
+    """The release was made by a disk.yml run on main at exactly `commit`: the release's author and every asset's uploader
+    are the Actions bot (a person's `gh release create` carries their own login), and the run record (a successful, completed
+    workflow_dispatch of disk.yml, head_branch main, head_sha `commit`) covers the release's publication and every asset's
+    upload within its [created_at, updated_at]. (The release's own `created_at` is the COMMIT's date, not the run's, so it is
+    not compared.) No such run, or an author or uploader that is not the bot, is `pin-not-main`; no readable run list is
+    `pin-unread`."""
+    author, published, uploads = made
+    if author != BOT or any(who != BOT for _, _, who in uploads):
+        raise Refused('pin-not-main')
+    try:
+        code, out = io.run([GH, 'api', f'repos/{repo}/actions/workflows/disk.yml/runs?head_sha={commit}'
+                            f'&event=workflow_dispatch&status=success&per_page=100'], env)
+        data = json.loads(out) if code == 0 else None
+    except (Refused, ValueError):
+        data = None
+    runs = data.get('workflow_runs') if isinstance(data, dict) else None
+    if not isinstance(runs, list):
+        raise Refused('pin-unread')
+    times = [utc(published)] + [utc(t) for _, t, _ in uploads]
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        start, end = utc(run.get('created_at')), utc(run.get('updated_at'))
+        if (run.get('head_branch') == MAIN and run.get('head_sha') == commit and run.get('event') == 'workflow_dispatch'
+                and run.get('status') == 'completed' and run.get('conclusion') == 'success'
+                and run.get('path') == DISK_WORKFLOW and start is not None and end is not None
+                and all(start - RUN_SLACK <= t <= end + RUN_SLACK for t in times)):
+            return
+    raise Refused('pin-not-main')
+
+
 def pin(io: Io, arch: str, serial: str, work: Path, repo: str, env: dict[str, str], fpr: str,
         now: float | None = None) -> dict:
-    """The lock entries of the release of arch's disk for serial, read-only, and only for a release made on main: the
-    release's own row names its commit, which must be on main, and every line printed is one re-read here (the upstream
+    """The lock entries of the release of arch's disk for serial, read-only, and only for a release whose commit is on main
+    and which a successful disk.yml dispatch on main at that commit made (require_on_main, require_main_run): the release's
+    own row names its commit, and every line printed is one re-read here (the upstream
     signed sum through the same gpgv check as the build, the asset digests from a second read of the release that must equal
     the first, for arm64 also the asset's bytes against that digest and the expanded disk's own sha and size, and vfkit's
     upstream bytes). A read that fails is pin-unread, never a guess."""
@@ -554,6 +613,7 @@ def pin(io: Io, arch: str, serial: str, work: Path, repo: str, env: dict[str, st
     try:
         first = release_facts(io, repo, tag, env, names)
         require_on_main(io, repo, first[1], env)
+        require_main_run(io, repo, first[1], first[3], env)
         facts = first[2]
         if arch == 'arm64':
             if signed_image_sum(io, base, IMAGE_ARM64, work, fpr, serial, now) != ARM64_IMAGE_SHA256:
@@ -592,7 +652,8 @@ def lock_text(entries: dict) -> str:
 def main(argv: list[str], environ: dict[str, str], io: Io) -> int:
     """`fleet-disk.py [amd64|arm64] <serial>`, with GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN in the environment;
     `fleet-disk.py cleanup [amd64|arm64] <serial>` deletes that tag's leftover draft release (and nothing else);
-    `fleet-disk.py pin [amd64|arm64] <serial>` reads the release back and prints its entries only if it was made on main."""
+    `fleet-disk.py pin [amd64|arm64] <serial>` reads the release back and prints its entries only if its commit is on main
+    and a successful disk.yml dispatch on main at that commit made it."""
     args = argv[1:]
     verb = args.pop(0) if args[:1] in (['cleanup'], ['pin']) else ''
     arch = args.pop(0) if len(args) == 2 and args[0] in ARCHES else 'amd64'

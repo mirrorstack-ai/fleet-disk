@@ -51,6 +51,10 @@ def validsig(*fprs: str, good: bool = True, stamp: int = SIGNED) -> str:
 
 
 RID = 4242  # the draft release's id in the fake GitHub
+iso = lambda t: time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(t))  # noqa: E731  GitHub's timestamp form
+RUN_START, RUN_END = NOW, NOW + 600  # the disk.yml run's created_at and updated_at in the fake
+MADE_AT = iso(NOW + 60)  # when the fake's run published its release and uploaded its assets: inside the run
+BOT = {'login': 'github-actions[bot]'}
 
 
 def quiet(err: str) -> str:
@@ -59,7 +63,7 @@ def quiet(err: str) -> str:
 
 
 def draft_row(tag: str, assets: list | None = None, draft: bool = True, rid: int = RID, target: str | None = None) -> dict:
-    row = {'id': rid, 'tag_name': tag, 'draft': draft, 'assets': assets if assets is not None else []}
+    row = {'id': rid, 'tag_name': tag, 'draft': draft, 'assets': assets if assets is not None else [], 'author': BOT}
     return row | {'target_commitish': target} if target else row  # GitHub's REST row names the --target it was made with
 
 
@@ -132,7 +136,8 @@ class FakeIo:
 
     def create(self, argv: list[str]) -> tuple[int, str]:
         """gh makes the draft and uploads, then publishes: a failed or killed run leaves what `leftover` says."""
-        assets = [{'name': n, 'digest': 'sha256:' + sha(self.written[n]), 'size': len(self.written[n])} for n in self.uploaded]
+        assets = [{'name': n, 'digest': 'sha256:' + sha(self.written[n]), 'size': len(self.written[n]),
+                   'created_at': MADE_AT, 'uploader': BOT} for n in self.uploaded]
         tag = argv[3]
         if self.gh == 0 and not self.timeout:
             assert '--draft' in argv  # nothing is created public
@@ -160,7 +165,7 @@ class FakeIo:
         self.patched.append(int(argv[4].rpartition('/')[2]))
         row = self.row_of(argv)
         if row is not None and (self.patch == 0 if self.patch_takes is None else self.patch_takes):
-            row['draft'] = False
+            row['draft'], row['published_at'] = False, MADE_AT
             for asset in row['assets']:
                 asset['digest'] = self.changed.get(asset['name'], asset['digest'])
         if self.patch_raises:
@@ -1095,29 +1100,39 @@ TAG = f'disk-noble-{SERIAL}'
 MAIN_SHA = 'cd' * 20  # the commit a release names (any 40-hex; whether it is on main is the compare's answer)
 REAL_ARM_PIN = fd.ARM64_IMAGE_SHA256  # the shipped pin, read before any test patches it
 ZST_BODY = ZST + RAW  # what the arm64 build's fake zstd writes for RAW: the release asset's bytes
-ARM_ASSET_ROW = {'name': ARM_ASSET, 'digest': 'sha256:' + sha(ZST_BODY), 'size': len(ZST_BODY)}
+ARM_ASSET_ROW = {'name': ARM_ASSET, 'digest': 'sha256:' + sha(ZST_BODY), 'size': len(ZST_BODY), 'created_at': MADE_AT,
+                 'uploader': BOT}
 
 
-def asset_row(name: str, body: bytes) -> dict:
-    return {'name': name, 'digest': 'sha256:' + sha(body), 'size': len(body)}
+def asset_row(name: str, body: bytes, **kw) -> dict:
+    return {'name': name, 'digest': 'sha256:' + sha(body), 'size': len(body), 'created_at': MADE_AT, 'uploader': BOT} | kw
 
 
 def made(tag: str, items: list | None, target=MAIN_SHA, **kw) -> dict:
     """A published release row as GitHub's REST list shows it; `target` None drops the key, `kw` overrides any field."""
-    row = draft_row(tag, items, False, target=None) | kw
+    row = draft_row(tag, items, False, target=None) | {'published_at': MADE_AT} | kw
     return row | {'target_commitish': target} if target is not None else row
 
 
 AMD_ASSETS = [asset_row(f'noble-{SERIAL}.vhdx', VHDX), asset_row(f'noble-{SERIAL}.qcow2', QCOW2)]
 
 
-class PinIo(FakeIo):
-    """FakeIo for `pin`: the compare answers `status` (or the scripted `compare`, an answer or an exception to raise),
-    and `boom` names a tool (by file name) that fails the way a missing one does."""
+def run_row(commit: str, **kw) -> dict:
+    """GitHub's run record of a disk.yml dispatch on main that succeeded at `commit` (the fields `pin` reads)."""
+    return {'id': 39591835148, 'head_branch': 'main', 'head_sha': commit, 'event': 'workflow_dispatch', 'status': 'completed',
+            'conclusion': 'success', 'path': '.github/workflows/disk.yml', 'created_at': iso(RUN_START),
+            'updated_at': iso(RUN_END)} | kw
 
-    def __init__(self, status: str = 'behind', compare=None, boom: str | None = None, **kw):
+
+class PinIo(FakeIo):
+    """FakeIo for `pin`: the compare answers `status` (or the scripted `compare`, an answer or an exception to raise), the
+    run record answers one good run at the commit asked for (`run_kw` overrides its fields; `runs` scripts the whole answer:
+    a list of runs, a (code, body) or an exception), and `boom` names a tool (by file name) that fails the way a missing one does."""
+
+    def __init__(self, status: str = 'behind', compare=None, boom: str | None = None, runs=None, run_kw: dict | None = None,
+                 **kw):
         super().__init__(**kw)
-        self.status, self.compare, self.boom = status, compare, boom
+        self.status, self.compare, self.boom, self.runs, self.run_kw = status, compare, boom, runs, run_kw or {}
 
     def run(self, argv: list[str], env: dict[str, str], timeout: int = fd.TOOL_TIMEOUT) -> tuple[int, str]:
         if self.boom and Path(argv[0]).name == self.boom:
@@ -1130,6 +1145,16 @@ class PinIo(FakeIo):
             if isinstance(self.compare, Exception):
                 raise self.compare
             return self.compare if self.compare is not None else (0, json.dumps({'status': self.status}))
+        if argv[:2] == [fd.GH, 'api'] and '/actions/workflows/' in argv[2]:
+            m = re.fullmatch(r'repos/[\w./-]+/actions/workflows/disk\.yml/runs\?head_sha=([0-9a-f]{40})'
+                             r'&event=workflow_dispatch&status=success&per_page=100', argv[2])
+            assert m, argv
+            self.timeouts.append(timeout)
+            self.ran.append((argv, env))
+            if isinstance(self.runs, Exception):
+                raise self.runs
+            return self.runs if isinstance(self.runs, tuple) else (0, json.dumps({'workflow_runs': (
+                self.runs if self.runs is not None else [run_row(m[1], **self.run_kw)])}))
         return super().run(argv, env, timeout)
 
 
@@ -1150,7 +1175,8 @@ def arm_io(**kw) -> PinArmIo:
 
 
 class Pin(unittest.TestCase):
-    """`fleet-disk.py pin`: a read-only verb that prints the lock entries only for a release made on main."""
+    """`fleet-disk.py pin`: a read-only verb that prints the lock entries only for a release whose commit is on main and that a
+    successful disk.yml dispatch on main at that commit made."""
 
     ENV = {'GITHUB_REPOSITORY': REPO, 'GH_TOKEN': TOKEN}
     NOT_PRINTED = ('pin-not-main', 'pin-unread', 'pin-mismatch')
@@ -1195,6 +1221,79 @@ class Pin(unittest.TestCase):
         io_ = arm_io(status='diverged')
         self.assertEqual(self.cli(io_, 'arm64', ARM_SERIAL)[1:], ('', 'fleet-disk: refused pin-not-main\n'))
         self.assertEqual(io_.fetched, [])  # nothing downloaded for a release that is not on main
+
+    def test_a_release_with_no_successful_main_run_at_its_commit_is_pin_not_main_before_anything_is_downloaded(self):
+        good = run_row(MAIN_SHA)
+        other_sha = run_row('ef' * 20)
+        cases = {'run on a branch': dict(run_kw=dict(head_branch='feat/x')), 'no run': dict(runs=[]),
+                 'a push, not a dispatch': dict(run_kw=dict(event='push')),
+                 'a run for another commit': dict(runs=[other_sha]), 'a failed run': dict(run_kw=dict(conclusion='failure')),
+                 'a skipped run': dict(run_kw=dict(conclusion='skipped')), 'no conclusion': dict(run_kw=dict(conclusion=None)),
+                 'still running': dict(run_kw=dict(status='in_progress')),
+                 'another workflow file': dict(run_kw=dict(path='.github/workflows/other.yml')),
+                 'only bad runs': dict(runs=[dict(good, head_branch='b'), other_sha, 'x', None, 7]),
+                 'run ended before the release was published': dict(run_kw=dict(updated_at=iso(NOW + 59 - fd.RUN_SLACK))),
+                 'run began after the assets were uploaded': dict(run_kw=dict(created_at=iso(NOW + 61 + fd.RUN_SLACK),
+                                                                               updated_at=iso(NOW + 900))),
+                 'run has no times': dict(run_kw=dict(created_at=None, updated_at='yesterday')),
+                 'release by a person': dict(rows=[made(TAG, AMD_ASSETS, author={'login': 'someone'})]),
+                 'asset uploaded by a person': dict(rows=[made(TAG, [AMD_ASSETS[0], dict(AMD_ASSETS[1], uploader={'login': 'someone'})])]),
+                 'asset uploaded after the run': dict(rows=[made(TAG, [AMD_ASSETS[0], dict(AMD_ASSETS[1], created_at=iso(RUN_END + 60))])]),
+                 'release published after the run': dict(rows=[made(TAG, AMD_ASSETS, published_at=iso(RUN_END + 3600))])}
+        for name, kw in cases.items():
+            with self.subTest(case=name):
+                io_ = amd_io(**kw)
+                self.assertEqual(self.cli(io_), (fd.REFUSED, '', 'fleet-disk: refused pin-not-main\n'))
+                # the release, the compare, the run record (a person's release is refused before it): no signed sum, no entry
+                self.assertEqual(io_.tools(), ['gh api'] * (2 if 'person' in name else 3))
+                self.assertEqual(io_.fetched, [])
+        io_ = arm_io(run_kw=dict(head_branch='feat/disk-build'))  # compare says on main (an ancestor), the run says otherwise
+        self.assertEqual(self.cli(io_, 'arm64', ARM_SERIAL), (fd.REFUSED, '', 'fleet-disk: refused pin-not-main\n'))
+        self.assertEqual(io_.fetched, [])
+
+    def test_a_good_run_among_the_bad_ones_and_the_releases_own_created_at_do_not_matter(self):
+        runs = [run_row(MAIN_SHA, head_branch='feat/x'), run_row('ef' * 20), run_row(MAIN_SHA)]
+        self.assertEqual(sorted(self.pin(amd_io(runs=runs))), ['disk', 'disk_input', 'disk_qcow2'])
+        # GitHub's release created_at is the COMMIT's date (2026-10-19 for the real disk-noble-20261017, run on 10-21)
+        early = made(TAG, AMD_ASSETS, created_at='2026-10-19T12:53:35Z')
+        self.assertEqual(sorted(self.pin(amd_io(rows=[early]))), ['disk', 'disk_input', 'disk_qcow2'])
+
+    def test_a_run_record_that_cannot_be_read_or_a_release_without_who_and_when_is_pin_unread(self):
+        no_author = {k: v for k, v in made(TAG, AMD_ASSETS).items() if k != 'author'}
+        no_when = {k: v for k, v in made(TAG, AMD_ASSETS).items() if k != 'published_at'}
+        no_up = [AMD_ASSETS[0], {k: v for k, v in AMD_ASSETS[1].items() if k != 'uploader'}]
+        no_at = [AMD_ASSETS[0], {k: v for k, v in AMD_ASSETS[1].items() if k != 'created_at'}]
+        cases = {'run list exit 1': dict(runs=(1, '')), 'not json': dict(runs=(0, 'x')), 'not an object': dict(runs=(0, '[]')),
+                 'no workflow_runs': dict(runs=(0, '{}')), 'runs not a list': dict(runs=(0, '{"workflow_runs": 7}')),
+                 'timeout': dict(runs=fd.Refused('tool-timeout')),
+                 'no author': dict(rows=[no_author]), 'author not an object': dict(rows=[made(TAG, AMD_ASSETS, author='bot')]),
+                 'author without login': dict(rows=[made(TAG, AMD_ASSETS, author={})]),
+                 'no published_at': dict(rows=[no_when]), 'published_at not a time': dict(rows=[made(TAG, AMD_ASSETS, published_at='soon')]),
+                 'asset without uploader': dict(rows=[made(TAG, no_up)]), 'asset without created_at': dict(rows=[made(TAG, no_at)]),
+                 'asset time not a time': dict(rows=[made(TAG, [AMD_ASSETS[0], dict(AMD_ASSETS[1], created_at=7)])])}
+        for name, kw in cases.items():
+            with self.subTest(case=name):
+                io_ = amd_io(**kw)
+                self.assertEqual(self.cli(io_), (fd.REFUSED, '', 'fleet-disk: refused pin-unread\n'))
+                self.assertEqual(io_.fetched, [])
+
+    def test_the_printed_qcow2_size_is_the_qcow2_assets_own_not_the_vhdxs(self):
+        rows = [made(TAG, [asset_row(f'noble-{SERIAL}.vhdx', VHDX, size=1933574144),  # the real disk-noble-20261017 sizes
+                           asset_row(f'noble-{SERIAL}.qcow2', QCOW2, size=1879179264)])]
+        entries = self.pin(amd_io(rows=rows))
+        self.assertEqual(entries['disk_qcow2']['size'], 1879179264)
+        self.assertEqual(set(entries['disk']), {'url', 'sha256'})
+        self.assertEqual(entries['disk_qcow2']['sha256'], sha(QCOW2))
+        self.assertEqual(entries['disk']['sha256'], sha(VHDX))
+
+    def test_an_expanded_arm64_disk_over_the_cap_is_pin_unread_and_prints_nothing(self):
+        self.addCleanup(setattr, fd, 'MAX_RAW', fd.MAX_RAW)
+        fd.MAX_RAW = len(RAW)  # exactly the cap is allowed ...
+        self.assertEqual(self.cli(arm_io(), 'arm64', ARM_SERIAL)[0], 0)
+        fd.MAX_RAW = len(RAW) - 1  # ... one byte more is not
+        io_ = arm_io()
+        self.assertEqual(self.cli(io_, 'arm64', ARM_SERIAL), (fd.REFUSED, '', 'fleet-disk: refused pin-unread\n'))
+        self.assertEqual(io_.patched, [])
 
     def test_a_compare_that_gives_no_status_or_no_answer_is_pin_unread(self):
         for compare in ((1, ''), (0, ''), (0, 'not json'), (0, '[]'), (0, '{}'), (0, '{"status": null}'),
@@ -1297,7 +1396,7 @@ class Pin(unittest.TestCase):
             self.assertEqual((code, err), (0, ''))
             calls = io_.ran[before:]
             gh = [call for call, _ in calls if call[0] == fd.GH]
-            self.assertEqual(len(gh), 3)  # the release, the compare, the release again
+            self.assertEqual(len(gh), 4)  # the release, the compare, the run record, the release again
             for call in gh:
                 self.assertEqual(call[1], 'api', call)
                 self.assertTrue(call[2].startswith(f'repos/{REPO}/'), call)
@@ -1358,7 +1457,8 @@ class Readme(unittest.TestCase):
     def test_the_pinning_paragraph_says_to_use_pin_not_the_log(self):
         text = ' '.join(self.TEXT.split())
         for need in ('`bin/fleet-disk.py pin [amd64|arm64] <serial>`', 'use `pin`, not the log', '`pin-not-main`', '`pin-unread`',
-                     '`pin-mismatch`', '`behind` or `identical`'):
+                     '`pin-mismatch`', '`behind` or `identical`', 'actions/workflows/disk.yml/runs', '`github-actions[bot]`',
+                     'cannot tell the run\'s own release from one that another job of the same bot'):
             self.assertIn(need, text)
         self.assertNotIn('entries to pin come only from the log', text)
 
