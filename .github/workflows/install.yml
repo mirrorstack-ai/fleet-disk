@@ -16,12 +16,29 @@
 #            not refuse what it must refuse. It proves the pipeline in VMs (no /dev/kvm: the good run ends in `kvm`), not the install.
 #   sign     needs plan and smoke (which needs fixture); runs no repository code and no third-party action: holds SIGN_KEY only in memory, refuses unless its
 #            fingerprint is KEY_SHA256 below, signs the three files, verifies them and wipes the key.
+#   gwsign   needs plan and sign; signs the gateway record for the kit host, in the TEST series only (SERIES=test; the owner's answer
+#            of 2026-10-21 to D311, option 5B). The kit job's `gateway` verb and both bootstraps verify gateway.json.sig under the baked key,
+#            and nothing but this job signs gateway.json under it, so a live pair signed by anybody else ends `REFUSED sig` there.
+#            Two steps, no checkout, no action, no python, no output but the signature: `fetch` (FLEET_READ only) reads the record from the
+#            release tip, refuses `tip-moved` unless it is the tip the plan judged, and keeps the bytes in a file of this job's runner; no
+#            `gateway.json.sig` at the tip is not live (nothing is signed, the kit job keeps `SKIP gateway not-live`); a signature without
+#            a record, or a record over 65536 bytes, is `REFUSED gateway`. `sign` (SIGN_KEY only, no git, ssh or network child) signs that
+#            file under the namespace mirrorstack-fleet-pin and verifies it (a failed verify stops the step). Before `live=yes` the
+#            fetch step checks the bytes name the five keys of a gateway record (serial, address, cert_sha256, manifest_key, session_key;
+#            a fixed-string grep, no python or jq, a shape check and not a schema check): the pin namespace is shared with kit.json and
+#            deploy-pin.json, so without it this job would sign any file at that path for the test key; a body without them is
+#            `REFUSED gateway`. The kit verb's full schema check still runs after. The record's bytes never leave the job: the output is the
+#            signature only, the log shows a size and a sha256 at most. The tip's own gateway.json.sig stays as it is, for the control VM.
+#            In a release series run it signs nothing (`SKIP gwsign series`): the kit job then judges the tip's own signature, which must
+#            be the release key's, as before this job existed. The kit host then serves the CI signature (the test series) and no
+#            longer the tip's: the kit pipeline does not verify the tip's own signature in the test series.
 #   kit      puts the bundle and the gateway record on the kit host. It holds only FLEET_READ and KIT_UPLOAD_KEY (the Ed25519
 #            key whose signature the host takes; it has no Cloudflare power at all). It rebuilds the bundle from the fleet
 #            commit install.json names, with the vendored packer, refuses unless size, sha256, head and tree equal the signed
 #            install.json, and uploads it. Before the bundle it judges the gateway pair at the release tip (`gateway --check`, no
 #            upload), so a bad pair is refused before a bundle the host can never delete is stored; after the bundle it reads
-#            the record and its signature from the release tip again, checks the owner's signature and uploads the pair.
+#            the record from the release tip again, checks the signature (gwsign's, passed as `--sig`, or else the tip's own
+#            gateway.json.sig) and uploads the pair.
 #            While no gateway is live (the record is the placeholder, serial 0 and address null, with no signature file) the
 #            gateway step prints `SKIP gateway not-live` and uploads nothing; any other state without a good signed pair is
 #            still a refusal. Nothing goes through the plan's files, an artifact, a cache or a log.
@@ -92,6 +109,7 @@ jobs:
       kit_sha: ${{ steps.plan.outputs.kit_sha }}
       pin_b64: ${{ steps.plan.outputs.pin_b64 }}
       pin_sha: ${{ steps.plan.outputs.pin_sha }}
+      tip: ${{ steps.plan.outputs.tip }}
       immutable: ${{ steps.immutable.outputs.immutable }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
@@ -320,8 +338,86 @@ jobs:
           sign deploy-pin.json mirrorstack-fleet-pin "$PIN_B64" "$PIN_SHA" pin
           printf 'pub=%s\n' "$pub" >> "$GITHUB_OUTPUT"
           echo "signed with key $fp"
+  gwsign:
+    needs: [plan, sign]
+    if: github.ref == 'refs/heads/release' && inputs.mode == 'sign'
+    environment: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    outputs:
+      gateway_sig: ${{ steps.sign.outputs.gateway_sig }}
+    steps:
+      - id: fetch
+        env:
+          FLEET_READ: ${{ secrets.FLEET_READ }}
+          TIP: ${{ needs.plan.outputs.tip }}
+        run: |
+          set -eu
+          umask 077
+          case "$TIP" in '' | *[!0-9a-f]*) echo 'REFUSED gateway tip'; exit 1;; esac
+          [ "${#TIP}" = 40 ] || { echo 'REFUSED gateway tip'; exit 1; }
+          d=$(mktemp -d /dev/shm/gwfetch.XXXXXX)
+          trap 'shred -u "$d/key" 2>/dev/null || true; rm -rf "$d"' EXIT
+          printf '%s\n' "$FLEET_READ" > "$d/key"
+          printf '%s\n' "$GH_HOSTKEY" > "$d/known_hosts"
+          export GIT_SSH_COMMAND="/usr/bin/ssh -i $d/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$d/known_hosts -o GlobalKnownHostsFile=/dev/null -o HostKeyAlgorithms=ssh-ed25519"
+          git init -q "$d/repo"
+          git -C "$d/repo" fetch -q --no-tags --depth 1 "$FLEET_REPO" '+refs/heads/release:refs/remotes/origin/release'
+          [ "$(git -C "$d/repo" rev-parse refs/remotes/origin/release)" = "$TIP" ] || { echo 'REFUSED tip-moved'; exit 1; }
+          rec=$(git -C "$d/repo" ls-tree "$TIP" -- fleet/core/gateway.json | cut -f 1)
+          sig=$(git -C "$d/repo" ls-tree "$TIP" -- fleet/core/gateway.json.sig | cut -f 1)
+          if [ -z "$sig" ]; then
+            echo 'SKIP gwsign not-live'
+            echo live=no >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          case "$rec" in '100644 blob '*) ;; *) echo 'REFUSED gateway'; exit 1;; esac
+          n=$(git -C "$d/repo" cat-file -s "$TIP:fleet/core/gateway.json")
+          case "$n" in '' | *[!0-9]*) echo 'REFUSED gateway'; exit 1;; esac
+          [ "$n" -gt 0 ] && [ "$n" -le 65536 ] || { echo 'REFUSED gateway'; exit 1; }
+          if [ "$SERIES" != test ]; then
+            echo 'SKIP gwsign series'
+            echo live=no >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir "$RUNNER_TEMP/gwsign"
+          git -C "$d/repo" cat-file blob "$TIP:fleet/core/gateway.json" > "$RUNNER_TEMP/gwsign/gateway.json"
+          for k in serial address cert_sha256 manifest_key session_key; do
+            grep -qF "\"$k\"" "$RUNNER_TEMP/gwsign/gateway.json" || { rm -rf "$RUNNER_TEMP/gwsign"; echo 'REFUSED gateway'; exit 1; }
+          done
+          echo live=yes >> "$GITHUB_OUTPUT"
+          echo "gateway record: $n bytes"
+      - id: sign
+        if: steps.fetch.outputs.live == 'yes'
+        env:
+          SIGN_KEY: ${{ secrets.SIGN_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [ "$SERIES" = test ] || { echo 'REFUSED series'; exit 1; }
+          g="$RUNNER_TEMP/gwsign/gateway.json"
+          [ -f "$g" ] && [ ! -L "$g" ] || { echo 'REFUSED gateway'; exit 1; }
+          n=$(wc -c < "$g" | tr -d ' ')
+          [ "$n" -gt 0 ] && [ "$n" -le 65536 ] || { echo 'REFUSED gateway'; exit 1; }
+          d=$(mktemp -d /dev/shm/gwsign.XXXXXX)
+          trap 'shred -u "$d/key" 2>/dev/null || true; rm -rf "$d" "$RUNNER_TEMP/gwsign"' EXIT
+          printf '%s\n' "$SIGN_KEY" > "$d/key"
+          fp=$(/usr/bin/ssh-keygen -l -f "$d/key" | cut -d ' ' -f 2)
+          pub=$(/usr/bin/ssh-keygen -y -f "$d/key" | cut -d ' ' -f 1,2)
+          [ -n "$fp" ] && [ -n "$pub" ] || { echo 'REFUSED no-key'; exit 1; }
+          printf '%s\n' "$KEY_SHA256" | grep -Eq '^SHA256:[A-Za-z0-9+/]{43}$' || { echo 'REFUSED key-not-set'; exit 1; }
+          [ "$fp" = "$KEY_SHA256" ] || { echo 'REFUSED key'; exit 1; }
+          printf 'owner namespaces="mirrorstack-fleet-pin" %s\n' "$pub" > "$d/allowed"
+          cp "$g" "$d/gateway.json"
+          h=$(sha256sum "$d/gateway.json" | cut -d ' ' -f 1)
+          /usr/bin/ssh-keygen -q -Y sign -f "$d/key" -n mirrorstack-fleet-pin "$d/gateway.json"
+          /usr/bin/ssh-keygen -Y verify -f "$d/allowed" -I owner -n mirrorstack-fleet-pin -s "$d/gateway.json.sig" < "$d/gateway.json" > /dev/null
+          [ "$(sha256sum "$d/gateway.json" | cut -d ' ' -f 1)" = "$h" ] || { echo 'REFUSED changed gateway.json'; exit 1; }
+          printf 'gateway_sig=%s\n' "$(base64 -w0 < "$d/gateway.json.sig")" >> "$GITHUB_OUTPUT"
+          echo "signed gateway.json: $n bytes, sha256 $h, key $fp"
   kit:
-    needs: [plan, smoke, sign]
+    needs: [plan, smoke, sign, gwsign]
     if: github.ref == 'refs/heads/release'
     environment: release
     runs-on: ubuntu-24.04
@@ -337,6 +433,7 @@ jobs:
           INSTALL_SHA: ${{ needs.plan.outputs.install_sha }}
           INSTALL_SIG: ${{ needs.sign.outputs.install_sig }}
           PUB: ${{ needs.sign.outputs.pub }}
+          GATEWAY_SIG: ${{ needs.gwsign.outputs.gateway_sig }}
           OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}
           KIT_HOST: ${{ env.KIT_HOST }}
           FLEET_READ: ${{ secrets.FLEET_READ }}
@@ -355,9 +452,14 @@ jobs:
           unset FLEET_READ
           printf '%s\n' "$GH_HOSTKEY" > "$d/known_hosts"
           export GIT_SSH_COMMAND="/usr/bin/ssh -i $d/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$d/known_hosts -o GlobalKnownHostsFile=/dev/null -o HostKeyAlgorithms=ssh-ed25519"
-          python3 bin/fleet-kit-upload.py gateway --check --owner-pub "$d/owner.pub"
+          args=()
+          if [ -n "$GATEWAY_SIG" ]; then
+            printf '%s' "$GATEWAY_SIG" | base64 -d > "$d/gateway.sig"
+            args=(--sig "$d/gateway.sig")
+          fi
+          python3 bin/fleet-kit-upload.py gateway --check --owner-pub "$d/owner.pub" ${args[@]+"${args[@]}"}
           python3 bin/fleet-kit-upload.py bundle "$d/install" --owner-pub "$d/owner.pub"
-          python3 bin/fleet-kit-upload.py gateway --owner-pub "$d/owner.pub"
+          python3 bin/fleet-kit-upload.py gateway --owner-pub "$d/owner.pub" ${args[@]+"${args[@]}"}
   tag:
     needs: [plan, smoke, sign, kit]
     if: github.ref == 'refs/heads/release'

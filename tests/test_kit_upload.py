@@ -840,6 +840,140 @@ class TestGatewayNotLive(Fixture):
         self.assertEqual(fk.NOT_LIVE, 'SKIP gateway not-live')
 
 
+class TestGatewayCiSignature(Fixture):
+    """`gateway [--check] --owner-pub P --sig FILE` (AF08, the owner's answer of 2026-10-21 to D311: the test series' CI signs the
+    record for the kit host). P is the baked key's public line here, the key the job `gwsign` signs with; the fixture's tip holds a
+    signature of ANOTHER key (the one the control VM trusts), which must neither be needed nor rescue a bad FILE."""
+
+    def setUp(self):
+        super().setUp()
+        self.ci = keygen(self.tmp, 'ci')
+        self.pub = self.tmp / 'baked.pub'  # the baked key's public line: what the kit job verifies under
+        self.pub.write_bytes(Path(str(self.ci) + '.pub').read_bytes())
+        self.pin = subprocess.run([fp.SSH_KEYGEN, '-l', '-f', str(self.pub)], capture_output=True, text=True).stdout.split()[1]
+        self.record_bytes = git(self.origin, 'show', 'HEAD:fleet/core/gateway.json').encode() + b'\n'
+        self.tip_sig = (self.origin / 'fleet/core/gateway.json.sig').read_bytes()  # signed by self.owner, not by the baked key
+
+    def sig_file(self, key: Path | None = None, namespace: str = fp.PIN_NS, body: bytes | None = None) -> Path:
+        """What the job `gwsign` makes: ssh-keygen -Y sign of the record's bytes, the armor in a file of its own."""
+        folder = Path(tempfile.mkdtemp(prefix='sig-', dir=self.tmp))
+        record = folder / 'gateway.json'
+        record.write_bytes(self.record_bytes if body is None else body)
+        ssh_sign(key or self.ci, record, namespace)
+        return folder / 'gateway.json.sig'
+
+    def drop_tip_sig(self) -> None:
+        git(self.origin, 'rm', '-q', 'fleet/core/gateway.json.sig')
+        git(self.origin, 'commit', '-q', '-m', 'no signature at the tip')
+
+    def with_sig(self, sig: Path | str, check: bool = False, **kw):
+        head = ('gateway', '--check') if check else ('gateway',)
+        return self.invoke(*head, '--owner-pub', str(self.pub), '--sig', str(sig), **kw)
+
+    def check(self, **kw):
+        return self.invoke('gateway', '--check', '--owner-pub', str(self.pub), **kw)
+
+    def refuses_sig(self, sig: Path | str, word: str, why: str) -> None:
+        for check in (False, True):
+            net = Boom()
+            code, out, _ = self.with_sig(sig, check, net=net)
+            self.assertEqual((code, out), (1, f'REFUSED {word}\n'), (why, check))
+            self.assertEqual(net.calls, [], (why, check))
+        self.assertClean()
+
+    def test_a_pair_signed_as_gwsign_signs_it_is_uploaded_with_the_ci_signature(self):
+        sig = self.sig_file()
+        code, out, err = self.with_sig(sig)
+        ci_sig = sig.read_bytes()
+        self.assertEqual((code, err), (0, ''), out)
+        self.assertEqual(out, f'OK gateway serial=3 json={sha(self.record_bytes)} sig={sha(ci_sig)}\n')
+        (call,) = self.net.calls
+        self.assertEqual((call['method'], call['path']), ('PUT', '/_k/gateway/3'))
+        self.assertEqual(json.loads(call['body']), {'json': base64.b64encode(self.record_bytes).decode(),
+                                                    'sig': base64.b64encode(ci_sig).decode()})
+        self.assertNotEqual(ci_sig, self.tip_sig)  # the tip's signature is not what went up
+        self.assertTrue(self.net.signature_ok(call))
+        self.assertClean()
+
+    def test_the_tip_may_hold_no_signature_at_all(self):
+        self.drop_tip_sig()
+        sig = self.sig_file()
+        code, out, _ = self.with_sig(sig)
+        self.assertEqual((code, out[:20]), (0, 'OK gateway serial=3 '), out)
+        self.assertEqual(json.loads(self.net.calls[0]['body'])['sig'], base64.b64encode(sig.read_bytes()).decode())
+        self.assertEqual(self.with_sig(sig, True, net=Boom())[:2], (0, 'OK gateway-check serial=3\n'))
+
+    def test_the_check_with_a_good_signature_is_ok_and_asks_nobody(self):
+        net = Boom()
+        self.assertEqual(self.with_sig(self.sig_file(), True, net=net)[:2], (0, 'OK gateway-check serial=3\n'))
+        self.assertEqual((net.calls, self.net.calls), ([], []))
+        self.assertClean()
+
+    def test_without_the_option_the_tips_own_signature_is_still_what_is_judged(self):
+        # control: the same tip without --sig carries another key's signature, so it is REFUSED sig, as before AF08
+        self.assertEqual(self.gateway(net=Boom())[:2], (1, 'REFUSED sig\n'))
+        self.assertEqual(self.check(net=Boom())[:2], (1, 'REFUSED sig\n'))
+
+    def test_a_signature_by_another_key_is_refused_sig(self):
+        self.refuses_sig(self.sig_file(key=self.owner), 'sig', 'the control key')
+        self.refuses_sig(self.sig_file(key=keygen(self.tmp, 'other')), 'sig', 'a stranger')
+
+    def test_a_signature_in_the_install_namespace_is_refused_sig(self):
+        self.refuses_sig(self.sig_file(namespace=fp.NS), 'sig', 'wrong namespace')
+
+    def test_a_signature_over_other_bytes_is_refused_sig(self):
+        other = json.dumps(self.record(4)).encode() + b'\n'
+        self.refuses_sig(self.sig_file(body=other), 'sig', 'another record')
+        self.refuses_sig(self.sig_file(body=self.record_bytes + b' '), 'sig', 'one more byte')
+
+    def test_a_good_signature_at_the_tip_does_not_rescue_a_bad_file(self):
+        (self.origin / 'fleet/core/gateway.json.sig').write_bytes(self.sig_file().read_bytes())  # the tip now holds a good CI signature
+        git(self.origin, 'add', '-A')
+        git(self.origin, 'commit', '-q', '-m', 'ci signature at the tip')
+        self.assertIn('serial=3', self.check()[1])  # control: that tip is good without --sig
+        self.refuses_sig(self.sig_file(key=self.owner), 'sig', 'bad file, good tip')
+        self.refuses_sig(self.sig_file(namespace=fp.NS), 'sig', 'wrong namespace file, good tip')
+
+    def test_a_file_that_is_missing_empty_over_the_cap_or_a_folder_is_refused_sig(self):
+        self.refuses_sig(self.tmp / 'no-such-file', 'sig', 'missing')
+        empty = self.tmp / 'empty.sig'
+        empty.write_bytes(b'')
+        self.refuses_sig(empty, 'sig', 'empty')
+        big = self.tmp / 'big.sig'
+        big.write_bytes(b'x' * (fk.MAX_GATEWAY_SIG + 1))
+        self.refuses_sig(big, 'sig', 'over the cap')
+        self.refuses_sig(self.tmp, 'sig', 'a folder')
+        edge = self.tmp / 'edge.sig'
+        edge.write_bytes(b'x' * fk.MAX_GATEWAY_SIG)
+        self.refuses_sig(edge, 'sig', 'at the cap but not a signature')
+
+    def test_a_not_live_or_unreadable_record_is_never_a_skip_with_a_file(self):
+        placeholder = (PLACEHOLDER + '\n').encode()
+        (self.origin / 'fleet/core/gateway.json').write_bytes(placeholder)
+        git(self.origin, 'add', '-A')
+        git(self.origin, 'commit', '-q', '-m', 'placeholder')
+        self.refuses_sig(self.sig_file(body=b'x\n'), 'sig', 'a placeholder, a signature of other bytes')
+        self.refuses_sig(self.sig_file(body=placeholder), 'gateway', 'a signed placeholder')
+        git(self.origin, 'rm', '-q', 'fleet/core/gateway.json')
+        git(self.origin, 'commit', '-q', '-m', 'no record')
+        self.refuses_sig(self.sig_file(), 'gateway', 'no record at the tip')
+
+    def test_the_usage_of_the_file_option(self):
+        want = {('gateway', '--owner-pub', 'p', '--sig', 'f'): ('gateway', Path('f'), 'p'),
+                ('gateway', '--check', '--owner-pub', 'p', '--sig', 'f'): ('gateway-check', Path('f'), 'p'),
+                ('gateway', '--owner-pub', 'p'): ('gateway', None, 'p'),
+                ('gateway', '--check', '--owner-pub', 'p'): ('gateway-check', None, 'p')}
+        for argv, parsed in want.items():
+            self.assertEqual(fk.parse_args(['x', *argv]), parsed, argv)
+        for argv in (['gateway', '--owner-pub', 'p', '--sig'], ['gateway', '--sig', 'f', '--owner-pub', 'p'],
+                     ['gateway', '--owner-pub', 'p', '--sig', ''], ['gateway', '--check', '--owner-pub', 'p', '--sig', 'f', 'g'],
+                     ['bundle', 'd', '--owner-pub', 'p', '--sig', 'f'], ['floor', '7', '--sig', 'f'],
+                     ['gateway', '--owner-pub', 'p', '--sigs', 'f'], ['gateway', '--owner-pub', 'p', 'q', 'f']):
+            self.assertIsNone(fk.parse_args(['x', *argv]), argv)
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(fk.main(['x', *argv], {}), 2, argv)
+
+
 @unittest.skipUnless(OPENSSL, 'no openssl with Ed25519 raw signing')
 class TestSigner(unittest.TestCase):
     def setUp(self):
