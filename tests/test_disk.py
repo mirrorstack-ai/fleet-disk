@@ -58,8 +58,9 @@ def quiet(err: str) -> str:
     return re.sub(r'fleet-disk: \w+ \d+ bytes\n', '', err)
 
 
-def draft_row(tag: str, assets: list | None = None, draft: bool = True, rid: int = RID) -> dict:
-    return {'id': rid, 'tag_name': tag, 'draft': draft, 'assets': assets if assets is not None else []}
+def draft_row(tag: str, assets: list | None = None, draft: bool = True, rid: int = RID, target: str | None = None) -> dict:
+    row = {'id': rid, 'tag_name': tag, 'draft': draft, 'assets': assets if assets is not None else []}
+    return row | {'target_commitish': target} if target else row  # GitHub's REST row names the --target it was made with
 
 
 class FakeIo:
@@ -131,10 +132,11 @@ class FakeIo:
 
     def create(self, argv: list[str]) -> tuple[int, str]:
         """gh makes the draft and uploads, then publishes: a failed or killed run leaves what `leftover` says."""
-        assets, tag = [{'name': n, 'digest': 'sha256:' + sha(self.written[n])} for n in self.uploaded], argv[3]
+        assets = [{'name': n, 'digest': 'sha256:' + sha(self.written[n]), 'size': len(self.written[n])} for n in self.uploaded]
+        tag = argv[3]
         if self.gh == 0 and not self.timeout:
             assert '--draft' in argv  # nothing is created public
-            self.rows = [draft_row(tag, assets)]
+            self.rows = [draft_row(tag, assets, target=argv[argv.index('--target') + 1])]
             return 0, ''
         self.rows = {'draft': [draft_row(tag, assets)], 'published': [draft_row(tag, assets, False)],
                      'other': [draft_row(tag + '-other', assets)], 'none': []}[self.leftover]
@@ -1012,6 +1014,19 @@ class Entry(unittest.TestCase):
         self.assertEqual((done.returncode, done.stdout, done.stderr), (fd.REFUSED, '', 'fleet-disk: refused serial-not-pinned\n'))
         self.assertEqual(self.run_script('arm64', ARM_SERIAL, 'x').returncode, fd.USAGE)
 
+    def test_pin_refuses_a_bad_serial_before_any_network_call_and_a_missing_gh_is_pin_unread(self):
+        done = self.run_script('pin', 'current')
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (fd.REFUSED, '', 'fleet-disk: refused serial\n'))
+        self.assertEqual(self.run_script('pin', 'arm64', '20260930').stderr, 'fleet-disk: refused serial-not-pinned\n')
+        self.assertEqual(self.run_script('pin').returncode, fd.USAGE)
+        code = ('import importlib.util, os, sys\n'
+                'spec = importlib.util.spec_from_file_location("fd", sys.argv[1])\n'
+                'fd = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(fd)\n'
+                'fd.GH = "/nonexistent/gh"\n'
+                'sys.exit(fd.main(["fleet-disk.py", "pin", sys.argv[2]], dict(os.environ), fd.Real()))\n')
+        done = self.run_script_code(code, str(ROOT / 'bin/fleet-disk.py'), SERIAL)
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (fd.REFUSED, '', 'fleet-disk: refused pin-unread\n'))
+
     def test_a_missing_release_environment_is_refused(self):
         done = self.run_script(SERIAL, GH_TOKEN='')
         self.assertEqual((done.returncode, done.stdout, done.stderr), (fd.REFUSED, '', 'fleet-disk: refused release-env\n'))
@@ -1076,6 +1091,262 @@ class Real(unittest.TestCase):
         self.assertEqual(fd.valid_fingerprints(sub), {OTHER, FPR})
 
 
+TAG = f'disk-noble-{SERIAL}'
+MAIN_SHA = 'cd' * 20  # the commit a release names (any 40-hex; whether it is on main is the compare's answer)
+REAL_ARM_PIN = fd.ARM64_IMAGE_SHA256  # the shipped pin, read before any test patches it
+ZST_BODY = ZST + RAW  # what the arm64 build's fake zstd writes for RAW: the release asset's bytes
+ARM_ASSET_ROW = {'name': ARM_ASSET, 'digest': 'sha256:' + sha(ZST_BODY), 'size': len(ZST_BODY)}
+
+
+def asset_row(name: str, body: bytes) -> dict:
+    return {'name': name, 'digest': 'sha256:' + sha(body), 'size': len(body)}
+
+
+def made(tag: str, items: list | None, target=MAIN_SHA, **kw) -> dict:
+    """A published release row as GitHub's REST list shows it; `target` None drops the key, `kw` overrides any field."""
+    row = draft_row(tag, items, False, target=None) | kw
+    return row | {'target_commitish': target} if target is not None else row
+
+
+AMD_ASSETS = [asset_row(f'noble-{SERIAL}.vhdx', VHDX), asset_row(f'noble-{SERIAL}.qcow2', QCOW2)]
+
+
+class PinIo(FakeIo):
+    """FakeIo for `pin`: the compare answers `status` (or the scripted `compare`, an answer or an exception to raise),
+    and `boom` names a tool (by file name) that fails the way a missing one does."""
+
+    def __init__(self, status: str = 'behind', compare=None, boom: str | None = None, **kw):
+        super().__init__(**kw)
+        self.status, self.compare, self.boom = status, compare, boom
+
+    def run(self, argv: list[str], env: dict[str, str], timeout: int = fd.TOOL_TIMEOUT) -> tuple[int, str]:
+        if self.boom and Path(argv[0]).name == self.boom:
+            self.ran.append((argv, env))
+            raise fd.Refused('tool-missing')
+        if argv[:2] == [fd.GH, 'api'] and '/compare/' in argv[2]:
+            assert re.fullmatch(r'repos/[\w./-]+/compare/main\.\.\.[0-9a-f]{40}\?per_page=1', argv[2]), argv
+            self.timeouts.append(timeout)
+            self.ran.append((argv, env))
+            if isinstance(self.compare, Exception):
+                raise self.compare
+            return self.compare if self.compare is not None else (0, json.dumps({'status': self.status}))
+        return super().run(argv, env, timeout)
+
+
+class PinArmIo(PinIo, ArmIo):
+    """The arm64 lane's fake, plus the release asset's bytes (what `pin` downloads to re-measure the raw disk)."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.bodies[ARM_ASSET] = ZST + self.formats['raw']
+
+
+def amd_io(**kw) -> PinIo:
+    return PinIo(**{'rows': [made(TAG, AMD_ASSETS)], **kw})
+
+
+def arm_io(**kw) -> PinArmIo:
+    return PinArmIo(**{'rows': [made(ARM_TAG, [ARM_ASSET_ROW])], **kw})
+
+
+class Pin(unittest.TestCase):
+    """`fleet-disk.py pin`: a read-only verb that prints the lock entries only for a release made on main."""
+
+    ENV = {'GITHUB_REPOSITORY': REPO, 'GH_TOKEN': TOKEN}
+    NOT_PRINTED = ('pin-not-main', 'pin-unread', 'pin-mismatch')
+
+    def setUp(self):
+        for name, value in {'CLOUDIMAGE_KEY_FPR': FPR, **ARM_PINS}.items():
+            self.addCleanup(setattr, fd, name, getattr(fd, name))
+            setattr(fd, name, value)
+
+    def pin(self, io_: FakeIo, arch: str = 'amd64', serial: str | None = None) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            return fd.pin(io_, arch, serial or (ARM_SERIAL if arch == 'arm64' else SERIAL), Path(tmp), REPO,
+                          fd.pin_env(REPO, self.ENV), FPR, NOW)
+
+    def refused(self, why: str, io_: FakeIo, arch: str = 'amd64') -> None:
+        with self.assertRaisesRegex(fd.Refused, f'^{why}$'):
+            self.pin(io_, arch)
+
+    def cli(self, io_: FakeIo, *argv: str, environ: dict | None = None) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = fd.main(['fleet-disk.py', 'pin', *(argv or (SERIAL,))], {'RUNNER_TEMP': tmp, **(environ or self.ENV)}, io_)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_behind_and_identical_print_exactly_the_entries_the_build_returned(self):
+        for status in ('behind', 'identical'):
+            with self.subTest(status=status):
+                io_ = PinIo(status=status)
+                built = build(io_)  # a real build of the fake release, so the two verbs cannot drift apart
+                self.assertEqual(self.pin(io_), built)
+        io_ = PinArmIo()
+        with tempfile.TemporaryDirectory() as tmp:
+            built = fd.build_arm64(io_, ARM_SERIAL, Path(tmp), REPO, SHA, TOKEN, FPR, NOW)
+        self.assertEqual(self.pin(io_, 'arm64'), built)
+
+    def test_ahead_diverged_and_a_status_it_does_not_know_refuse_pin_not_main_and_print_nothing(self):
+        for status in ('ahead', 'diverged', 'brand-new', '', 'BEHIND'):
+            with self.subTest(status=status):
+                io_ = amd_io(status=status)
+                self.assertEqual(self.cli(io_), (fd.REFUSED, '', 'fleet-disk: refused pin-not-main\n'))
+                self.assertEqual(io_.tools(), ['gh api', 'gh api'])  # the release, the compare: no signed sum, no entry built
+        io_ = arm_io(status='diverged')
+        self.assertEqual(self.cli(io_, 'arm64', ARM_SERIAL)[1:], ('', 'fleet-disk: refused pin-not-main\n'))
+        self.assertEqual(io_.fetched, [])  # nothing downloaded for a release that is not on main
+
+    def test_a_compare_that_gives_no_status_or_no_answer_is_pin_unread(self):
+        for compare in ((1, ''), (0, ''), (0, 'not json'), (0, '[]'), (0, '{}'), (0, '{"status": null}'),
+                        (0, '{"status": 7}'), (0, '{"status": ["behind"]}'), fd.Refused('tool-timeout')):
+            with self.subTest(compare=compare):
+                self.refused('pin-unread', amd_io(compare=compare))
+
+    def test_a_target_commitish_that_is_not_a_40_hex_sha_is_pin_unread_before_any_compare(self):
+        for target in ('main', 'refs/heads/main', 'CD' * 20, 'cd' * 19 + 'c', 'cd' * 21, '', 7, None, ['cd' * 20]):
+            with self.subTest(target=target):
+                io_ = PinIo(rows=[made(TAG, AMD_ASSETS, target)])
+                self.refused('pin-unread', io_)
+                self.assertEqual(io_.tools(), ['gh api'])  # the release read only: a branch name is never compared
+
+    def test_a_release_that_cannot_be_read_or_is_not_the_published_one_is_pin_unread(self):
+        pair = [made(TAG, AMD_ASSETS)] * 2
+        bad_digests = [dict(AMD_ASSETS[0], digest=d) for d in (None, sha(VHDX), 'sha256:' + 'A' * 64, 'sha256:abc', 7)]
+        cases = {'list fails': dict(readback=(1, '')), 'not json': dict(readback=(0, 'x')), 'not a list': dict(readback=(0, '{}')),
+                 'no release': dict(rows=[]), 'other tag': dict(rows=[made(TAG + '0', AMD_ASSETS)]),
+                 'two rows': dict(rows=pair), 'draft': dict(rows=[made(TAG, AMD_ASSETS, draft=True)]),
+                 'draft null': dict(rows=[made(TAG, AMD_ASSETS, draft=None)]), 'no id': dict(rows=[made(TAG, AMD_ASSETS, id=None)]),
+                 'assets not a list': dict(rows=[made(TAG, None, assets=None)]),
+                 'one asset only': dict(rows=[made(TAG, AMD_ASSETS[:1])]),
+                 'extra asset': dict(rows=[made(TAG, AMD_ASSETS + [asset_row('x.bin', b'x')])]),
+                 'wrong asset': dict(rows=[made(TAG, [AMD_ASSETS[0], asset_row('noble-1.qcow2', QCOW2)])]),
+                 'size missing': dict(rows=[made(TAG, [AMD_ASSETS[0], {k: v for k, v in AMD_ASSETS[1].items() if k != 'size'}])]),
+                 'size zero': dict(rows=[made(TAG, [AMD_ASSETS[0], dict(AMD_ASSETS[1], size=0)])]),
+                 'size bool': dict(rows=[made(TAG, [AMD_ASSETS[0], dict(AMD_ASSETS[1], size=True)])]),
+                 'gh missing': dict(rows=[made(TAG, AMD_ASSETS)], boom='gh')}
+        cases.update({f'digest {d["digest"]!r}': dict(rows=[made(TAG, [d, AMD_ASSETS[1]])]) for d in bad_digests})
+        for name, kw in cases.items():
+            with self.subTest(case=name):
+                io_ = PinIo(**kw)
+                self.assertEqual(self.cli(io_), (fd.REFUSED, '', 'fleet-disk: refused pin-unread\n'))
+
+    def test_a_failing_gh_fails_closed_at_every_read(self):
+        for name, kw in {'compare exit 1': dict(compare=(1, '')), 'release list exit 1': dict(readback=(1, '')),
+                         'gpgv missing': dict(boom='gpgv'), 'gpgv refuses': dict(gpgv=(1, '')),
+                         'wrong key': dict(gpgv=(0, validsig(OTHER))), 'no signed sum': dict(sums=b'')}.items():
+            with self.subTest(case=name):
+                self.assertEqual(self.cli(amd_io(**kw))[1:], ('', 'fleet-disk: refused pin-unread\n'))
+
+    def test_the_release_is_read_again_and_what_the_second_read_says_differs_is_pin_mismatch(self):
+        first, other = made(TAG, AMD_ASSETS), made(TAG, [AMD_ASSETS[0], asset_row(f'noble-{SERIAL}.qcow2', b'changed!!')])
+        moved = made(TAG, AMD_ASSETS, target='ef' * 20)  # also on main, but not the commit that was compared
+        for second in (other, moved, made(TAG, AMD_ASSETS, id=RID + 1)):
+            with self.subTest(second=second):
+                io_ = PinIo(readback=[(0, json.dumps([first])), (0, json.dumps([second]))])
+                self.assertEqual(self.cli(io_)[1:], ('', 'fleet-disk: refused pin-mismatch\n'))
+                self.assertEqual(io_.reads, 2)
+        io_ = PinIo(readback=[(0, json.dumps([first])), (1, '')])  # a second read that fails is no confirmation
+        self.refused('pin-unread', io_)
+        io_ = PinIo(readback=[(0, json.dumps([first]))] * 2)  # the same twice prints
+        self.assertEqual(sorted(self.pin(io_)), ['disk', 'disk_input', 'disk_qcow2'])
+
+    def test_arm64_re_measures_the_asset_against_githubs_digest_and_the_pinned_image(self):
+        io_ = arm_io()
+        entries = self.pin(io_, 'arm64')
+        self.assertEqual(entries['disk_arm64']['raw_sha256'], sha(RAW))  # from the bytes expanded here, not from a note
+        self.assertEqual((entries['disk_arm64']['raw_size'], entries['disk_arm64']['sha256']), (len(RAW), sha(ZST_BODY)))
+        self.assertEqual(entries['vfkit']['sha256'], VFKIT_PIN)
+        io_ = arm_io()
+        io_.bodies[ARM_ASSET] = ZST + RAW + b'tampered'  # the digest GitHub lists is not the bytes it serves
+        self.refused('pin-mismatch', io_, 'arm64')
+        io_ = arm_io(rows=[made(ARM_TAG, [dict(ARM_ASSET_ROW, digest='sha256:' + '0' * 64)])])  # a digest changed since the build
+        self.refused('pin-mismatch', io_, 'arm64')
+        fd.ARM64_IMAGE_SHA256 = REAL_ARM_PIN  # the fake's signed image is validly signed but is not the shipped pin
+        self.refused('pin-mismatch', arm_io(), 'arm64')
+
+    def test_arm64_refusals_that_are_reads_stay_pin_unread(self):
+        for name, kw in {'vfkit changed': dict(vfkit=b'other'), 'zstd fails': dict(zstd=1), 'gh missing': dict(boom='gh'),
+                         'zstd missing': dict(boom='zstd')}.items():
+            with self.subTest(case=name):
+                self.refused('pin-unread', arm_io(**kw), 'arm64')
+
+    def test_a_zstd_that_exits_0_and_writes_no_disk_is_pin_unread_not_a_crash(self):
+        class NoDisk(PinArmIo):
+            def run(self, argv, env, timeout=fd.TOOL_TIMEOUT):
+                return (0, '') if argv[0] == fd.ZSTD else super().run(argv, env, timeout)
+
+        self.assertEqual(self.cli(NoDisk(rows=[made(ARM_TAG, [ARM_ASSET_ROW])]), 'arm64', ARM_SERIAL),
+                         (fd.REFUSED, '', 'fleet-disk: refused pin-unread\n'))
+
+    def test_a_bad_serial_or_another_arm64_serial_refuses_before_any_call(self):
+        for argv, word in ((('current',), 'serial'), (('arm64', '20260930'), 'serial-not-pinned')):
+            io_ = amd_io()
+            self.assertEqual(self.cli(io_, *argv), (fd.REFUSED, '', f'fleet-disk: refused {word}\n'))
+            self.assertEqual((io_.ran, io_.fetched), ([], []))
+        for argv in (('sparc', SERIAL), (SERIAL, 'extra'), ('arm64', 'amd64', ARM_SERIAL)):
+            self.assertEqual(self.cli(amd_io(), *argv)[0], fd.USAGE)
+
+    def test_it_writes_nothing_every_gh_call_is_a_plain_get_and_the_token_is_only_in_gh_s_environment(self):
+        amd, arm = PinIo(), PinArmIo()
+        build(amd)
+        with tempfile.TemporaryDirectory() as tmp:
+            fd.build_arm64(arm, ARM_SERIAL, Path(tmp), REPO, SHA, TOKEN, FPR, NOW)
+        for io_, argv in ((amd, (SERIAL,)), (arm, ('arm64', ARM_SERIAL))):
+            before = len(io_.ran)
+            code, out, err = self.cli(io_, *argv)
+            self.assertEqual((code, err), (0, ''))
+            calls = io_.ran[before:]
+            gh = [call for call, _ in calls if call[0] == fd.GH]
+            self.assertEqual(len(gh), 3)  # the release, the compare, the release again
+            for call in gh:
+                self.assertEqual(call[1], 'api', call)
+                self.assertTrue(call[2].startswith(f'repos/{REPO}/'), call)
+                self.assertEqual(len(call), 3, call)  # no -X, -F, --input or any other flag: a GET
+            self.assertEqual(io_.patched, [RID])  # only the build's own PATCH: pin made no write
+            self.assertEqual(io_.deleted, [])
+            self.assertTrue(all(env['GH_TOKEN'] == TOKEN for call, env in calls if call[0] == fd.GH))
+            self.assertNotIn(TOKEN, out + err)
+            self.assertTrue(all(set(env) <= {'PATH', 'GH_REPO', 'GH_PROMPT_DISABLED', 'GH_TOKEN'} for _, env in calls))
+
+    def test_what_is_printed_is_the_header_and_the_entries_only_and_a_refusal_prints_only_its_word(self):
+        for io_, argv, keys in ((amd_io(), (SERIAL,), {'disk', 'disk_input', 'disk_qcow2'}),
+                                (arm_io(), ('arm64', ARM_SERIAL), {'disk_arm64', 'disk_arm64_input', 'vfkit'})):
+            code, out, err = self.cli(io_, *argv)
+            head, _, body = out.partition('\n')
+            self.assertEqual((code, err, head), (0, '', "paste into the fleet's carrier.lock.json, then sign the lock:"))
+            self.assertEqual(body, json.dumps(json.loads(body), indent=1, sort_keys=True, ensure_ascii=True) + '\n')  # as build prints
+            entries = json.loads(body)
+            self.assertEqual(set(entries), keys)
+            for entry in entries.values():
+                self.assertLessEqual(set(entry), {'url', 'sha256', 'size', 'raw_sha256', 'raw_size', 'version'})
+                for key, value in entry.items():
+                    ok = {'url': lambda v: v.startswith('https://'), 'version': lambda v: re.fullmatch(r'v[0-9.]+', v),
+                          'size': lambda v: type(v) is int, 'raw_size': lambda v: type(v) is int}.get(
+                              key, lambda v: re.fullmatch(r'[0-9a-f]{64}', v))
+                    self.assertTrue(ok(value), (key, value))
+        for status, word in (('ahead', 'pin-not-main'), ('diverged', 'pin-not-main')):
+            self.assertEqual(self.cli(amd_io(status=status)), (fd.REFUSED, '', f'fleet-disk: refused {word}\n'))
+        for kw in (dict(compare=(1, 'secret-' + TOKEN)), dict(readback=(0, TOKEN)), dict(gpgv=(0, TOKEN))):
+            code, out, err = self.cli(amd_io(**kw))
+            self.assertEqual((code, out), (fd.REFUSED, ''))
+            self.assertRegex(err, r'^fleet-disk: refused pin-(unread|mismatch|not-main)\n$')
+
+    def test_it_needs_no_token_and_without_a_repo_in_the_environment_reads_this_repo(self):
+        io_ = amd_io()
+        self.assertEqual(self.cli(io_, environ={'HOME': '/h', 'GH_CONFIG_DIR': '/c', 'OTHER': 'x'})[0], 0)
+        envs = [env for argv, env in io_.ran if argv[0] == fd.GH]
+        self.assertEqual(fd.DEFAULT_REPO, 'mirrorstack-ai/fleet-disk')  # the repo the real releases are in
+        self.assertTrue(envs and all(e == {'PATH': '/usr/bin', 'GH_REPO': fd.DEFAULT_REPO, 'GH_PROMPT_DISABLED': '1',
+                                           'HOME': '/h', 'GH_CONFIG_DIR': '/c'} for e in envs))
+        self.assertTrue(all(argv[2].startswith(f'repos/{fd.DEFAULT_REPO}/') for argv, _ in io_.ran if argv[0] == fd.GH))
+        self.assertEqual(self.cli(amd_io(), environ={'GITHUB_REPOSITORY': 'not a repo'}), (fd.REFUSED, '', 'fleet-disk: refused release-env\n'))
+
+    def test_a_pin_leaves_no_files(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(fd.main(['fleet-disk.py', 'pin', 'arm64', ARM_SERIAL], {'RUNNER_TEMP': tmp, **self.ENV}, arm_io()), 0)
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+
 class Readme(unittest.TestCase):
     TEXT = (ROOT / 'README.md').read_text(encoding='utf-8')
 
@@ -1083,6 +1354,13 @@ class Readme(unittest.TestCase):
         for need in ('created as a draft', '`publish-unread`', '`publish-mismatch`', '`draft-left`', '`tag-exists`',
                      'bin/fleet-disk.py cleanup <arch> <serial>', 'unverified <asset> sha256:<hex>', 'delete the draft by hand'):
             self.assertIn(need, self.TEXT)
+
+    def test_the_pinning_paragraph_says_to_use_pin_not_the_log(self):
+        text = ' '.join(self.TEXT.split())
+        for need in ('`bin/fleet-disk.py pin [amd64|arm64] <serial>`', 'use `pin`, not the log', '`pin-not-main`', '`pin-unread`',
+                     '`pin-mismatch`', '`behind` or `identical`'):
+            self.assertIn(need, text)
+        self.assertNotIn('entries to pin come only from the log', text)
 
     def test_the_disk_environment_is_not_called_a_boundary_and_the_probe_is_read_only(self):
         section = self.TEXT.split('\n## One-time repo settings\n', 1)[1].split('\n## ', 1)[0]

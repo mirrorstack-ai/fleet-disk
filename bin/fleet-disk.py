@@ -13,6 +13,11 @@ edits the lock and refuses to overwrite a tag; a draft an interrupted run left i
 pinned serial: the signed sha must equal the pinned one, vfkit's upstream bytes are re-checked against their pin, the
 image becomes a raw GPT disk with an EFI System Partition (what vfkit's EFI boot needs) and a zstd of it is the one
 release asset of disk-noble-arm64-<serial>; the lock entries are `disk_arm64_input`, `disk_arm64` and `vfkit`.
+`fleet-disk.py pin [amd64|arm64] <serial>` is the read-only way to get the entries for a lock PR: it asks GitHub for the
+published release of that tag, takes the commit the release names (`target_commitish`), and prints the entries only when
+`compare/main...<sha>` says that commit is on main (`behind` or `identical`); `ahead`, `diverged` or any other answer is
+`pin-not-main`, a read that fails or is not the expected shape is `pin-unread`, a digest that two reads (or the asset's
+bytes) do not agree on is `pin-mismatch`. It writes nothing, holds no secret and prints no line it did not just re-read.
 Standalone stdlib. An error names the rule and never echoes a value; every refusal is exit 1, a bad command line 2."""
 from __future__ import annotations
 
@@ -62,6 +67,10 @@ READ_TRIES, READ_PAUSE = 4, 5  # a release read-back: at most this many reads, t
 FETCH_DEADLINE = 1500  # seconds for one whole download; urlopen's timeout is only per socket read
 MAX_SKEW = 86400  # a signature stamped more than a day ahead of the clock is refused
 USAGE, REFUSED = 2, 1
+DEFAULT_REPO, MAIN = 'mirrorstack-ai/fleet-disk', 'main'  # `pin` outside Actions: the repo of the releases; their branch
+ON_MAIN = frozenset({'behind', 'identical'})  # compare/main...<sha>: the commit is an ancestor of main, or main's own tip
+PIN_REFUSALS = frozenset({'pin-not-main', 'pin-unread', 'pin-mismatch'})
+LOCK_HEADER = "paste into the fleet's carrier.lock.json, then sign the lock:\n"
 
 
 class Refused(ValueError):
@@ -433,6 +442,13 @@ def has_esp(raw: Path) -> bool:
     return any(table[i:i + 16] == ESP_TYPE for i in range(0, len(table) - size + 1, size))
 
 
+def check_vfkit(io: Io, work: Path) -> None:
+    """vfkit's upstream bytes are what the pins say (never run here: only hashed and measured), or Refused."""
+    vfkit = work / 'vfkit'
+    if io.fetch(VFKIT_URL, vfkit, VFKIT_SIZE) != VFKIT_SHA256 or vfkit.stat().st_size != VFKIT_SIZE:
+        raise Refused('vfkit-mismatch')  # the size the lock entry states is the fetched file's own
+
+
 def build_arm64(io: Io, serial: str, work: Path, repo: str, sha: str, token: str, fpr: str,
                 now: float | None = None) -> dict:
     """The macOS lane's disk: the pinned serial's signed noble arm64 image as a zstd'd raw GPT/EFI disk, the one asset
@@ -449,9 +465,7 @@ def build_arm64(io: Io, serial: str, work: Path, repo: str, sha: str, token: str
     want = signed_image_sum(io, base, IMAGE_ARM64, work, fpr, serial, now)
     if want != ARM64_IMAGE_SHA256:
         raise Refused('image-pin-mismatch')
-    vfkit = work / 'vfkit'  # never run here: only the bytes upstream serves are hashed and measured
-    if io.fetch(VFKIT_URL, vfkit, VFKIT_SIZE) != VFKIT_SHA256 or vfkit.stat().st_size != VFKIT_SIZE:
-        raise Refused('vfkit-mismatch')  # the size the lock entry states is the fetched file's own
+    check_vfkit(io, work)
     image = fetch_image(io, base, IMAGE_ARM64, work, want)
     raw, zst, again = work / f'noble-arm64-{serial}.raw', work / f'noble-arm64-{serial}.raw.zst', work / 'again.raw'
     if convert(io, image, raw, 'raw') > MAX_RAW:
@@ -474,29 +488,133 @@ def build_arm64(io: Io, serial: str, work: Path, repo: str, sha: str, token: str
             'vfkit': {'version': VFKIT_VERSION, 'url': VFKIT_URL, 'sha256': VFKIT_SHA256, 'size': VFKIT_SIZE}}
 
 
+def pin_env(repo: str, environ: dict[str, str]) -> dict[str, str]:
+    """The environment gh runs under for `pin`: no token is required (it reads a public repo), but the ones gh finds its
+    login by are passed on when set. A repo that is not owner/name is refused before any call."""
+    if not REPO.fullmatch(repo):
+        raise Refused('release-env')
+    env = {'PATH': '/usr/bin', 'GH_REPO': repo, 'GH_PROMPT_DISABLED': '1'}
+    return env | {k: environ[k] for k in ('GH_TOKEN', 'HOME', 'GH_CONFIG_DIR', 'XDG_CONFIG_HOME') if environ.get(k)}
+
+
+def asset_names(arch: str, serial: str) -> list[str]:
+    """The names of the assets build() / build_arm64() publish on that arch's release, in the order they are uploaded."""
+    return [f'noble-arm64-{serial}.raw.zst'] if arch == 'arm64' else [f'noble-{serial}.vhdx', f'noble-{serial}.qcow2']
+
+
+def release_facts(io: Io, repo: str, tag: str, env: dict[str, str], names: list[str]) -> tuple:
+    """Read the release list once and return (release id, target commit, {asset name: (sha256 hex, size)}) of the ONE
+    published release of exactly tag: Refused('pin-unread') unless it is public, names a 40-hex commit, and holds exactly
+    `names`, each with a `sha256:<hex>` digest and a size. A draft, a missing or doubled release or an unread list is none."""
+    row = sole(release_rows(io, repo, tag, env))
+    commit = row.get('target_commitish') if row is not None else None
+    got = row.get('assets') if row is not None else None
+    if (row is None or row.get('draft') is not False or row_id(row) is None or not isinstance(commit, str)
+            or not re.fullmatch(r'[0-9a-f]{40}', commit, re.ASCII) or not isinstance(got, list)
+            or not all(isinstance(a, dict) for a in got)
+            or sorted(map(repr, (a.get('name') for a in got))) != sorted(map(repr, names))):
+        raise Refused('pin-unread')
+    facts = {}
+    for a in got:
+        m = re.fullmatch(r'sha256:([0-9a-f]{64})', a['digest'], re.ASCII) if isinstance(a.get('digest'), str) else None
+        if m is None or type(a.get('size')) is not int or a['size'] <= 0:
+            raise Refused('pin-unread')
+        facts[a['name']] = (m[1], a['size'])
+    return row['id'], commit, facts
+
+
+def require_on_main(io: Io, repo: str, commit: str, env: dict[str, str]) -> None:
+    """compare/main...<commit> must answer `behind` or `identical`: the allow-list refuses `ahead`, `diverged` and any status
+    GitHub adds later as `pin-not-main`; no answer, or none with a `status`, is `pin-unread`."""
+    try:
+        code, out = io.run([GH, 'api', f'repos/{repo}/compare/{MAIN}...{commit}?per_page=1'], env)
+        data = json.loads(out) if code == 0 else None
+    except (Refused, ValueError):
+        data = None
+    status = data.get('status') if isinstance(data, dict) else None
+    if not isinstance(status, str):
+        raise Refused('pin-unread')
+    if status not in ON_MAIN:
+        raise Refused('pin-not-main')
+
+
+def pin(io: Io, arch: str, serial: str, work: Path, repo: str, env: dict[str, str], fpr: str,
+        now: float | None = None) -> dict:
+    """The lock entries of the release of arch's disk for serial, read-only, and only for a release made on main: the
+    release's own row names its commit, which must be on main, and every line printed is one re-read here (the upstream
+    signed sum through the same gpgv check as the build, the asset digests from a second read of the release that must equal
+    the first, for arm64 also the asset's bytes against that digest and the expanded disk's own sha and size, and vfkit's
+    upstream bytes). A read that fails is pin-unread, never a guess."""
+    if not SERIAL.fullmatch(serial):
+        raise Refused('serial')
+    if arch == 'arm64' and serial != ARM64_SERIAL:
+        raise Refused('serial-not-pinned')
+    tag, names, base = tag_name(arch, serial), asset_names(arch, serial), f'{BASE}{serial}/'
+    url = f'https://github.com/{repo}/releases/download/{tag}/'
+    try:
+        first = release_facts(io, repo, tag, env, names)
+        require_on_main(io, repo, first[1], env)
+        facts = first[2]
+        if arch == 'arm64':
+            if signed_image_sum(io, base, IMAGE_ARM64, work, fpr, serial, now) != ARM64_IMAGE_SHA256:
+                raise Refused('pin-mismatch')
+            check_vfkit(io, work)
+            zst, raw = work / names[0], work / 'again.raw'
+            if io.fetch(url + names[0], zst, MAX_ASSET) != facts[names[0]][0]:
+                raise Refused('pin-mismatch')  # GitHub's digest is not the bytes it serves
+            if io.run([ZSTD, '-d', '-q', '-o', str(raw), str(zst)], {'PATH': '/usr/bin'}, CONVERT_TIMEOUT)[0] != 0 \
+                    or raw.stat().st_size > MAX_RAW:
+                raise Refused('pin-unread')
+            entries = {'disk_arm64_input': {'url': base + IMAGE_ARM64, 'sha256': ARM64_IMAGE_SHA256},
+                       'disk_arm64': {'url': url + names[0], 'sha256': facts[names[0]][0], 'size': facts[names[0]][1],
+                                      'raw_sha256': file_sha(raw), 'raw_size': raw.stat().st_size},
+                       'vfkit': {'version': VFKIT_VERSION, 'url': VFKIT_URL, 'sha256': VFKIT_SHA256, 'size': VFKIT_SIZE}}
+        else:
+            vhdx, qcow2 = names
+            signed = signed_image_sum(io, base, IMAGE, work, fpr, serial, now)
+            entries = {'disk_input': {'url': base + IMAGE, 'sha256': signed},
+                       'disk': {'url': url + vhdx, 'sha256': facts[vhdx][0]},
+                       'disk_qcow2': {'url': url + qcow2, 'sha256': facts[qcow2][0], 'size': facts[qcow2][1]}}
+        if release_facts(io, repo, tag, env, names) != first:  # what is printed is what a second read says too
+            raise Refused('pin-mismatch')
+    except Refused as why:
+        raise why if str(why) in PIN_REFUSALS else Refused('pin-unread') from None
+    except OSError:  # a file the tools were to write is not there: unread, with no path in the message
+        raise Refused('pin-unread') from None
+    return entries
+
+
+def lock_text(entries: dict) -> str:
+    """What a run prints for a person to paste: one header line, then the entries as JSON."""
+    return LOCK_HEADER + json.dumps(entries, indent=1, sort_keys=True, ensure_ascii=True) + '\n'
+
+
 def main(argv: list[str], environ: dict[str, str], io: Io) -> int:
     """`fleet-disk.py [amd64|arm64] <serial>`, with GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN in the environment;
-    `fleet-disk.py cleanup [amd64|arm64] <serial>` deletes that tag's leftover draft release (and nothing else)."""
+    `fleet-disk.py cleanup [amd64|arm64] <serial>` deletes that tag's leftover draft release (and nothing else);
+    `fleet-disk.py pin [amd64|arm64] <serial>` reads the release back and prints its entries only if it was made on main."""
     args = argv[1:]
-    cleanup = args[:1] == ['cleanup']
-    args = args[1:] if cleanup else args
+    verb = args.pop(0) if args[:1] in (['cleanup'], ['pin']) else ''
     arch = args.pop(0) if len(args) == 2 and args[0] in ARCHES else 'amd64'
     if len(args) != 1:
-        sys.stderr.write('usage: fleet-disk.py [cleanup] [amd64|arm64] <serial>\n')
+        sys.stderr.write('usage: fleet-disk.py [cleanup|pin] [amd64|arm64] <serial>\n')
         return USAGE
     job = (args[0], environ.get('GITHUB_REPOSITORY', ''), environ.get('GITHUB_SHA', ''), environ.get('GH_TOKEN', ''))
     try:
-        if cleanup:
+        if verb == 'cleanup':
             status = drop_draft(io, job[1], tag_name(arch, args[0]), release_env(job[0], CLOUDIMAGE_KEY_FPR, *job[1:]))
             sys.stderr.write(f'fleet-disk: cleanup {status}\n')
             return 0 if status in ('deleted', 'none', 'kept') else REFUSED
         with tempfile.TemporaryDirectory(dir=environ.get('RUNNER_TEMP') or None) as tmp:
-            entries = (build_arm64 if arch == 'arm64' else build)(io, job[0], Path(tmp), *job[1:], CLOUDIMAGE_KEY_FPR)
+            if verb == 'pin':
+                repo = environ.get('GITHUB_REPOSITORY') or DEFAULT_REPO
+                entries = pin(io, arch, args[0], Path(tmp), repo, pin_env(repo, environ), CLOUDIMAGE_KEY_FPR)
+            else:
+                entries = (build_arm64 if arch == 'arm64' else build)(io, job[0], Path(tmp), *job[1:], CLOUDIMAGE_KEY_FPR)
     except Refused as why:
         sys.stderr.write(f'fleet-disk: refused {why}\n')
         return REFUSED
-    sys.stdout.write("paste into the fleet's carrier.lock.json, then sign the lock:\n"
-                     + json.dumps(entries, indent=1, sort_keys=True, ensure_ascii=True) + '\n')
+    sys.stdout.write(lock_text(entries))
     return 0
 
 
