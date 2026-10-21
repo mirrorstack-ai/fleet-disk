@@ -23,7 +23,11 @@
 #            release tip, refuses `tip-moved` unless it is the tip the plan judged, and keeps the bytes in a file of this job's runner; no
 #            `gateway.json.sig` at the tip is not live (nothing is signed, the kit job keeps `SKIP gateway not-live`); a signature without
 #            a record, or a record over 65536 bytes, is `REFUSED gateway`. `sign` (SIGN_KEY only, no git, ssh or network child) signs that
-#            file under the namespace mirrorstack-fleet-pin and verifies it. The record's bytes never leave the job: the output is the
+#            file under the namespace mirrorstack-fleet-pin and verifies it (a failed verify stops the step). Before `live=yes` the
+#            fetch step checks the bytes name the five keys of a gateway record (serial, address, cert_sha256, manifest_key, session_key;
+#            a fixed-string grep, no python or jq, a shape check and not a schema check): the pin namespace is shared with kit.json and
+#            deploy-pin.json, so without it this job would sign any file at that path for the test key; a body without them is
+#            `REFUSED gateway`. The kit verb's full schema check still runs after. The record's bytes never leave the job: the output is the
 #            signature only, the log shows a size and a sha256 at most. The tip's own gateway.json.sig stays as it is, for the control VM.
 #            In a release series run it signs nothing (`SKIP gwsign series`): the kit job then judges the tip's own signature, which must
 #            be the release key's, as before this job existed. The kit host then serves the CI signature (the test series) and no
@@ -379,6 +383,9 @@ jobs:
           fi
           mkdir "$RUNNER_TEMP/gwsign"
           git -C "$d/repo" cat-file blob "$TIP:fleet/core/gateway.json" > "$RUNNER_TEMP/gwsign/gateway.json"
+          for k in serial address cert_sha256 manifest_key session_key; do
+            grep -qF "\"$k\"" "$RUNNER_TEMP/gwsign/gateway.json" || { rm -rf "$RUNNER_TEMP/gwsign"; echo 'REFUSED gateway'; exit 1; }
+          done
           echo live=yes >> "$GITHUB_OUTPUT"
           echo "gateway record: $n bytes"
       - id: sign

@@ -3138,6 +3138,14 @@ class Workflow(unittest.TestCase):
         self.assertNotIn('GIT_SSH_COMMAND', sign)
         self.assertIn('/usr/bin/ssh-keygen -q -Y sign', sign)   # ssh-keygen is the one tool, and it never talks to a network
 
+    @staticmethod
+    def gateway_keys() -> tuple:
+        import importlib.util as iu
+        spec = iu.spec_from_file_location('fleet_kit_upload_keys', ROOT / 'bin/fleet-kit-upload.py')
+        mod = iu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.GATEWAY_KEYS   # the names the kit verb's own check holds a record to
+
     def test_the_fetch_step_refuses_a_moved_tip_judges_the_pair_and_signs_nothing_outside_the_test_series(self):
         fetch = self.step_text('gwsign', 'fetch')
         self.assertIn('TIP: ${{ needs.plan.outputs.tip }}', fetch)
@@ -3149,6 +3157,11 @@ class Workflow(unittest.TestCase):
         order = ["trap 'shred -u", '"$FLEET_READ" > "$d/key"', 'fetch -q --no-tags --depth 1', 'REFUSED tip-moved', 'if [ -z "$sig" ]',
                  'case "$rec" in', 'if [ "$SERIES" != test ]', 'cat-file blob "$TIP:fleet/core/gateway.json"']
         self.assertEqual([fetch.index(x) for x in order], sorted(fetch.index(x) for x in order))
+        # the body is shaped like a gateway record before it is called live (review of AF08, P1): the five names of GATEWAY_KEYS, fixed strings
+        self.assertIn('for k in ' + ' '.join(self.gateway_keys()) + '; do', fetch)
+        self.assertIn('grep -qF "\\"$k\\"" "$RUNNER_TEMP/gwsign/gateway.json"', fetch)
+        self.assertLess(fetch.index('for k in '), fetch.index('echo live=yes'))
+        self.assertGreater(fetch.index('for k in '), fetch.index('cat-file blob'))
         self.assertNotIn('--force', fetch)
         self.assertNotIn('+refs/tags', fetch)
         self.assertEqual(len(re.findall(r'cat-file blob', fetch)), 1)   # the record is read once, after every check; nothing prints it
@@ -3168,6 +3181,7 @@ class Workflow(unittest.TestCase):
         echoed = [l.strip() for l in sign.splitlines() if l.strip().startswith('echo ') and '$' in l]
         self.assertEqual(echoed, ['echo "signed gateway.json: $n bytes, sha256 $h, key $fp"'])   # the one line with a value: a size, a hash, the key's fingerprint
         self.assertNotRegex(sign, r'(?m)^\s*(?:cat|head|tail|xxd|od)\b')   # nothing prints the record
+        self.assertNotRegex(sign, r'-Y verify[^\n]*\|\|')   # a failed verify stops the step: no `|| true` after it (review of AF08, mutant X10)
         self.assertIn('rm -rf "$d" "$RUNNER_TEMP/gwsign"', sign)   # the record's copy goes with the key
 
     # the boot smoke before the signature (AF34)

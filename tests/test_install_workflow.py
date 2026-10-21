@@ -200,7 +200,26 @@ class GwsignRuns(unittest.TestCase):
                 done, out = self.fetch(self.commit(**kw))
                 self.assertEqual((done.returncode, out, done.stdout), (1, {}, 'REFUSED gateway\n'), what)
                 self.assertFalse(self.record_file.exists())
-        done, out = self.fetch(self.commit(b'x' * 65536))   # the cap itself is taken: the host takes 65536 bytes
+        done, out = self.fetch(self.commit(RECORD.rstrip(b'\n').ljust(65536)))   # the cap itself is taken: the host takes 65536 bytes (a record padded to it: a body must name the record's keys, below)
+        self.assertEqual((done.returncode, out), (0, {'live': 'yes'}))
+        self.assertEqual(len(self.record_file.read_bytes()), 65536)
+
+    def test_a_body_that_is_not_a_gateway_record_is_refused_and_not_kept(self):
+        """Review of AF08, P1: the pin namespace is shared with kit.json and deploy-pin.json, so the job must not sign any file at that path."""
+        keys = ('serial', 'address', 'cert_sha256', 'manifest_key', 'session_key')
+        whole = json.loads(RECORD)
+        bodies = [('another document', b'{"not": "a gateway", "kit": "anything the tip holds"}\n'), ('plain text', b'hello\n'),
+                  ('the kit record shape', json.dumps({'serial': 3, 'files': {}}).encode() + b'\n')]
+        bodies += [(f'a record without {k}', json.dumps({a: b for a, b in whole.items() if a != k}).encode() + b'\n') for k in keys]
+        for what, record in bodies:
+            with self.subTest(what):
+                self.out.unlink(missing_ok=True)
+                done, out = self.fetch(self.commit(record))
+                self.assertEqual((done.returncode, out, done.stdout), (1, {}, 'REFUSED gateway\n'), what)
+                self.assertFalse(self.record_file.exists())
+                self.assertFalse(self.record_file.parent.exists())
+        self.out.unlink(missing_ok=True)
+        done, out = self.fetch(self.commit(PLACEHOLDER))   # control: the check can say yes; the placeholder names all five keys
         self.assertEqual((done.returncode, out), (0, {'live': 'yes'}))
 
     def test_a_tip_that_is_not_a_full_lower_case_sha_is_refused_before_anything_is_read(self):
@@ -296,6 +315,28 @@ class GwsignRuns(unittest.TestCase):
         self.record_file.symlink_to(self.tmp / 'elsewhere')
         done, out = self.sign()
         self.assertEqual((done.returncode, out, done.stdout), (1, {}, 'REFUSED gateway\n'), 'a symlink')
+
+    def test_a_verify_that_fails_stops_the_sign_step_before_a_signature_is_handed_on(self):
+        """Review of AF08 (mutant X10: `|| true` after -Y verify survived): a shim stands in for ssh-keygen and fails on -Y verify."""
+        self.place()
+        shim = self.tmp / 'ssh-keygen-shim'
+        shim.write_text(f'#!/bin/sh\ncase "$*" in *"-Y verify"*) exit 1;; esac\nexec {fp.SSH_KEYGEN} "$@"\n')
+        shim.chmod(0o755)
+        script = body('gwsign', 'sign').replace('/usr/bin/ssh-keygen', str(shim)).replace('/dev/shm/', f'{self.shm}/')
+        self.assertEqual(script.count(str(shim)), 4)   # the four calls: -l, -y, -Y sign, -Y verify
+        env = {'PATH': f'{self.bin}:/usr/bin:/bin', 'HOME': str(self.tmp), 'RUNNER_TEMP': str(self.runner), 'GITHUB_OUTPUT': str(self.out),
+               'SERIES': 'test', 'KEY_SHA256': self.pin, 'SIGN_KEY': self.baked.read_text()}
+        done = subprocess.run(['/bin/bash', '-c', script], env=env, capture_output=True, text=True, cwd=self.tmp)
+        self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(self.outputs(), {})   # no gateway_sig
+        self.assertNotIn('signed gateway.json', done.stdout)
+        self.assertEqual(list(self.shm.iterdir()), [])
+        # control: the same shim, passing -Y verify through, lets the step finish, so the failure above is the verify's
+        shim.write_text(f'#!/bin/sh\nexec {fp.SSH_KEYGEN} "$@"\n')
+        self.place()
+        done = subprocess.run(['/bin/bash', '-c', script], env=env, capture_output=True, text=True, cwd=self.tmp)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(set(self.outputs()), {'gateway_sig'})
 
     def test_the_two_steps_in_a_row_over_one_tip_make_a_signature_the_kit_verb_takes(self):
         tip = self.commit()
