@@ -4,7 +4,7 @@
 // Node over node:sqlite (see fake-storage.js). It only needs the part of the
 // Durable Object storage API that both provide:
 //
-//   storage.sql.exec(query, ...bindings) -> cursor with toArray(), rowsWritten
+//   storage.sql.exec(query, ...bindings) -> cursor with toArray(), rowsWritten, rowsRead
 //   storage.transactionSync(fn)          -> runs fn (sync) as one transaction
 //   storage.sync()                       -> Promise, resolves once writes are durable
 //

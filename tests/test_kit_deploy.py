@@ -188,6 +188,7 @@ class FakeKit:
         self.gate_calls = 0                      # requests that got past the front check into the Gate
         self.rows_read = 0                       # the Gate's rows-read counter (PY21): rows_each per decision, 429s included
         self.rows_each = flags.get('rows_each', 4)
+        self.n429 = 0                            # the Gate's 429s so far (flags['flood_404'])
         self.rows_evicted = False                # flags['rows_read']='evicted': the counter is zeroed once, at the first 429
         self.releases: list[int] = []            # the serial of every released (refunded) download, in order
         self.requests = 0                        # every request, in order (the 'placeholder' flag asks for this number)
@@ -456,12 +457,17 @@ def make_handler(kit: FakeKit):
                 self.end_headers()
                 return
             serial, name = int(m.group(1)), m.group(2)
+            if kit.flags.get('cut_404') and serial == kc.S_BASE + 6:     # the cut vector's invite is answered 404 (PY21 review)
+                return self.nf()
             with kit.lock:
                 kit.gate_calls += 1                              # the Gate's decide answers the 429 too: count it first
                 if kit.fails >= kit.per_source:
+                    kit.n429 += 1
+                    if kit.flags.get('flood_404') and kit.n429 > 1:   # the first 429 is the loop's own; the flood gets a 404
+                        return self.nf()
                     if kit.flags.get('rows_read') == 'evicted' and not kit.rows_evicted:    # the Gate slept and woke at 0
                         kit.rows_evicted, kit.rows_read = True, 0
-                    kit.rows_read += kit.rows_each
+                    kit.rows_read += kit.flags.get('rows_429', kit.rows_each)
                     return self.send_fixed(429, b'try later\n')
                 kit.rows_read += kit.rows_each
                 inv = next((i for i in kit.invites.values() if i['code'] == c.group(1)), None)
@@ -592,8 +598,10 @@ def make_handler(kit: FakeKit):
             if path == '/_k/state':
                 doc = {'ok': True, 'now': kit.now()}
                 mode = kit.flags.get('rows_read')            # None counts; 'absent' = a kit built before PY21; 'garbage' = not a count
+                if mode == 'second_absent' and kit.n429:      # the first read has it; every read after the first 429 has not
+                    mode = 'absent'
                 if mode != 'absent':
-                    doc['rowsRead'] = 'many' if mode == 'garbage' else kit.rows_read
+                    doc['rowsRead'] = {'garbage': 'many', 'true': True}.get(mode, kit.rows_read)
                 return self.send_json(200, doc)
             if self.command == 'POST':
                 d = j()
@@ -1571,8 +1579,8 @@ class OverHttp(unittest.TestCase):
         self.assertEqual(sum(1 for role, m, p, _, _ in log if (role, m, p) == ('gateway', 'PUT', '/_k/floor')), 1)
         stale = [st for role, m, p, ts, st in log if (m, p) == ('GET', '/_k/state') and ts < kit.now() - 300000]
         self.assertEqual(stale, [404])
-        # 10 ready, the stale one, the rows-read before and after, the front reject's zero signature: nothing sent again
-        self.assertEqual(sum(1 for _, m, p, _, _ in log if (m, p) == ('GET', '/_k/state')), 14)   # + the rows-read pair (PY21)
+        # 10 ready, the stale one, the rows-read before, between and after, the front reject's zero signature: nothing sent again
+        self.assertEqual(sum(1 for _, m, p, _, _ in log if (m, p) == ('GET', '/_k/state')), 15)   # + the rows-read three (PY21)
         self.assertEqual(sum(1 for *_, st in log if st == 409), 3)     # overwrite, rollback, replay second: once each
         self.assertIn("fixed 404: 0", '\n'.join(lines))
 
@@ -1623,7 +1631,7 @@ class OverHttp(unittest.TestCase):
         self.assertEqual(got[40][1] - got[0][1], 40)                     # the flood really reached the Gate N times
 
     def test_a_kit_without_the_counter_prints_unavailable_and_does_not_fail(self):
-        for mode in ('absent', 'garbage'):
+        for mode in ('absent', 'garbage', 'true'):          # 'true': a bool is not a count
             with self.subTest(mode=mode):
                 kit, text, m = self.rows(rows_read=mode)
                 self.assertIsNone(m)
@@ -1645,6 +1653,49 @@ class OverHttp(unittest.TestCase):
         self.assertNotIn('rows_per_failure', text)
         self.assertIn('vectors passed', text)
 
+    def test_a_counter_that_never_moves_is_unavailable_not_a_figure_of_zero(self):
+        # a real cursor that exposes rowsRead only after draining, or not at all, would leave the number at 0
+        for n in (0, 20):
+            with self.subTest(rows_failures=n):
+                kit, text, m = self.rows(rows_each=0, run={'rows_failures': n})
+                self.assertIsNone(m)
+                self.assertIn('(h) rows_read=unavailable (the counter did not move over', text)
+                self.assertNotIn('rows_per_failure', text)
+                self.assertNotIn('0.0', text.split('(h)')[1])
+                self.assertIn('vectors passed', text)
+
+    def test_the_second_read_without_rows_read_is_unavailable(self):
+        kit, text, m = self.rows(rows_read='second_absent')
+        self.assertIsNone(m)
+        self.assertIn('(h) rows_read=unavailable (the second read of /_k/state had no rowsRead)', text)
+        self.assertNotIn('rows_per_failure', text)
+
+    def test_the_figure_is_split_into_the_loops_404s_and_the_floods_429s(self):
+        kit, text, m = self.rows(rows_each=4)
+        served, flood = int(m.group(4)), int(m.group(5))
+        self.assertIn('; loop 4.0 per decision (%d rows over its %d 404s and its 429); flood 4.0 per 429 (%d rows over %d)'
+                      % (4 * (served + 1), served, 4 * flood, flood), text)
+        # without a flood there is nothing to split off: the loop's figure only
+        kit, text, m = self.rows(rows_each=4, run={'rows_failures': 0})
+        self.assertIn('; loop 4.0 per decision', text)
+        self.assertNotIn('flood', text.split('(h)')[1])
+
+    def test_a_loop_and_a_flood_that_cost_different_rows_show_different_figures(self):
+        # the 404 path reads 9 rows, the 429 path 1: the combined number alone (4.9 here, 1.4 at the default flood) hides it
+        kit, text, m = self.rows(rows_each=9, rows_429=1)
+        served = int(m.group(4))
+        self.assertIn('loop %.1f per decision (%d rows over its %d 404s and its 429)'
+                      % ((9 * served + 1) / (served + 1), 9 * served + 1, served), text)
+        self.assertIn('flood 1.0 per 429 (20 rows over 20)', text)
+        self.assertLess(float(m.group(1)), (9 * served + 1) / (served + 1) - 3)    # the combined figure is the diluted one
+
+    def test_the_cut_vector_refuses_when_the_cut_request_is_not_a_200(self):
+        # no cut, no spent cap: both follow-up downloads would succeed and the vector would pass with nothing cut
+        self.refused('cut vector, after chunk 3: status 404, expected 200', cut_404=True)
+
+    def test_the_rows_flood_refuses_a_request_that_is_not_a_429(self):
+        self.refused('rows read: flood request #1: status 404, expected 429', flood_404=True)
+
     def test_the_cli_takes_rows_failures_as_a_flag_with_a_default_of_200(self):
         seen = {}
 
@@ -1658,6 +1709,9 @@ class OverHttp(unittest.TestCase):
             self.assertEqual(kc.main(['replay', '--rows-failures', '7', 'https://kit.example']), 0)
             self.assertEqual(seen['rows_failures'], 7)
             self.assertEqual(kc.main(['replay', '--rows-failures', '-1', 'https://kit.example']), 1)
+            self.assertEqual(kc.main(['replay', '--rows-failures', '100001', 'https://kit.example']), 1)
+            self.assertEqual(kc.main(['replay', '--rows-failures', '100000', 'https://kit.example']), 0)
+            self.assertEqual(seen['rows_failures'], 100000)
 
     def test_the_cut_vector_cuts_a_1_mib_object_after_chunk_3_and_chunk_4_and_each_cut_is_released_once(self):
         kit, lines = self.replay()

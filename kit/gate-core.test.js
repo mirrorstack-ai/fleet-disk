@@ -771,6 +771,49 @@ test('rowsRead: a cursor that reports no number counts nothing, and answers are 
   assert.equal(await rowsRead(ctx), 0);
 });
 
+test('rowsRead is read after the cursor is drained: a lazy cursor counts nothing until toArray()', async () => {
+  // SELECT statements (#rows) and writes (#run) each report their rows only once consumed, as the real cursor does.
+  const isWrite = (q) => /^\s*(INSERT|UPDATE|DELETE)/i.test(q);
+  for (const [label, rowsFor, pick] of [
+    ['a SELECT (#rows)', (q) => (isWrite(q) ? 0 : 3), (execs) => execs.filter((q) => !isWrite(q))],
+    ['a write (#run)', (q) => (isWrite(q) ? 5 : 0), (execs) => execs.filter(isWrite)],
+  ]) {
+    const ctx = await ready();
+    ctx.storage.lazyRowsRead = true;
+    ctx.storage.rowsReadOf = rowsFor;
+    const from = ctx.storage.stats.execs.length;
+    assert.equal((await dec(ctx, BAD)).status, 404);
+    const mine = pick(ctx.storage.stats.execs.slice(from));
+    assert.ok(mine.length > 1, `${label}: the decision ran statements of this kind`);
+    const per = rowsFor(mine[0]);
+    assert.ok((await rowsRead(ctx)) > 0, `${label}: counted after the drain, not before`);
+    assert.equal(await rowsRead(ctx), per * mine.length, label);
+  }
+});
+
+test('rowsRead: a transaction that throws ends the measuring, so later admin calls never count', async () => {
+  const ctx = await ready();
+  await dec(ctx, BAD);
+  let seen = 0;
+  ctx.storage.beforeExec = () => {
+    if (++seen === 3) { ctx.storage.beforeExec = null; throw new Error('storage'); }
+  };
+  await assert.rejects(dec(ctx, { tag: TAG2 }), /storage/);
+  const v1 = await rowsRead(ctx);
+  await addInvite(ctx, { ref: 'ref-00000003', tag: TAG2 });
+  const v2 = await rowsRead(ctx);
+  assert.equal(v2, v1, 'admin calls after a thrown decision are outside the count');
+});
+
+test('rowsRead: only safe whole positive numbers are added (2.5, Infinity, NaN, a string, 0, a negative are not)', async () => {
+  const ctx = await ready();
+  for (const junk of [2.5, Infinity, NaN, '7', 0, -1, null, true, 2 ** 60]) {
+    ctx.storage.rowsReadOf = () => junk;
+    await dec(ctx, BAD);
+    assert.equal(await rowsRead(ctx), 0, `junk ${String(junk)}`);
+  }
+});
+
 test('rowsRead is never stored: the number of writes per decision is the same with and without it', async () => {
   const run = async (counting) => {
     const ctx = await ready();

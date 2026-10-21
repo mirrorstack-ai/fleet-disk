@@ -44,8 +44,9 @@ plus the `openssl` binary (3.x: Ed25519 with -rawin) for the throwaway admin key
                       front rejects get one try. Two measurements ride along (PY21): the cut vector (a 1 MiB object read
                       in 64 KiB chunks, cut after the 3rd and after the 4th, each cut must give its download back) and
                       rows read per failed decision (the Gate's rowsRead from /_k/state before and after the budget loop
-                      and `--rows-failures N` more rejects, default 200: prints rows_per_failure=<n>, or rows_read=
-                      unavailable on a Worker without the counter, or rows_read=reset if the number fell between reads).
+                      and `--rows-failures N` more rejects, default 200: prints rows_per_failure=<n> with the loop's and
+                      the flood's own figures, or rows_read=unavailable on a Worker without the counter (or whose counter
+                      did not move), or rows_read=reset if the number fell between reads).
   probe URL           the hostile probe against PRODUCTION: at most 5 well-formed failures, every answer byte-identical
                       to the first apart from date, cf-ray and the token in Cloudflare's own cf-nel report-to (below),
                       one of them with Accept-Encoding: gzip. It first waits out version propagation (run 38180769445:
@@ -1032,7 +1033,9 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
     Rows read per failed decision (G-AUD-KIT-WORKER-1b): the Gate counts the rows its decisions read and /_k/state shows the
     number. The replay reads it before the budget loop, makes the loop's own failures plus `rows_failures` more reject-shaped
     requests (the source is past its budget by then, so those are the Gate's flood path: the 429), reads it again and prints
-    rows_per_failure. A kit that does not report the number prints rows_read=unavailable (no failure, no extra requests); a
+    rows_per_failure. A third read, between the loop and the flood, splits the figure: rows per decision of the loop (its 404s
+    and the 429 that ends them) and per 429 of the flood. A kit that does not report the number prints rows_read=unavailable
+    (no failure, no flood); so does a counter that did not move over the decisions (a figure of 0.0 would read as a pass); a
     second read below the first prints rows_read=reset (the Gate was evicted between them)."""
     s1, s2, s3, s4, s5, gser = (S_BASE + i for i in (1, 2, 3, 4, 5, 1))
     s6 = S_BASE + 6                                    # the cut vector's object
@@ -1259,7 +1262,7 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
         if left < 1:
             raise Refused('the replay itself spent %d failures' % fails)
         # The rows-read counter before the loop: nothing but this loop's decisions (and the flood below) moves it until the
-        # second read. A kit built before PY21 has none: no extra requests, and the summary says so.
+        # second read. A kit built before PY21 has none: no flood, and the summary says so.
         rows_before = rows_read_of(ok_call('rows read before', lambda: admin.call('gateway', 'GET', '/_k/state'))[0])
         served = 0
         resp429 = None
@@ -1281,6 +1284,7 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
             m['rows'] = 'rows_read=unavailable (this kit does not report rowsRead: a Worker built before PY21)'
         else:
             vector('rows read per failed decision')
+            rows_mid = rows_read_of(ok_call('rows read between', lambda: admin.call('gateway', 'GET', '/_k/state'))[0])
             for i in range(rows_failures):                                   # the source is past its budget: the Gate's 429 path
                 r = get_kit(client, s1, 'bundle.tar', random_code())
                 if r.status != 429:
@@ -1292,10 +1296,19 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
             elif rows_after < rows_before:
                 m['rows'] = ('rows_read=reset (%d, then %d: the Gate was evicted between the two reads; no figure, '
                              'run the replay again)' % (rows_before, rows_after))
+            elif rows_after == rows_before:                                  # decisions > 0 here: a counter that never moves is no 0.0
+                m['rows'] = ('rows_read=unavailable (the counter did not move over %d decisions: this kit does not count '
+                             'the rows its cursors read)' % decisions)
             else:
                 m['rows'] = ('rows_per_failure=%.1f (%d rows read over %d failed decisions: the loop\'s %d 404s and its 429, '
                              'then %d more 429s)' % ((rows_after - rows_before) / decisions, rows_after - rows_before,
                                                       decisions, served, rows_failures))
+                if rows_mid is not None and rows_before <= rows_mid <= rows_after:
+                    m['rows'] += ('; loop %.1f per decision (%d rows over its %d 404s and its 429)'
+                                  % ((rows_mid - rows_before) / (served + 1), rows_mid - rows_before, served))
+                    if rows_failures:
+                        m['rows'] += ('; flood %.1f per 429 (%d rows over %d)'
+                                      % ((rows_after - rows_mid) / rows_failures, rows_after - rows_mid, rows_failures))
         r = get_kit(client, s1, 'gateway.json', code_w)
         check_fixed_answer('valid request while the budget is spent', r, 429, TRY_LATER)
         r = client.request('POST', '/v1/kit/%d/bundle.tar' % s1, [('Authorization', 'FleetInvite ' + code_w)], b'')
