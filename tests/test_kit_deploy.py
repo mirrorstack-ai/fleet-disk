@@ -5,6 +5,7 @@ each must be refused. The workflow's rules are text checks (no YAML parser in th
 the Ed25519 signatures need an `openssl` 3.x binary (the tests that sign skip without one). Plain unittest."""
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import http.client
@@ -637,11 +638,34 @@ class ServePoll(unittest.TestCase):
         seen = self.polls_seen(run)
         self.assertEqual(len(seen), 1, seen)                 # the recorder saw the server (the check is not vacuous)
         self.assertLessEqual(seen[0], 0.05, seen)            # the stdlib default is 0.5, and shutdown() waits for one poll
+        self.assertGreater(seen[0], 0, seen)                 # 0 would busy-spin a loaded shared runner
 
     def test_the_redirect_servers_poll_every_few_milliseconds(self):
         seen = self.polls_seen(lambda: through_the_real_open(302, lambda: None, {}))
         self.assertEqual(len(seen), 1, seen)
         self.assertLessEqual(seen[0], 0.05, seen)
+        self.assertGreater(seen[0], 0, seen)
+
+    def test_no_server_in_this_file_is_served_by_a_bare_thread(self):
+        """The inline server of the redirect-never-followed judge is run by no ServePoll test, so read the source: every
+        ThreadingHTTPServer(...) built in this file is matched by one serve_thread(...) call, and the only serve_forever
+        used as a thread target is the one inside serve_thread itself."""
+        tree = ast.parse(Path(__file__).read_text())
+        servers = serve_threads = 0
+        bare = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                f = node.func
+                name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else ''
+                servers += name == 'ThreadingHTTPServer'
+                serve_threads += name == 'serve_thread'
+                if name == 'Thread':
+                    for kw in node.keywords:
+                        if kw.arg == 'target' and isinstance(kw.value, ast.Attribute) and kw.value.attr == 'serve_forever':
+                            bare.append(node.lineno)
+        self.assertEqual(servers, 3, 'a stand-in server was added or removed: update this count and use serve_thread')
+        self.assertEqual(serve_threads, servers, 'every ThreadingHTTPServer needs its serve_thread(...)')
+        self.assertEqual(len(bare), 1, bare)                 # only serve_thread's own Thread(target=server.serve_forever)
 
 
 class ReplayClock:
