@@ -59,6 +59,18 @@ ADMIN_RE = re.compile(r'^KitAdmin (upload|gateway) ([1-9][0-9]{12,15}) ([0-9a-f]
 SPKI_PREFIX = bytes.fromhex('302a300506032b6570032100')
 
 
+# serve_forever looks at its stop flag only every `poll_interval` seconds (default 0.5), and shutdown() blocks until it does:
+# about 0.25 s per fake server on average, 0.5 s at worst, and a replay test opens and closes one per replay (201 shutdowns
+# in the 58 OverHttp tests: 117 s of a 288 s class on a loaded Mac, PY06 / G-KITTEST-1). A 10 ms poll costs nothing here
+# and changes no request the server answers.
+SERVE_POLL = 0.01
+
+
+def serve_thread(server: ThreadingHTTPServer) -> threading.Thread:
+    """The thread that serves `server` in a test, started by the caller; every stand-in server in this file uses it."""
+    return threading.Thread(target=server.serve_forever, kwargs={'poll_interval': SERVE_POLL}, daemon=True)
+
+
 class _Redirector(BaseHTTPRequestHandler):
     """Answers every request with `code` and a Location to /other; records (method, path, Authorization)."""
     code = 302
@@ -82,7 +94,7 @@ def through_the_real_open(code, call, env):
     mutation that bypasses _OPENER fails here instead of reaching the API). Returns (result, requests seen, HTTPS tries)."""
     H = type('H', (_Redirector,), {'code': code, 'seen': []})
     srv = ThreadingHTTPServer(('127.0.0.1', 0), H)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    serve_thread(srv).start()
     local = 'http://127.0.0.1:%d/start' % srv.server_address[1]
     real, https_tries = kc._OPENER, []
 
@@ -593,7 +605,7 @@ class Served:
         self.kit = kit
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(kit))
         self.server.daemon_threads = True
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = serve_thread(self.server)
 
     def __enter__(self):
         self.thread.start()
@@ -602,6 +614,34 @@ class Served:
     def __exit__(self, *a):
         self.server.shutdown()
         self.server.server_close()
+
+
+class ServePoll(unittest.TestCase):
+    """PY06 (G-KITTEST-1): every stand-in server polls for its stop flag often, so a shutdown costs milliseconds, not 0.25 s."""
+
+    def polls_seen(self, run):
+        """The poll_interval of every serve_forever call made while `run()` opens and closes its servers."""
+        seen, real = [], ThreadingHTTPServer.serve_forever
+
+        def serve_forever(server, poll_interval=0.5):
+            seen.append(poll_interval)
+            return real(server, poll_interval)
+        with mock.patch.object(ThreadingHTTPServer, 'serve_forever', serve_forever):
+            run()
+        return seen
+
+    def test_the_replays_fake_server_polls_every_few_milliseconds(self):
+        def run():
+            with Served(FakeKit({})):
+                pass
+        seen = self.polls_seen(run)
+        self.assertEqual(len(seen), 1, seen)                 # the recorder saw the server (the check is not vacuous)
+        self.assertLessEqual(seen[0], 0.05, seen)            # the stdlib default is 0.5, and shutdown() waits for one poll
+
+    def test_the_redirect_servers_poll_every_few_milliseconds(self):
+        seen = self.polls_seen(lambda: through_the_real_open(302, lambda: None, {}))
+        self.assertEqual(len(seen), 1, seen)
+        self.assertLessEqual(seen[0], 0.05, seen)
 
 
 class ReplayClock:
@@ -934,7 +974,7 @@ class Judges(unittest.TestCase):
                 pass
 
         srv = ThreadingHTTPServer(('127.0.0.1', 0), H)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        serve_thread(srv).start()
         try:
             r = urllib.request.Request('http://127.0.0.1:%d/start' % srv.server_address[1], headers={'Authorization': 'Bearer T'})
             with self.assertRaises(urllib.error.HTTPError) as why:
