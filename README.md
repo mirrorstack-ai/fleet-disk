@@ -436,3 +436,29 @@ Fork pull requests run this workflow's code (from the PR) on hosted runners, inc
 Windows and macOS ones. It holds no secret and a read-only token, so the worst a hostile fork can do is spend runner minutes.
 Keep that true in the repository settings: Actions > General > Fork pull request workflows, set "Require approval for all
 outside collaborators", and leave "Send write tokens to workflows from pull requests" off.
+
+## Real smoke (a published release)
+
+`.github/workflows/smoke-real.yml` (`workflow_dispatch` only, from `main` only, input `serial` digits only, `contents: read`, no
+secret, no Environment) runs the REAL one-liner of a published release `install-<serial>` on the same five runners:
+`smoke_driver.py real --serial N` reads the release's notes with `gh release view`, takes the OS's check line (the fence under
+`<os> (bootstrap sha256 <hex>):`, the text `release_notes` writes), and runs it with no invite on a throwaway `HOME`/`TEMP`,
+stripped of the runner's token. The check must end as a fixture case does (the same `expect`: the machine's own refusal,
+`kvm` on a Linux runner without `/dev/kvm`, else exit 0 with the code line), make no file outside the throwaway home (the real
+home and temp folder are listed before and after, and so are the places an install would write) and leave nothing in the
+throwaway temp folder.
+
+Two values it holds the release against come from `main`, never from the release under test: the owner key's fingerprint is
+the `KEY_SHA256` constant of `install.yml`, and the bootstrap digests are `.github/smoke-real-pins.json`
+(`{"<serial>": {"ps1": <sha256>, "sh": <sha256>}}`). The release's notes, its downloaded asset and the line must all carry
+main's digest (`digest-mismatch` otherwise, even when the notes and the asset agree with each other) and the notes must name
+main's key (`key-mismatch`); the run's own `bootstrap sha256` and `key` lines must be main's too. A serial with no pin stops
+at `no-main-pin` before anything is read: add the pin (from the signed `install.json` of the fleet release folder) by a reviewed
+change first.
+Checking a release therefore takes a second, reviewed step per serial: a pin PR that copies the bootstrap sha256 from the signed
+`install.json` into `smoke-real-pins.json` (the plan said to stop and report when no main-side digest source exists; this file is
+that source, so the plan's rule is waived for it only if the coordinator agrees), then one dispatch from `main`. The line the
+release's notes carry must also equal, byte for byte, what `main`'s `bin/fleet-install-publish.py` `check_line` renders for that
+serial, OS, repository, digest and min serial, so a line with anything added is never run. A dispatch from any other branch fails
+in the `guard` job (red), it never skips green. The leg costs hosted-runner minutes on every dispatch (the macOS leg at the macOS multiplier), so dispatch it
+once per published release.
