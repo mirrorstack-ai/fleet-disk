@@ -42,6 +42,40 @@ A wrong pin fails closed (`image-pin-mismatch` / `vfkit-mismatch`): the evidence
 key at build time) and the bytes upstream serves, and a pin that does not match them stops the build. The printed `vfkit` lock entry must get `cdhash` and `entitlements` added from a Mac before the owner signs it, because a Linux runner
 has no `codesign`.
 
+## Pinning a disk release
+
+`bin/fleet-disk.py pin [amd64|arm64] <serial>` is the one way to get the lock entries for a PR, in place of copying them from a
+run's log. It is read-only (every call is a plain GET through `gh api`, nothing is created, changed or deleted), needs no token
+beyond the login `gh` already has (`GH_TOKEN`, `HOME`, `GH_CONFIG_DIR` and `XDG_CONFIG_HOME` are passed on when set; the repository
+is `GITHUB_REPOSITORY` or this one), and runs where the build's tools are (`gh`, `gpgv` with the Ubuntu cloud-image keyring, and
+`zstd` for arm64, at the same paths). It reads the published release of `disk-noble-<serial>` (or `disk-noble-arm64-<serial>`),
+takes the commit the release names (`target_commitish`, which must be a 40-hex sha, the `--target` the build passed), and asks
+`compare/main...<sha>`: only `behind` or `identical` (the commit is on `main`) goes on. It then reads the run record of
+`disk.yml` (`actions/workflows/disk.yml/runs?head_sha=<sha>&event=workflow_dispatch&status=success`) and goes on only if a
+completed, successful `workflow_dispatch` run on branch `main` at exactly that sha exists, the release's author and every asset's
+uploader are `github-actions[bot]` (a person's `gh release create` carries their own login), and the release's publication and every
+asset's upload fall inside that run's `created_at` to `updated_at` (30 seconds of slack; the release's own `created_at` is its commit's
+date, so it is not compared). It then prints the same entries, in the
+same form, as the build: the signed upstream sum is re-read through the build's own `gpgv` check, the asset digests and sizes
+come from a second read of the release that must equal the first, and for arm64 the asset's bytes are downloaded and must hash
+to GitHub's digest, are expanded with `zstd`, and the expanded disk's sha256 and size are measured here (vfkit's upstream bytes are
+re-checked too). Nothing is printed that was not read in that run. The words it refuses with, on stderr, with no stdout and exit 1:
+
+- `pin-not-main`: the compare says `ahead` or `diverged`, or any answer that is not `behind` or `identical`; or there is no such
+  run (a dispatch of a branch, a push, a failed or other-commit run, or one whose window does not hold the release), or the
+  release or an asset was made by someone other than the bot.
+- `pin-unread`: any read fails (a nonzero exit, a timeout, not JSON, a tool missing), the release is not exactly one published
+  release with the expected assets and a `sha256:` digest and size each, `target_commitish` is not a 40-hex sha (a branch name
+  is never compared), the compare answer has no `status`, the run list is not a list, or the release has no author, publication
+  time, or an asset with an uploader and creation time.
+- `pin-mismatch`: two reads of the release disagree, an asset's bytes are not the digest GitHub lists, or the signed arm64 image is
+  not `ARM64_IMAGE_SHA256`.
+
+What it proves is that the release names a commit that is on `main`, that a successful `disk.yml` dispatch on `main` ran at that
+commit, and that the bot published the release and uploaded its assets while that run was going. It cannot tell the run's own
+release from one that another job of the same bot made at that commit in that window (and a person with a token for the bot is
+beyond it), so the owner's signature over the lock and the ruleset on `refs/tags/disk-*` remain the other two walls.
+
 ## How an install set is released and verified
 
 The release inputs are committed in the fleet repository under `release/install-<serial>/` and reach this repo only through
@@ -316,8 +350,9 @@ ref's workflow file). The real boundary is set in the repo, not in code:
   (restricted to `main`), so nothing about `release` gates or reaches it. `disk` holds no secret or variable, so it is not a
   boundary: it only restricts the dispatch to `main`, and the job's write power is the workflow file's `contents: write`.
   No ruleset covers the `disk-*` tags yet, so anyone with push access can take a `disk-noble-<serial>` name. The ruleset
-  (creation, update, deletion, with a deploy key stored in `disk` as its only bypass) is the owner's step; until then the
-  entries to pin come only from the log of a run on `main`. A read-only probe, run by hand with an admin token, prints
+  (creation, update, deletion, with a deploy key stored in `disk` as its only bypass) is the owner's step; until then
+  use `pin`, not the log: `bin/fleet-disk.py pin [amd64|arm64] <serial>` (see "Pinning a disk release") prints the entries only for
+  a release whose commit is on `main`. A read-only probe, run by hand with an admin token, prints
   FAIL until both exist:
 
   ```sh
