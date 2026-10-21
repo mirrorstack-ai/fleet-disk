@@ -186,6 +186,10 @@ class FakeKit:
         self.per_source = flags.get('per_source', 30)
         self.gate_failures = 0
         self.gate_calls = 0                      # requests that got past the front check into the Gate
+        self.rows_read = 0                       # the Gate's rows-read counter (PY21): rows_each per decision, 429s included
+        self.rows_each = flags.get('rows_each', 4)
+        self.rows_evicted = False                # flags['rows_read']='evicted': the counter is zeroed once, at the first 429
+        self.releases: list[int] = []            # the serial of every released (refunded) download, in order
         self.requests = 0                        # every request, in order (the 'placeholder' flag asks for this number)
         self.paths: list[str] = []               # every path requested, in order
         self.ready_tries = 0                     # requests to the probe's readiness path so far (the 'ready_fault' flag)
@@ -455,7 +459,11 @@ def make_handler(kit: FakeKit):
             with kit.lock:
                 kit.gate_calls += 1                              # the Gate's decide answers the 429 too: count it first
                 if kit.fails >= kit.per_source:
+                    if kit.flags.get('rows_read') == 'evicted' and not kit.rows_evicted:    # the Gate slept and woke at 0
+                        kit.rows_evicted, kit.rows_read = True, 0
+                    kit.rows_read += kit.rows_each
                     return self.send_fixed(429, b'try later\n')
+                kit.rows_read += kit.rows_each
                 inv = next((i for i in kit.invites.values() if i['code'] == c.group(1)), None)
                 data = None
                 if name == 'bundle.tar':
@@ -482,11 +490,12 @@ def make_handler(kit: FakeKit):
                 for i in range(0, len(data), 65536):
                     self.wfile.write(data[i:i + 65536])
             except OSError:
-                if name == 'bundle.tar' and not kit.flags.get('no_release'):
+                if name == 'bundle.tar' and not kit.flags.get('no_release') and serial != kit.flags.get('no_release_serial'):
                     with kit.lock:
                         if inv['refunds'] < 3:
                             inv['used'] -= 1
                             inv['refunds'] += 1
+                            kit.releases.append(serial)
 
         def propagating(self, a, path) -> bool:
             """Version propagation (run 38140164568): a signed call reaching an isolate with the previous run's keys gets
@@ -581,7 +590,11 @@ def make_handler(kit: FakeKit):
                 kit.floor = j()['floor']
                 return self.send_json(200, {'ok': True})
             if path == '/_k/state':
-                return self.send_json(200, {'ok': True, 'now': kit.now()})
+                doc = {'ok': True, 'now': kit.now()}
+                mode = kit.flags.get('rows_read')            # None counts; 'absent' = a kit built before PY21; 'garbage' = not a count
+                if mode != 'absent':
+                    doc['rowsRead'] = 'many' if mode == 'garbage' else kit.rows_read
+                return self.send_json(200, doc)
             if self.command == 'POST':
                 d = j()
                 now = kit.now()
@@ -1407,7 +1420,8 @@ class OverHttp(unittest.TestCase):
         time is measured on a ReplayClock, not on the runner's clock, unless real_clock (only the slow-runner control)."""
         kit = self.kit = FakeKit(self.pubs, **flags)
         # the readiness streak is the real one (10); only the waits are short here
-        kw = dict(big_mib=12, cut_wait=0.4, short_life_ms=2500, ready_spacing=0.0, retry_wait=0.0, log=lambda *_: None)
+        kw = dict(big_mib=12, cut_wait=0.4, short_life_ms=2500, ready_spacing=0.0, retry_wait=0.0, rows_failures=20,
+              log=lambda *_: None)
         kw.update(run or {})
         # the expiry wait moves the kit's clock (no real wait); a `sleep` in `run` is the one every shorter wait really uses
         kw['sleep'] = kit.fake_sleep(kw.get('sleep', time.sleep))
@@ -1557,8 +1571,8 @@ class OverHttp(unittest.TestCase):
         self.assertEqual(sum(1 for role, m, p, _, _ in log if (role, m, p) == ('gateway', 'PUT', '/_k/floor')), 1)
         stale = [st for role, m, p, ts, st in log if (m, p) == ('GET', '/_k/state') and ts < kit.now() - 300000]
         self.assertEqual(stale, [404])
-        # 10 ready, the stale one, the front reject's zero signature: nothing sent again
-        self.assertEqual(sum(1 for _, m, p, _, _ in log if (m, p) == ('GET', '/_k/state')), 12)
+        # 10 ready, the stale one, the rows-read before and after, the front reject's zero signature: nothing sent again
+        self.assertEqual(sum(1 for _, m, p, _, _ in log if (m, p) == ('GET', '/_k/state')), 14)   # + the rows-read pair (PY21)
         self.assertEqual(sum(1 for *_, st in log if st == 409), 3)     # overwrite, rollback, replay second: once each
         self.assertIn("fixed 404: 0", '\n'.join(lines))
 
@@ -1576,6 +1590,113 @@ class OverHttp(unittest.TestCase):
         self.assertEqual(kit.floor, 0)
         self.assertTrue(all(i['revoked'] for i in kit.invites.values()))  # nothing open is left on the Worker
         self.assertNotIn(next(iter(kit.invites.values()))['code'], text)  # no code in what the job prints
+
+    # -- PY21: rows read per failed decision (G-AUD-KIT-WORKER-1b) and the cut vector -------------------------------------
+    ROWS = re.compile(r'\(h\) rows_per_failure=([0-9.]+) \((\d+) rows read over (\d+) failed decisions: the loop\'s (\d+) 404s '
+                      r'and its 429, then (\d+) more 429s\)')
+
+    def rows(self, **flags):
+        kit, lines = self.replay(**flags)
+        text = '\n'.join(lines)
+        return kit, text, self.ROWS.search(text)
+
+    def test_the_replay_prints_rows_per_failure_from_the_kits_counter(self):
+        kit, text, m = self.rows(rows_each=4)
+        self.assertIsNotNone(m, text)
+        per, rows, decisions, served, flood = m.groups()
+        self.assertEqual((per, int(flood)), ('4.0', 20))
+        self.assertEqual(int(decisions), int(served) + 1 + 20)           # the loop's 404s, its 429, the flood
+        self.assertEqual(int(rows), 4 * int(decisions))                  # every decision between the two reads, and no other
+        self.assertEqual(int(served), 30 - 10)                           # the replay's own 10 failures came first
+        self.assertEqual(kit.fails, 30)
+
+    def test_rows_per_failure_is_the_kits_number_per_decision_whatever_n_is(self):
+        # N from the flag: the flood is N requests more, the figure is rows over decisions, so it stays the kit's own
+        got = {}
+        for n in (0, 5, 40):
+            kit, text, m = self.rows(rows_each=7, run={'rows_failures': n})
+            self.assertIsNotNone(m, text)
+            self.assertEqual(m.group(1), '7.0')
+            got[n] = (int(m.group(3)), kit.gate_calls)
+        self.assertEqual(got[5][0] - got[0][0], 5)
+        self.assertEqual(got[40][0] - got[5][0], 35)
+        self.assertEqual(got[40][1] - got[0][1], 40)                     # the flood really reached the Gate N times
+
+    def test_a_kit_without_the_counter_prints_unavailable_and_does_not_fail(self):
+        for mode in ('absent', 'garbage'):
+            with self.subTest(mode=mode):
+                kit, text, m = self.rows(rows_read=mode)
+                self.assertIsNone(m)
+                self.assertIn('(h) rows_read=unavailable (this kit does not report rowsRead', text)
+                self.assertNotIn('rows_per_failure', text)
+                self.assertIn('vectors passed', text)
+                self.assertEqual(kit.fails, 30)
+        # the control: no flood is sent to a kit that cannot count it
+        counting, _ = self.replay()
+        silent, _ = self.replay(rows_read='absent')
+        self.assertEqual(counting.gate_calls - silent.gate_calls, 20)
+
+    def test_a_counter_that_falls_between_the_two_reads_prints_reset_not_a_figure(self):
+        kit, text, m = self.rows(rows_read='evicted', run={'rows_failures': 1})
+        self.assertIsNone(m)
+        self.assertRegex(text, r'\(h\) rows_read=reset \(\d+, then \d+: the Gate was evicted between the two reads')
+        before, after = map(int, re.search(r'rows_read=reset \((\d+), then (\d+):', text).groups())
+        self.assertLess(after, before)
+        self.assertNotIn('rows_per_failure', text)
+        self.assertIn('vectors passed', text)
+
+    def test_the_cli_takes_rows_failures_as_a_flag_with_a_default_of_200(self):
+        seen = {}
+
+        def fake(client, admin, **kw):
+            seen.update(kw)
+            return ['x']
+        with mock.patch.object(kc, 'run_replay', fake), mock.patch.dict(os.environ, {'KIT_GATE_DIR': self.gate_dir}), \
+                mock.patch.object(kc, 'summary'):
+            self.assertEqual(kc.main(['replay', 'https://kit.example']), 0)
+            self.assertEqual(seen['rows_failures'], 200)
+            self.assertEqual(kc.main(['replay', '--rows-failures', '7', 'https://kit.example']), 0)
+            self.assertEqual(seen['rows_failures'], 7)
+            self.assertEqual(kc.main(['replay', '--rows-failures', '-1', 'https://kit.example']), 1)
+
+    def test_the_cut_vector_cuts_a_1_mib_object_after_chunk_3_and_chunk_4_and_each_cut_is_released_once(self):
+        kit, lines = self.replay()
+        text = '\n'.join(lines)
+        self.assertIn('(a) cut vector: 1024 KiB in 64 KiB chunks, cut after chunk 3 and 4, count restored: 2 of 2', text)
+        s6 = kc.S_BASE + 6
+        self.assertEqual(len(kit.files[s6]), 1024 * 1024)
+        self.assertEqual(kit.releases.count(s6), 2)                      # two cuts, one release each
+        self.assertEqual(kit.releases.count(kc.S_BASE + 2), 2)           # the older 16 MiB vector is still there, unchanged
+        self.assertEqual(sorted(set(kit.releases)), [kc.S_BASE + 2, s6])
+
+    def test_the_cut_vector_reads_64_kib_chunks_and_hangs_up_after_the_3rd_and_after_the_4th(self):
+        calls, real = [], kc.get_kit_cut
+
+        def spy(client, serial, code, *a, **kw):
+            calls.append((serial, kw.get('chunk'), kw.get('chunks')))
+            return real(client, serial, code, *a, **kw)
+        with mock.patch.object(kc, 'get_kit_cut', spy):
+            self.replay()
+        s6 = kc.S_BASE + 6
+        self.assertEqual([c for c in calls if c[0] == s6], [(s6, 65536, 3), (s6, 65536, 4)])
+        self.assertEqual([c for c in calls if c[0] != s6], [(kc.S_BASE + 2, None, None)] * 2)     # the older vector is as it was
+
+    def test_the_cut_vector_refuses_a_worker_that_keeps_the_count_of_those_cuts(self):
+        why = self.refused('cut vector: a cut stream did not give the download back (0 of 2 restored)', no_release_serial=kc.S_BASE + 6)
+        self.assertNotIn('(a) client cuts', str(why))
+
+    def test_a_cut_reader_takes_whole_chunks_and_refuses_an_object_too_short_for_the_cut(self):
+        kit = FakeKit(self.pubs)
+        kit.files[7] = b'x' * (3 * 65536 + 5)
+        kit.invites['r'] = {'ref': 'r', 'code': '2222222222', 'tier': 'install', 'lo': 1, 'hi': 9, 'exp': kit.now() + 10 ** 7,
+                            'cap': 5, 'used': 0, 'refunds': 0, 'revoked': False}
+        with Served(kit) as base:
+            client = kc.Client(base, allow_http=True)
+            self.assertEqual(kc.get_kit_cut(client, 7, '2222222222', chunk=65536, chunks=3), 200)
+            with self.assertRaises(kc.Refused) as why:
+                kc.get_kit_cut(client, 7, '2222222222', chunk=65536, chunks=4)
+            self.assertIn('the stream ended inside chunk 4 of 4', str(why.exception))
+            self.assertEqual(kc.get_kit_cut(client, 7, '2222222222', read_bytes=1000), 200)    # the old call is as it was
 
     def test_the_replay_refuses_a_worker_that_tells_a_revoked_invite_apart(self):
         self.refused('differs', leak_revoked=True)
@@ -1718,10 +1839,10 @@ class OverHttp(unittest.TestCase):
         self.assertGreaterEqual(asked[0], 4.0)
         self.assertLessEqual(asked[0], 5.0)
         self.assertGreaterEqual(kit.skew_ms, asked[0] * 1000)
-        # (b) every other wait stayed real: the two cut_waits are slept (not advanced); no 3 s 503 retry is ever asked for
+        # (b) every other wait stayed real: the four cut_waits (two cuts, then the PY21 cut vector's two) are slept (not advanced); no 3 s 503 retry is ever asked for
         # (the fake cannot answer 503 to the invite POST; if it ever does, the wrapper must exclude that literal 3)
         real = [s for s, advanced in kit.sleeps if not advanced]
-        self.assertEqual(real.count(0.4), 2, kit.sleeps)
+        self.assertEqual(real.count(0.4), 4, kit.sleeps)
         self.assertLess(max(real), 2.0)
         self.assertNotIn(3, [s for s, _ in kit.sleeps])
 
@@ -1754,7 +1875,7 @@ class OverHttp(unittest.TestCase):
         # real sleep for the cut_waits and spacings would be seen; the expiry wait never reaches it (it moves the clock)
         rec = []
         self.replay(run={'sleep': rec.append})
-        self.assertEqual(rec.count(0.4), 2, rec)
+        self.assertEqual(rec.count(0.4), 4, rec)       # the two cuts and the cut vector's two
         self.assertLess(max(rec), 2.0, rec)
 
     def test_without_the_clock_moving_the_invite_does_not_expire(self):

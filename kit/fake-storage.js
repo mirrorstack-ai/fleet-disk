@@ -7,12 +7,14 @@ export function fakeStorage(path = ':memory:') {
   const db = new DatabaseSync(path);
   const stats = { syncs: 0, execs: [] };
   let depth = 0;
+  const read = (query, rows) => (storage.rowsReadOf ? storage.rowsReadOf(query) : rows);
   const storage = {
     db,
     stats,
     // Optional hooks for tests.
     beforeExec: null,
     syncImpl: null,
+    rowsReadOf: null, // (query) => the rowsRead to report for it; default: the rows returned, 0 for a write
     sql: {
       exec(query, ...bindings) {
         stats.execs.push(query);
@@ -20,14 +22,14 @@ export function fakeStorage(path = ':memory:') {
         const stmt = db.prepare(query);
         if (stmt.columns().length > 0) {
           const rows = stmt.all(...bindings);
-          return { toArray: () => rows, rowsRead: rows.length, rowsWritten: 0 };
+          return { toArray: () => rows, rowsRead: read(query, rows.length), rowsWritten: 0 };
         }
         const r = stmt.run(...bindings);
         // Like the real cursor, rowsWritten is "so far" (0) until it is consumed.
         let consumed = false;
         return {
           toArray: () => { consumed = true; return []; },
-          rowsRead: 0,
+          rowsRead: read(query, 0),
           get rowsWritten() { return consumed ? Number(r.changes) : 0; },
         };
       },

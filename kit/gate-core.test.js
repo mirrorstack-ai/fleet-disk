@@ -558,7 +558,7 @@ test('health exposes no tag, no code, no source', async () => {
   await dec(ctx, { tag: TAG2 });
   const h = await adm(ctx, 'gateway', 'health', {});
   assert.deepEqual(h, {
-    ok: true, now: ctx.clk.t, floor: 0, effectiveFloor: 0, floorError: false, gateway: 1, openInvites: 1, bundles: 1, failuresLastHour: 1,
+    ok: true, now: ctx.clk.t, floor: 0, effectiveFloor: 0, floorError: false, gateway: 1, openInvites: 1, bundles: 1, failuresLastHour: 1, rowsRead: 4,
   });
   const text = JSON.stringify(h);
   assert.ok(!text.includes(TAG) && !text.includes(SRC));
@@ -698,4 +698,110 @@ test('a write is judged only after its cursor is drained (rowsWritten is final t
   assert.equal(a.status, 200);
   assert.deepEqual(await ctx2.core.release({ rid: a.rid }), { released: true });
   assert.equal(used(ctx2.storage), 0);
+});
+
+// ---- the rows-read counter (G-AUD-KIT-WORKER-1b, PY21) ----------------------
+// The Free plan meters 5 million rows read a day. The counter is the sum of every
+// statement's cursor.rowsRead over the decision path, in memory, shown by health.
+
+const rowsRead = async (ctx) => (await adm(ctx, 'gateway', 'health', {})).rowsRead;
+const BAD = { tag: TAG2 }; // an unknown invite: a reject-shaped decision
+
+test('rowsRead: a decision whose statements each read 3 rows adds 3 per statement', async () => {
+  const ctx = await ready();
+  assert.equal(await rowsRead(ctx), 0, 'the setup (admin calls) is outside the count');
+  ctx.storage.rowsReadOf = () => 3;
+  const from = ctx.storage.stats.execs.length;
+  assert.equal((await dec(ctx, BAD)).status, 404);
+  const statements = ctx.storage.stats.execs.length - from;
+  assert.ok(statements > 5);
+  assert.equal(await rowsRead(ctx), 3 * statements);
+});
+
+test('rowsRead: on the fake (rows returned) one failed decision reads 4 rows, a 200 adds its own', async () => {
+  const ctx = await ready();
+  await dec(ctx, BAD);
+  assert.equal(await rowsRead(ctx), 4);
+  const a = await dec(ctx);
+  assert.equal(a.status, 200);
+  const after200 = await rowsRead(ctx);
+  assert.ok(after200 > 4, 'a served decision adds its reads');
+  await ctx.core.release({ rid: a.rid });
+  assert.ok((await rowsRead(ctx)) > after200, 'release is on the decision path too');
+});
+
+test('rowsRead: N rejects add N times the per-decision rows (the prune runs once per bucket)', async () => {
+  const ctx = await ready();
+  const seen = [];
+  let last = await rowsRead(ctx);
+  for (let i = 0; i < 8; i++) {
+    assert.equal((await dec(ctx, BAD)).status, 404);
+    const now = await rowsRead(ctx);
+    seen.push(now - last);
+    last = now;
+  }
+  const [first, ...rest] = seen;
+  for (const d of rest) assert.equal(d, rest[0]);
+  assert.equal(last, first + 7 * rest[0]);
+  // reject() after a yes is a failed decision as well: the same rows as any other, no prune in the same bucket
+  const b = await dec(ctx);
+  const before = await rowsRead(ctx);
+  await ctx.core.reject({ src: SRC, rid: b.rid });
+  assert.ok((await rowsRead(ctx)) > before);
+});
+
+test('rowsRead: admin calls and health never move it', async () => {
+  const ctx = await ready();
+  await dec(ctx, BAD);
+  const n = await rowsRead(ctx);
+  assert.ok(n > 0);
+  await adm(ctx, 'upload', 'setFloor', { floor: 0 });
+  await addInvite(ctx, { ref: 'ref-00000002', tag: TAG2 });
+  assert.equal(await rowsRead(ctx), n);
+  assert.equal(await rowsRead(ctx), n);
+});
+
+test('rowsRead: a cursor that reports no number counts nothing, and answers are unchanged', async () => {
+  const ctx = await ready();
+  ctx.storage.rowsReadOf = () => undefined;
+  assert.deepEqual(await dec(ctx, BAD), { status: 404 });
+  assert.equal(await rowsRead(ctx), 0);
+  ctx.storage.rowsReadOf = () => -5;
+  await dec(ctx, BAD);
+  assert.equal(await rowsRead(ctx), 0);
+});
+
+test('rowsRead is never stored: the number of writes per decision is the same with and without it', async () => {
+  const run = async (counting) => {
+    const ctx = await ready();
+    if (!counting) ctx.storage.rowsReadOf = () => undefined; // the counter stays 0: the old behaviour
+    const from = ctx.storage.stats.execs.length;
+    for (let i = 0; i < 4; i++) await dec(ctx, BAD);
+    const a = await dec(ctx);
+    await ctx.core.release({ rid: a.rid });
+    await ctx.core.reject({ src: SRC, rid: null });
+    const dump = ['invites', 'fails', 'allfails', 'reservations', 'meta'].map((t) => ctx.storage.db.prepare(`SELECT * FROM ${t}`).all());
+    return { ctx, writes: writes(ctx.storage.stats.execs.slice(from)), dump };
+  };
+  const on = await run(true);
+  const off = await run(false);
+  assert.equal(await rowsRead(on.ctx) > 0, true, 'the counter really counted in the first run');
+  assert.deepEqual(on.writes, off.writes, 'the same write statements in the same order');
+  assert.deepEqual(on.dump, off.dump, 'the same rows in every table');
+  const keys = on.ctx.storage.db.prepare('SELECT k FROM meta').all().map((r) => r.k);
+  assert.ok(keys.every((k) => !/row/i.test(k)), `no meta key for the counter: ${keys}`);
+  // and a failed decision after the bucket's first writes exactly the two budget rows
+  const ctx = await ready();
+  await dec(ctx, BAD);
+  const from = ctx.storage.stats.execs.length;
+  await dec(ctx, BAD);
+  assert.equal(writes(ctx.storage.stats.execs.slice(from)).length, 2);
+});
+
+test('rowsRead lives in memory: a Gate that wakes on the same storage starts at 0', async () => {
+  const ctx = await ready();
+  for (let i = 0; i < 3; i++) await dec(ctx, BAD);
+  assert.ok((await rowsRead(ctx)) > 0);
+  const woken = { ...ctx, core: new GateCore(ctx.storage, { now: ctx.clk.now }) };
+  assert.equal(await rowsRead(woken), 0);
 });

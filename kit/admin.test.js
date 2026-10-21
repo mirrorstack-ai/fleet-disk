@@ -20,7 +20,7 @@ async function is404(res) {
 const failures = (h) => h.q('SELECT COALESCE(SUM(n), 0) AS n FROM allfails')[0].n;
 const state = async (h) => jsonOf(await admin(h, 'gateway', 'GET', '/_k/state'));
 
-test('state: the gateway role reads health, counts only', async () => {
+test('state: the gateway role reads health, counts only (and the one rows-read number, PY21)', async () => {
   const h = await ready({}, bytesOf(1000));
   const res = await admin(h, 'gateway', 'GET', '/_k/state');
   assert.equal(res.status, 200);
@@ -30,7 +30,32 @@ test('state: the gateway role reads health, counts only', async () => {
   assert.equal(s.openInvites, 1);
   assert.equal(s.bundles, 1);
   assert.equal(s.floorError, false);
+  assert.equal(s.rowsRead, 0, 'a number, 0 before any decision');
   assert.ok(!JSON.stringify(s).includes('ref-0000'));
+  assert.deepEqual(Object.keys(s).sort(), [
+    'bundles', 'effectiveFloor', 'failuresLastHour', 'floor', 'floorError', 'gateway', 'now', 'ok', 'openInvites', 'rowsRead',
+  ]);
+});
+
+test('state: rowsRead grows by the same rows per rejected request, over the real routes', async () => {
+  const h = await ready({}, bytesOf(1000));
+  const bad = '/v1/kit/5/bundle.tar';
+  const rows = async () => (await state(h)).rowsRead;
+  assert.equal(await rows(), 0);
+  await is404(await get(h, bad, { code: 'CCCC2222VX' }));
+  const first = await rows();
+  assert.ok(Number.isInteger(first) && first > 0);
+  const steps = [];
+  let last = first;
+  for (let i = 0; i < 5; i++) {
+    await is404(await get(h, bad, { code: 'CCCC2222VX' }));
+    const n = await rows();
+    steps.push(n - last);
+    last = n;
+  }
+  assert.ok(steps[0] > 0);
+  for (const d of steps) assert.equal(d, steps[0]);
+  assert.equal(await rows(), last, 'reading the number does not move it');
 });
 
 test('a bad or unsigned call is the one 404, spends no budget and reaches no admin op', async () => {

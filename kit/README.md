@@ -88,13 +88,19 @@ budget. Once the signature is good, replies are JSON and may say why (400 bad-re
 | upload | `PUT /_k/floor` | `{"floor": <int>}` |
 | gateway | `POST /_k/invite` | `{ref, code, tier, lo, hi, exp, cap}` (`exp` in epoch ms). The Worker computes the HMAC tag from `code` and drops the code. |
 | gateway | `DELETE /_k/invite/<ref>` | none |
-| gateway | `GET /_k/state` | none: health counts |
+| gateway | `GET /_k/state` | none: health counts, and one number, `rowsRead` (below) |
 
 ### Measured on staging (K6), not here
 
 (a) a real client cut fires the release; (c) R2 refuses wrong bytes and overwrites (a second put of different bytes to an existing key returns null on real R2, and the wildcard `etagDoesNotMatch: '*'` is honoured); (d) the
 Free over-quota status; (g) CPU time; (h) rows read per failed decision, against the Free plan's 5 million rows read a day
-(read the staging Durable Object's rows-read metric before and after a known number of failed decisions). The unit tests use stand-ins and say nothing about these.
+(`bin/fleet-kit-check.py replay` reads `rowsRead` from `/_k/state` before and after the budget loop and a flood of `--rows-failures N` rejects, default 200, and prints `rows_per_failure=<n>`; the Gate counts it, see below). The unit tests use stand-ins and say nothing about these.
+
+`rowsRead` (PY21, G-AUD-KIT-WORKER-1b): the sum of every statement's `cursor.rowsRead` over the decision path (`decide`, `release`, `reject`),
+a number in the Gate instance's memory. It is NEVER stored, so a decision writes no extra row (a reject flood is the path it measures, and the Free plan meters
+rows written too); an evicted Gate starts again at 0 and the replay prints `rows_read=reset` when it sees the number fall. Admin calls and `health` itself are outside it.
+The fake storage reports the rows a SELECT returns (an aggregate is 1) and 0 for a write; the real cursor reports the rows scanned, so only staging gives the real figure.
+A Worker deploys only at the next kit-deploy: a kit without the counter answers `/_k/state` without `rowsRead` and the replay prints `rows_read=unavailable`, not a failure.
 
 ## Shared decision vectors (G-K3-1)
 
