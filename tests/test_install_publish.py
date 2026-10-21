@@ -2817,38 +2817,39 @@ class Readme(unittest.TestCase):
 class Workflow(unittest.TestCase):
     TEXT = (ROOT / '.github/workflows/install.yml').read_text(encoding='utf-8')
     DISK = (ROOT / '.github/workflows/disk.yml').read_text(encoding='utf-8')
-    JOBS = {m[1]: m[2] for m in re.finditer(r'(?ms)^  (plan|fixture|smoke|sign|kit|tag|publish|floor-approve|floor|untag-check|untag-approve|untag):\n(.*?)(?=^  [\w-]+:\n|\Z)',
+    JOBS = {m[1]: m[2] for m in re.finditer(r'(?ms)^  (plan|fixture|smoke|sign|gwsign|kit|tag|publish|floor-approve|floor|untag-check|untag-approve|untag):\n(.*?)(?=^  [\w-]+:\n|\Z)',
                                             TEXT.split('\njobs:\n', 1)[1])}
 
-    def test_it_is_a_release_branch_dispatch_of_the_seven_signing_jobs_the_floor_pair_and_the_untag_trio(self):
+    def test_it_is_a_release_branch_dispatch_of_the_eight_signing_jobs_the_floor_pair_and_the_untag_trio(self):
         self.assertRegex(self.TEXT, r'(?m)^on:\n  workflow_dispatch:\n    inputs:\n      mode:\n')
         self.assertEqual(re.findall(r'(?m)^      (\w+):\n        (?:description|required)', self.TEXT),
                          ['mode', 'serial', 'min_serial', 'floor'])
         self.assertRegex(self.TEXT, r'(?m)^        options: \[sign, pubkey, floor, untag\]\n        default: sign\n')
-        self.assertEqual(list(self.JOBS), ['plan', 'fixture', 'smoke', 'sign', 'kit', 'tag', 'publish', 'floor-approve', 'floor',
-                                                 'untag-check', 'untag-approve', 'untag'])
+        self.assertEqual(list(self.JOBS), ['plan', 'fixture', 'smoke', 'sign', 'gwsign', 'kit', 'tag', 'publish', 'floor-approve',
+                                                 'floor', 'untag-check', 'untag-approve', 'untag'])
         self.assertEqual(re.findall(r'(?m)^  ([\w-]+):$', self.TEXT.split('\njobs:\n', 1)[1]), list(self.JOBS))  # and no other job
         for bad in ('pull_request', 'push:', 'self-hosted', 'refs/heads/main', 'actions/cache'):
             self.assertNotIn(bad, self.TEXT)
         for name, job in self.JOBS.items():
             self.assertIn("github.ref == 'refs/heads/release'", job.split('steps:')[0], name)
         self.assertEqual(re.findall(r'runs-on: (.+)', self.TEXT),
-                         ['ubuntu-24.04', 'ubuntu-24.04', '${{ matrix.runner }}'] + ['ubuntu-24.04'] * 9)  # the smoke job is the only hosted-matrix one; the fixture is built once on ubuntu
+                         ['ubuntu-24.04', 'ubuntu-24.04', '${{ matrix.runner }}'] + ['ubuntu-24.04'] * 10)  # the smoke job is the only hosted-matrix one; the fixture is built once on ubuntu
         self.assertEqual([re.findall(r'(?m)^    environment: (\S+)$', j) for j in self.JOBS.values()],
-                         [['release'], [], [], ['release'], ['release'], ['release'], [], ['kit-floor'], ['release'], [], ['kit-floor'], ['release']])  # fixture, smoke and publish have none: no secret, no variable of release
+                         [['release'], [], [], ['release'], ['release'], ['release'], ['release'], [], ['kit-floor'], ['release'], [], ['kit-floor'], ['release']])  # fixture, smoke and publish have none: no secret, no variable of release
 
     def test_only_publish_writes_and_only_contents_and_sign_and_tag_hold_no_token(self):
         self.assertRegex(self.TEXT, r'(?m)^permissions:\n  contents: read\n')
         self.assertEqual(re.findall(r'(\w[\w-]*): write', self.TEXT), ['contents'])
         self.assertIn('    permissions:\n      contents: write\n', self.JOBS['publish'])
-        for name in ('fixture', 'smoke', 'sign', 'tag', 'untag-approve', 'untag'):
+        for name in ('fixture', 'smoke', 'sign', 'gwsign', 'tag', 'untag-approve', 'untag'):
             self.assertTrue('    permissions: {}\n' in self.JOBS[name] and 'github.token' not in self.JOBS[name])
         self.assertIn('    permissions:\n      contents: read\n', self.JOBS['untag-check'])  # the one new job with a token: read only
 
     def test_each_secret_is_read_by_one_job_and_the_sign_and_tag_jobs_run_no_action_and_no_repository_code(self):
         self.assertEqual(sorted(re.findall(r'secrets\.(\w+)', self.TEXT)),
-                         ['FLEET_READ', 'FLEET_READ', 'KIT_UPLOAD_KEY', 'KIT_UPLOAD_KEY', 'SIGN_KEY', 'TAG_KEY', 'TAG_KEY'])  # TAG_KEY: tag and untag (AF42, on purpose: the deploy key that makes a tag is the one that removes it)
-        for name, secrets in (('plan', ['FLEET_READ']), ('sign', ['SIGN_KEY']), ('kit', ['FLEET_READ', 'KIT_UPLOAD_KEY']),
+                         ['FLEET_READ', 'FLEET_READ', 'FLEET_READ', 'KIT_UPLOAD_KEY', 'KIT_UPLOAD_KEY', 'SIGN_KEY', 'SIGN_KEY', 'TAG_KEY', 'TAG_KEY'])  # gwsign (AF08) reads and signs; TAG_KEY: tag and untag (AF42, on purpose: the deploy key that makes a tag is the one that removes it)
+        for name, secrets in (('plan', ['FLEET_READ']), ('sign', ['SIGN_KEY']), ('gwsign', ['FLEET_READ', 'SIGN_KEY']),
+                              ('kit', ['FLEET_READ', 'KIT_UPLOAD_KEY']),
                               ('tag', ['TAG_KEY']), ('floor', ['KIT_UPLOAD_KEY']), ('untag', ['TAG_KEY'])):
             self.assertEqual(re.findall(r'secrets\.(\w+)', self.JOBS[name]), secrets)
         self.assertNotIn('secrets.', self.JOBS['publish'])
@@ -2856,7 +2857,7 @@ class Workflow(unittest.TestCase):
         self.assertNotIn('secrets.', self.JOBS['fixture'])
         for name in ('untag-check', 'untag-approve'):
             self.assertNotIn('secrets.', self.JOBS[name])
-        for name in ('sign', 'tag', 'untag'):
+        for name in ('sign', 'gwsign', 'tag', 'untag'):
             for bad in ('uses:', 'checkout', 'fleet-install-publish', 'python', 'RUNNER_WORKSPACE', 'GITHUB_WORKSPACE'):
                 self.assertNotIn(bad, self.JOBS[name], name)
         self.assertEqual(re.findall(r'vars\.(\w+)', self.TEXT), ['IMMUTABLE_RELEASES_CONFIRMED'])
@@ -2907,7 +2908,7 @@ class Workflow(unittest.TestCase):
             self.assertIn(need, step)
         self.assertEqual(self.declared_outputs('plan')['immutable'], ('immutable', 'immutable'))  # still handed to publish
         self.assertIn('IMMUTABLE_CONFIRMED: ${{ needs.plan.outputs.immutable }}', self.JOBS['publish'])
-        self.assertEqual(len(self.JOBS), 12)  # seven, the smoke and its fixture (AF34), the untag trio (AF42); AF08's gateway-sign job is still parked
+        self.assertEqual(len(self.JOBS), 13)  # seven, the smoke and its fixture (AF34), the untag trio (AF42), the gateway-sign job (AF08)
         self.assertEqual(re.findall(r'vars\.(\w+)', self.TEXT), ['IMMUTABLE_RELEASES_CONFIRMED'])
 
     def test_the_plan_job_reads_the_fleet_over_ssh_with_the_pinned_host_key_and_the_tag_job_never_forces(self):
@@ -2952,7 +2953,8 @@ class Workflow(unittest.TestCase):
 
     def test_each_job_needs_exactly_the_jobs_before_it(self):
         needs = {name: re.findall(r'(?m)^    needs: (.*)$', job) for name, job in self.JOBS.items()}
-        self.assertEqual(needs, {'plan': [], 'fixture': ['plan'], 'smoke': ['[plan, fixture]'], 'sign': ['[plan, smoke]'], 'kit': ['[plan, smoke, sign]'],
+        self.assertEqual(needs, {'plan': [], 'fixture': ['plan'], 'smoke': ['[plan, fixture]'], 'sign': ['[plan, smoke]'],
+                                 'gwsign': ['[plan, sign]'], 'kit': ['[plan, smoke, sign, gwsign]'],
                                  'tag': ['[plan, smoke, sign, kit]'], 'publish': ['[plan, smoke, sign, kit, tag]'],
                                  'floor-approve': [], 'floor': ['floor-approve'],
                                  'untag-check': [], 'untag-approve': ['untag-check'], 'untag': ['[untag-check, untag-approve]']})
@@ -2991,7 +2993,7 @@ class Workflow(unittest.TestCase):
         self.assertGreater(len(used), 10)
         for job, out in sorted(used):
             self.assertIn(out, declared[job], f'needs.{job}.outputs.{out} is read but never declared')
-        for job in ('plan', 'sign'):  # and none is declared in vain
+        for job in ('plan', 'sign', 'gwsign'):  # and none is declared in vain
             self.assertEqual(declared[job], {out for j, out in used if j == job}, job)
 
     def test_the_publish_job_takes_its_serial_from_the_plan_and_runs_the_publisher_in_the_stage(self):
@@ -3012,10 +3014,11 @@ class Workflow(unittest.TestCase):
         return '\n'.join(line[10:] for line in body[1].splitlines())
 
     def test_tag_and_publish_both_need_kit_and_kit_needs_the_signatures_not_the_tag(self):
-        self.assertIn('    needs: [plan, smoke, sign]\n', self.JOBS['kit'])
+        self.assertIn('    needs: [plan, smoke, sign, gwsign]\n', self.JOBS['kit'])
         self.assertIn('    needs: [plan, smoke, sign, kit]\n', self.JOBS['tag'])
         self.assertIn('    needs: [plan, smoke, sign, kit, tag]\n', self.JOBS['publish'])
-        self.assertLess(self.TEXT.index('\n  sign:\n'), self.TEXT.index('\n  kit:\n'))
+        self.assertLess(self.TEXT.index('\n  sign:\n'), self.TEXT.index('\n  gwsign:\n'))
+        self.assertLess(self.TEXT.index('\n  gwsign:\n'), self.TEXT.index('\n  kit:\n'))
         self.assertLess(self.TEXT.index('\n  kit:\n'), self.TEXT.index('\n  tag:\n'))
 
     def test_the_kit_job_holds_the_read_key_and_the_upload_key_and_nothing_else_and_leaves_nothing_behind(self):
@@ -3049,9 +3052,13 @@ class Workflow(unittest.TestCase):
     def test_the_kit_job_judges_the_gateway_pair_before_the_bundle_and_uploads_it_after(self):
         body = self.run_body('kit')
         calls = [line.strip() for line in body.splitlines() if line.strip().startswith('python3 bin/fleet-kit-upload.py ')]
-        self.assertEqual(calls, ['python3 bin/fleet-kit-upload.py gateway --check --owner-pub "$d/owner.pub"',
+        self.assertEqual(calls, ['python3 bin/fleet-kit-upload.py gateway --check --owner-pub "$d/owner.pub" ${args[@]+"${args[@]}"}',
                                  'python3 bin/fleet-kit-upload.py bundle "$d/install" --owner-pub "$d/owner.pub"',
-                                 'python3 bin/fleet-kit-upload.py gateway --owner-pub "$d/owner.pub"'])
+                                 'python3 bin/fleet-kit-upload.py gateway --owner-pub "$d/owner.pub" ${args[@]+"${args[@]}"}'])
+        # the signature gwsign made (AF08, TEST series only) is handed to both gateway calls, never to the bundle; none made, none passed
+        self.assertIn('args=()\nif [ -n "$GATEWAY_SIG" ]; then\n  printf \'%s\' "$GATEWAY_SIG" | base64 -d > "$d/gateway.sig"\n'
+                      '  args=(--sig "$d/gateway.sig")\nfi\n', body)
+        self.assertEqual(body.count('--sig '), 1)
         check, bundle, upload = (body.index(c) for c in calls)
         self.assertLess(check, bundle)
         self.assertLess(bundle, upload)
@@ -3061,16 +3068,20 @@ class Workflow(unittest.TestCase):
         self.assertEqual(body.count('set -eu'), 1)   # a refused check stops the job before the bundle is stored
         kit = self.JOBS['kit']
         self.assertEqual(re.findall(r'^          (\w+): ', kit, re.M),
-                         ['INSTALL_B64', 'INSTALL_SHA', 'INSTALL_SIG', 'PUB', 'OWNER_PIN_SHA256', 'KIT_HOST', 'FLEET_READ', 'KIT_UPLOAD_KEY'])
+                         ['INSTALL_B64', 'INSTALL_SHA', 'INSTALL_SIG', 'PUB', 'GATEWAY_SIG', 'OWNER_PIN_SHA256', 'KIT_HOST', 'FLEET_READ',
+                          'KIT_UPLOAD_KEY'])
+        self.assertIn('GATEWAY_SIG: ${{ needs.gwsign.outputs.gateway_sig }}', kit)
         self.assertEqual(re.findall(r'secrets\.(\w+)', kit), ['FLEET_READ', 'KIT_UPLOAD_KEY'])
-        self.assertIn('    needs: [plan, smoke, sign]\n    if: github.ref == \'refs/heads/release\'\n    environment: release\n', kit)
+        self.assertIn('    needs: [plan, smoke, sign, gwsign]\n    if: github.ref == \'refs/heads/release\'\n    environment: release\n', kit)
 
     def test_the_gateway_record_never_enters_the_folder_the_plan_publishes(self):
         for name in fp.FIXED + fp.KIT_FILES + fp.DATA:
             self.assertNotIn('gateway', name)
         for job in ('plan', 'sign', 'tag', 'publish'):
             self.assertNotIn('gateway', self.JOBS[job], job)
+        self.assertEqual(self.declared_outputs('gwsign'), {'gateway_sig': ('sign', 'gateway_sig')})  # the signature only, never a byte of the record
         self.assertIn('gateway --owner-pub', self.JOBS['kit'])   # the kit job reads the pair itself, at the release tip
+        self.assertEqual((self.written_outputs('gwsign', 'fetch'), self.written_outputs('gwsign', 'sign')), ({'live'}, {'gateway_sig'}))
 
     def test_the_floor_job_is_only_the_floor_mode_in_the_release_environment_with_the_upload_key(self):
         floor = self.JOBS['floor']
@@ -3096,6 +3107,68 @@ class Workflow(unittest.TestCase):
         self.assertIn("(inputs.mode == 'pubkey' || (needs.plan.result == 'success' && needs.smoke.result == 'success'))", self.JOBS['sign'])
         for bad in ('upload-artifact', 'GITHUB_STEP_SUMMARY', 'set -x', 'FLEET_READ', 'gh '):
             self.assertNotIn(bad, floor, bad)
+
+    # the gateway signature (AF08): CI signs gateway.json for the TEST series only (the owner's answer of 2026-10-21 to D311, option 5B)
+
+    def test_the_gwsign_job_is_two_steps_in_the_release_environment_with_no_token_no_checkout_and_no_action(self):
+        job = self.JOBS['gwsign']
+        head, body = job.split('    steps:\n', 1)
+        self.assertEqual(head, "    needs: [plan, sign]\n    if: github.ref == 'refs/heads/release' && inputs.mode == 'sign'\n"
+                               "    environment: release\n    runs-on: ubuntu-24.04\n    timeout-minutes: 10\n    permissions: {}\n"
+                               "    outputs:\n      gateway_sig: ${{ steps.sign.outputs.gateway_sig }}\n")
+        self.assertEqual([re.match(r'      - id: (\w+)\n', step)[1] for step in self.steps_of(job)], ['fetch', 'sign'])
+        for bad in ('uses:', 'checkout', 'github.token', 'GH_TOKEN', 'upload-artifact', 'download-artifact', 'actions/cache', 'GITHUB_STEP_SUMMARY',
+                    'GITHUB_ENV', 'set -x', '::add-mask', 'curl ', ' gh ', 'vars.', 'install-stage', 'fleet-install-publish'):
+            self.assertNotIn(bad, job, bad)
+        self.assertNotIn('inputs.', body)   # the dispatch inputs reach no step
+        self.assertEqual(re.findall(r'(?m)^        run: \|$', job), ['        run: |'] * 2)
+
+    def test_the_two_secrets_never_share_a_step_and_the_signing_step_holds_no_git_ssh_python_or_jq(self):
+        fetch, sign = self.step_text('gwsign', 'fetch'), self.step_text('gwsign', 'sign')
+        self.assertEqual(re.findall(r'(?m)^          (\w+): ', fetch), ['FLEET_READ', 'TIP'])
+        self.assertEqual(re.findall(r'(?m)^          (\w+): ', sign), ['SIGN_KEY'])
+        self.assertEqual(re.findall(r'secrets\.(\w+)', fetch), ['FLEET_READ'])
+        self.assertEqual(re.findall(r'secrets\.(\w+)', sign), ['SIGN_KEY'])
+        self.assertNotIn('SIGN_KEY', fetch)
+        self.assertNotIn('FLEET_READ', sign)
+        self.assertNotIn('TIP', sign)
+        code = '\n'.join(l for l in sign.splitlines() if not l.lstrip().startswith('#'))
+        for tool in (r'git', r'ssh(?!-keygen)', r'scp', r'sftp', r'python3?', r'jq', r'curl', r'wget', r'nc', r'gh', r'openssl'):
+            self.assertNotRegex(code, rf'(?<![\w/-])(?:/usr/bin/)?{tool}(?![\w-])' if tool != r'ssh(?!-keygen)' else r'(?<![\w-])ssh(?![\w-])', tool)
+        self.assertNotIn('GIT_SSH_COMMAND', sign)
+        self.assertIn('/usr/bin/ssh-keygen -q -Y sign', sign)   # ssh-keygen is the one tool, and it never talks to a network
+
+    def test_the_fetch_step_refuses_a_moved_tip_judges_the_pair_and_signs_nothing_outside_the_test_series(self):
+        fetch = self.step_text('gwsign', 'fetch')
+        self.assertIn('TIP: ${{ needs.plan.outputs.tip }}', fetch)
+        self.assertEqual(self.declared_outputs('plan')['tip'], ('plan', 'tip'))   # the tip the plan judged, handed on
+        for need in ('/dev/shm/gwfetch.', 'umask 077', "trap 'shred -u", 'StrictHostKeyChecking=yes', 'IdentitiesOnly=yes', 'GlobalKnownHostsFile=/dev/null',
+                     "REFUSED tip-moved", "REFUSED gateway tip", "REFUSED gateway", "SKIP gwsign not-live", "SKIP gwsign series",
+                     'ls-tree "$TIP" -- fleet/core/gateway.json.sig', "'100644 blob '*", '-le 65536'):
+            self.assertIn(need, fetch, need)
+        order = ["trap 'shred -u", '"$FLEET_READ" > "$d/key"', 'fetch -q --no-tags --depth 1', 'REFUSED tip-moved', 'if [ -z "$sig" ]',
+                 'case "$rec" in', 'if [ "$SERIES" != test ]', 'cat-file blob "$TIP:fleet/core/gateway.json"']
+        self.assertEqual([fetch.index(x) for x in order], sorted(fetch.index(x) for x in order))
+        self.assertNotIn('--force', fetch)
+        self.assertNotIn('+refs/tags', fetch)
+        self.assertEqual(len(re.findall(r'cat-file blob', fetch)), 1)   # the record is read once, after every check; nothing prints it
+        self.assertNotRegex(fetch, r'(?m)^\s*(?:cat|head|tail|xxd|od|base64)\b')
+
+    def test_the_sign_step_runs_in_the_test_series_only_checks_the_key_and_prints_a_size_and_a_hash_at_most(self):
+        sign = self.step_text('gwsign', 'sign')
+        self.assertIn("        if: steps.fetch.outputs.live == 'yes'\n", sign)
+        for need in ('[ "$SERIES" = test ] || { echo \'REFUSED series\'; exit 1; }', '/dev/shm/gwsign.', 'umask 077', 'set -euo pipefail', "trap 'shred -u",
+                     "grep -Eq '^SHA256:[A-Za-z0-9+/]{43}$'", '[ "$fp" = "$KEY_SHA256" ] ||', 'REFUSED key-not-set',
+                     f'-Y sign -f "$d/key" -n {fp.PIN_NS} "$d/gateway.json"', f'-Y verify -f "$d/allowed" -I owner -n {fp.PIN_NS}',
+                     f'namespaces="{fp.PIN_NS}"', 'REFUSED changed gateway.json', "printf 'gateway_sig=%s\\n' \"$(base64 -w0"):
+            self.assertIn(need, sign, need)
+        self.assertNotIn(fp.NS + '"', sign)   # the install namespace is never the gateway record's
+        order = ['[ "$SERIES" = test ]', '"$d/key"', '[ "$fp" = "$KEY_SHA256" ]', '-Y sign', '-Y verify', 'REFUSED changed', 'gateway_sig=']
+        self.assertEqual([sign.index(x) for x in order], sorted(sign.index(x) for x in order))
+        echoed = [l.strip() for l in sign.splitlines() if l.strip().startswith('echo ') and '$' in l]
+        self.assertEqual(echoed, ['echo "signed gateway.json: $n bytes, sha256 $h, key $fp"'])   # the one line with a value: a size, a hash, the key's fingerprint
+        self.assertNotRegex(sign, r'(?m)^\s*(?:cat|head|tail|xxd|od)\b')   # nothing prints the record
+        self.assertIn('rm -rf "$d" "$RUNNER_TEMP/gwsign"', sign)   # the record's copy goes with the key
 
     # the boot smoke before the signature (AF34)
 
@@ -3286,6 +3359,7 @@ class Workflow(unittest.TestCase):
     echo "SIG=$(cat "$d/install/install.json.sig")"
     echo "PUBFILE=$(cat "$d/owner.pub")"
     echo "KNOWN=$(cat "$d/known_hosts")"
+    echo "GWSIG=$(cat "$d/gateway.sig" 2>/dev/null)"
   fi
 } >> "$STUB_LOG"
 [ "$3" = --check ] && [ -n "$STUB_FAIL_CHECK" ] && exit 1
@@ -3310,7 +3384,7 @@ class Workflow(unittest.TestCase):
     def kit_env(self, **over) -> dict:
         install = b'{"kind": "install"}\n'
         env = {'INSTALL_B64': base64.b64encode(install).decode(), 'INSTALL_SHA': sha(install), 'INSTALL_SIG': base64.b64encode(b'SIGBYTES').decode(),
-               'PUB': 'ssh-ed25519 PUBLINE', 'OWNER_PIN_SHA256': 'SHA256:x', 'KIT_HOST': 'kit.example.org',
+               'PUB': 'ssh-ed25519 PUBLINE', 'GATEWAY_SIG': '', 'OWNER_PIN_SHA256': 'SHA256:x', 'KIT_HOST': 'kit.example.org',
                'FLEET_READ': 'THROWAWAY-READ-KEY', 'KIT_UPLOAD_KEY': 'THROWAWAY-UPLOAD-KEY'}
         env.update(over)
         return env
@@ -3329,6 +3403,19 @@ class Workflow(unittest.TestCase):
                          'INSTALL={"kind": "install"}', 'SIG=SIGBYTES', 'PUBFILE=ssh-ed25519 PUBLINE', 'KNOWN=github.com ssh-ed25519 AAAA'):
                 self.assertEqual(log.count(want + '\n'), 3, want)
             self.assertEqual(list(shm.iterdir()), [])   # the key and the files are gone on exit
+            self.assertEqual(log.count('GWSIG=\n'), 3)   # no signature handed on: no file, and no --sig on either gateway call
+
+    def test_the_kit_step_passes_the_gateway_signature_to_both_gateway_calls_and_to_nothing_else(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            done, log, shm = self.run_block(Path(tmp), 'kit', self.kit_env(GATEWAY_SIG=base64.b64encode(b'GWSIGBYTES').decode()))
+            self.assertEqual((done.returncode, done.stdout + done.stderr), (0, ''), done.stderr)
+            calls = [l for l in log.splitlines() if l.startswith('ARGS ')]
+            self.assertEqual(len(calls), 3)
+            self.assertRegex(calls[0], r'^ARGS bin/fleet-kit-upload\.py gateway --check --owner-pub \S+/owner\.pub --sig \S+/gateway\.sig$')
+            self.assertRegex(calls[1], r'^ARGS bin/fleet-kit-upload\.py bundle \S+/install --owner-pub \S+/owner\.pub$')   # never the bundle
+            self.assertRegex(calls[2], r'^ARGS bin/fleet-kit-upload\.py gateway --owner-pub \S+/owner\.pub --sig \S+/gateway\.sig$')
+            self.assertEqual(log.count('GWSIG=GWSIGBYTES\n'), 3)   # the file holds the decoded signature, as the job made it
+            self.assertEqual(list(shm.iterdir()), [])
 
     def test_the_kit_step_stops_and_cleans_up_when_the_bundle_is_refused_or_the_manifest_is_not_the_planned_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3511,7 +3598,7 @@ class Workflow(unittest.TestCase):
             self.assertIn("if: github.ref == 'refs/heads/release' && inputs.mode == 'untag'\n", self.JOBS[name].split('steps:')[0], name)
             self.assertNotIn('timeout-minutes: 60', self.JOBS[name])
         self.assertIn("group: ${{ inputs.mode == 'floor' && 'install-floor' || 'install' }}", self.TEXT)  # untag stays in `install`
-        for name in ('plan', 'fixture', 'smoke', 'sign', 'kit', 'tag', 'publish', 'floor-approve', 'floor'):
+        for name in ('plan', 'fixture', 'smoke', 'sign', 'gwsign', 'kit', 'tag', 'publish', 'floor-approve', 'floor'):
             self.assertNotIn("inputs.mode == 'untag'", self.JOBS[name], name)  # no other mode's job runs in an untag run
         self.assertLess(self.TEXT.index('\n  floor:\n'), self.TEXT.index('\n  untag-check:\n'))
         self.assertLess(self.TEXT.index('\n  untag-check:\n'), self.TEXT.index('\n  untag-approve:\n'))

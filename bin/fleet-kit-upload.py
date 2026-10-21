@@ -21,6 +21,13 @@ a serial 0 with an address and an unsigned record with a null address and a seri
 fleet repository holds it: every field, its type, no other key, a plain `0`, a regular file. A signed record with a null address and
 a serial of 1 or more is judged live, as it was before: the address is not read here.
 
+`gateway --sig FILE`: the signature is taken from FILE (a pair the test series' CI signed, ledger D311 as the owner answered it on
+2026-10-21: the kit host's copy is signed under the baked key by CI, for TEST releases only) in place of the tip's own
+gateway.json.sig, which is then not read at all, so a good signature at the tip never rescues a bad FILE, and no signature file at
+the tip is not a refusal. Every other check is the same: FILE must be 1 to MAX_GATEWAY_SIG bytes and verify under the owner key in
+the pin's namespace over the very record at the tip (else `REFUSED sig`), and the record must be a live gateway record. Without
+`--sig` nothing changes. The kit job passes it only when the job `gwsign` made one.
+
 `gateway --check`: the same read and the same verdict, no upload and no upload key: `OK gateway-check serial=N`, `SKIP gateway
 not-live` or a refusal. The kit job runs it first, so a bad pair is refused before the bundle, which the host can never delete,
 is stored. The verb `gateway` reads the tip again (a second shallow fetch) and judges again, so a tip that moves in between is
@@ -173,7 +180,7 @@ SHM = '/dev/shm'  # where the key lives for the length of the run
 KEY_PEM = re.compile(r'-----BEGIN PRIVATE KEY-----\n[A-Za-z0-9+/=\n]{1,400}-----END PRIVATE KEY-----\n?', re.ASCII)
 GIT_TIMEOUT, SIGN_TIMEOUT, NET_TIMEOUT = 600, 60, 900
 USAGE_TEXT = ('usage: fleet-kit-upload.py bundle <dir> --owner-pub <path>\n'
-              '       fleet-kit-upload.py gateway [--check] --owner-pub <path>\n'
+              '       fleet-kit-upload.py gateway [--check] --owner-pub <path> [--sig <file>]\n'
               '       fleet-kit-upload.py floor <N>\n')
 
 
@@ -373,14 +380,14 @@ def call(net: Net, signer: Signer, host: str, method: str, path: str, body: byte
 
 # --- the two verbs -------------------------------------------------------------------------------------------------
 
-def read_bounded(path: Path, limit: int) -> bytes:
+def read_bounded(path: Path, limit: int, code: str = 'install') -> bytes:
     try:
         with open(path, 'rb') as f:
             data = f.read(limit + 1)
     except OSError:
-        raise Refused('install') from None
+        raise Refused(code) from None
     if not data or len(data) > limit:
-        raise Refused('install')
+        raise Refused(code)
     return data
 
 
@@ -476,14 +483,19 @@ def is_placeholder(text: bytes, mode: str = '100644') -> bool:
             and all(type(doc[key]) is type(want) and doc[key] == want for key, want in PLACEHOLDER_RECORD.items()))
 
 
-def read_gateway_pair(owner_pub: bytes, environ: dict[str, str], work: Path) -> tuple[bytes, bytes, int] | None:
+def read_gateway_pair(owner_pub: bytes, environ: dict[str, str], work: Path,
+                      sig_file: Path | None = None) -> tuple[bytes, bytes, int] | None:
     """(json, signature, serial) of the live pair at the release tip, once every check has passed; None when no gateway is
-    live: the record is the placeholder and no signature file exists beside it. Every other state is Refused."""
+    live: the record is the placeholder and no signature file exists beside it. Every other state is Refused. With sig_file the
+    signature is that file's (Refused('sig') when it is unreadable, empty or over MAX_GATEWAY_SIG) and the tip's own signature file
+    is not read: the record is still the tip's, and every check below is the same."""
     env, repo, log = git_env(environ), work / 'fleet', work / 'fetch.log'
     repo.mkdir()
     git_run(repo, env, 'init', '-q', log=log)
     fetch_fleet(environ['FLEET_REPO'], repo, env, log, tip=True)
-    record, signature = tip_blob(repo, env, log, GATEWAY_PATH), tip_blob(repo, env, log, GATEWAY_SIG_PATH)
+    record = tip_blob(repo, env, log, GATEWAY_PATH)
+    signature = (tip_blob(repo, env, log, GATEWAY_SIG_PATH) if sig_file is None
+                 else ('100644', read_bounded(sig_file, MAX_GATEWAY_SIG, 'sig')))
     if record is None or not 0 < len(record[1]) <= MAX_GATEWAY_JSON:  # no record, or one the host would not take
         raise Refused('gateway')
     mode, text = record
@@ -507,16 +519,17 @@ def read_gateway_pair(owner_pub: bytes, environ: dict[str, str], work: Path) -> 
     return text, sig, serial
 
 
-def check_gateway(owner_pub: bytes, environ: dict[str, str], work: Path) -> str:
+def check_gateway(owner_pub: bytes, environ: dict[str, str], work: Path, sig_file: Path | None = None) -> str:
     """The judgement of upload_gateway and nothing else: it makes no request and holds no upload key."""
     fp.check_kit_host(environ.get('KIT_HOST', ''))
-    pair = read_gateway_pair(owner_pub, environ, work)
+    pair = read_gateway_pair(owner_pub, environ, work, sig_file)
     return NOT_LIVE if pair is None else f'OK gateway-check serial={pair[2]}'
 
 
-def upload_gateway(owner_pub: bytes, environ: dict[str, str], net: Net, signer: Signer, work: Path) -> str:
+def upload_gateway(owner_pub: bytes, environ: dict[str, str], net: Net, signer: Signer, work: Path,
+                   sig_file: Path | None = None) -> str:
     host = fp.check_kit_host(environ.get('KIT_HOST', ''))
-    pair = read_gateway_pair(owner_pub, environ, work)
+    pair = read_gateway_pair(owner_pub, environ, work, sig_file)
     if pair is None:
         return NOT_LIVE
     text, sig, serial = pair
@@ -540,13 +553,17 @@ def upload_floor(floor: int, environ: dict[str, str], net: Net, signer: Signer) 
 
 def parse_args(argv: list[str]) -> tuple[str, Path | int | None, str] | None:
     """(verb, dir or floor or None, owner-pub path) from `bundle <dir> --owner-pub P`, `gateway --owner-pub P`,
-    `gateway --check --owner-pub P` (verb `gateway-check`) or `floor N` (N canonical decimal, at most MAX_FLOOR), or None."""
-    if len(argv) == 5 and argv[1] == 'bundle' and argv[3] == '--owner-pub':
+    `gateway --check --owner-pub P` (verb `gateway-check`) or `floor N` (N canonical decimal, at most MAX_FLOOR), or None.
+    Either gateway form may end in `--sig FILE`; the second slot then holds Path(FILE) (it is None without it)."""
+    sig = None
+    if len(argv) in (6, 7) and argv[1] == 'gateway' and argv[-2] == '--sig' and argv[-1]:
+        sig, argv = Path(argv[-1]), argv[:-2]
+    if len(argv) == 5 and argv[1] == 'bundle' and argv[3] == '--owner-pub' and sig is None:
         return 'bundle', Path(argv[2]), argv[4]
     if len(argv) == 4 and argv[1] == 'gateway' and argv[2] == '--owner-pub':
-        return 'gateway', None, argv[3]
+        return 'gateway', sig, argv[3]
     if len(argv) == 5 and argv[1] == 'gateway' and argv[2] == '--check' and argv[3] == '--owner-pub':
-        return 'gateway-check', None, argv[4]
+        return 'gateway-check', sig, argv[4]
     if len(argv) == 3 and argv[1] == 'floor' and FLOOR_RX.fullmatch(argv[2]) and int(argv[2]) <= MAX_FLOOR:
         return 'floor', int(argv[2]), ''
     return None
@@ -579,12 +596,12 @@ def main(argv: list[str], environ: dict[str, str], net: Net | None = None) -> in
             owner_pub = fp.owner_key(pub_path, environ['OWNER_PIN_SHA256'], fp.run_argv)
             work = Path(tempfile.mkdtemp(prefix='kit-', dir=environ['RUNNER_TEMP']))
             if verb == 'gateway-check':  # no signer, no net: this verb cannot make a request
-                line = check_gateway(owner_pub, environ, work)
+                line = check_gateway(owner_pub, environ, work, folder)
             else:
                 signer = Signer(environ['KIT_UPLOAD_KEY'])
                 net = net or Real()
                 line = (upload_bundle(folder, owner_pub, environ, net, signer, work) if verb == 'bundle'
-                        else upload_gateway(owner_pub, environ, net, signer, work))
+                        else upload_gateway(owner_pub, environ, net, signer, work, folder))
     except Refused as why:
         sys.stderr.write(f'fleet-kit-upload: refused {why.code.split()[0]}\n')
         print(f'REFUSED {why.code}')
