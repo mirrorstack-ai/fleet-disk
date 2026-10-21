@@ -454,5 +454,11 @@ the `KEY_SHA256` constant of `install.yml`, and the bootstrap digests are `.gith
 main's digest (`digest-mismatch` otherwise, even when the notes and the asset agree with each other) and the notes must name
 main's key (`key-mismatch`); the run's own `bootstrap sha256` and `key` lines must be main's too. A serial with no pin stops
 at `no-main-pin` before anything is read: add the pin (from the signed `install.json` of the fleet release folder) by a reviewed
-change first. The leg costs hosted-runner minutes on every dispatch (the macOS leg at the macOS multiplier), so dispatch it
+change first.
+Checking a release therefore takes a second, reviewed step per serial: a pin PR that copies the bootstrap sha256 from the signed
+`install.json` into `smoke-real-pins.json` (the plan said to stop and report when no main-side digest source exists; this file is
+that source, so the plan's rule is waived for it only if the coordinator agrees), then one dispatch from `main`. The line the
+release's notes carry must also equal, byte for byte, what `main`'s `bin/fleet-install-publish.py` `check_line` renders for that
+serial, OS, repository, digest and min serial, so a line with anything added is never run. A dispatch from any other branch fails
+in the `guard` job (red), it never skips green. The leg costs hosted-runner minutes on every dispatch (the macOS leg at the macOS multiplier), so dispatch it
 once per published release.

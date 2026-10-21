@@ -17,8 +17,17 @@ permissions:
 concurrency:
   group: smoke-real
 jobs:
+  guard:      # a dispatch from another branch FAILS here, red, instead of skipping `real` and showing green with no case run
+    name: from main only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - env:
+          REF: ${{ github.ref }}
+        run: |
+          [ "$REF" = refs/heads/main ] || { echo "::error::smoke-real runs only from main (this dispatch is from $REF): nothing was checked"; exit 1; }
   real:
-    if: github.ref == 'refs/heads/main'
+    needs: guard
     name: real ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25

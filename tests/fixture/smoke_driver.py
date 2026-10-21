@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import platform
@@ -135,10 +136,10 @@ def run_case(c: dict, base: str, fx: serve.Fixture, fp: str, mach: str | None, k
         argv = [POWERSHELL, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', run, *given] if c['os'] == 'ps1' else ['sh', run, *given]
         fx.set_case(c['id'])
         try:
-            done = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=1500)
-            out, rc = done.stdout.decode('utf-8', 'replace'), done.returncode
+            done = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=RUN_TIMEOUT)
+            out, rc, hung = done.stdout.decode('utf-8', 'replace'), done.returncode, False
         except subprocess.TimeoutExpired:
-            out, rc = '', -1
+            out, rc, hung = '', -1, True
         left = [n for n in os.listdir(tmp) if LEFT.match(n)]
     with open(run, 'rb') as f:
         sha = hashlib.sha256(f.read()).hexdigest()
@@ -207,6 +208,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 MAIN_PINS = os.path.join(ROOT, '.github', 'smoke-real-pins.json')  # {"<serial>": {"ps1": <sha256>, "sh": <sha256>}}, a reviewed change per serial
 MAIN_KEY_FILE = os.path.join(ROOT, '.github', 'workflows', 'install.yml')  # its constant KEY_SHA256 is the owner key this repo trusts
 REAL_REPO = 'mirrorstack-ai/fleet-disk'
+RUN_TIMEOUT = 900  # seconds for the line; smoke-real.yml's job limit (25 min) must outlast it plus the plan, or a hung line is killed unjudged
 OS_BOOT = {'win': 'ps1', 'mac': 'sh', 'ubuntu': 'sh'}  # the bootstrap each OS's line runs; twin: fleet-install-publish.OS_BOOT
 KEY_CONST = re.compile(r'(?m)^  KEY_SHA256: (SHA256:[A-Za-z0-9+/]{43})[ \t]*$')
 HEX64 = re.compile(r'[0-9a-f]{64}')
@@ -277,14 +279,33 @@ def parse_notes(body: str, os_name: str) -> tuple[str, str, str]:
     return keys[0][4:], heads[0][1], lines[heads[0][0] + 2]
 
 
-def check_shape(line: str, repo: str, serial: int, kind: str, sha: str, min_serial: int | None) -> int:
+PUBLISHER = os.path.join(ROOT, 'bin', 'fleet-install-publish.py')  # main's code: it renders the line a release's notes must carry
+
+
+def expected_line(os_name: str, repo: str, serial: int, sha: str, min_serial: int) -> str:
+    """The check line main's publisher would write for this release: the one text a release's line may be (a test seam)."""
+    spec = importlib.util.spec_from_file_location('fleet_install_publish_main', PUBLISHER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.check_line(os_name, repo, serial, sha, min_serial)
+
+
+def check_shape(line: str, repo: str, serial: int, kind: str, sha: str, min_serial: int | None, os_name: str | None = None) -> int:
     """The line must be the one for this release: one line, this repository's asset URL for this serial, the digest main pins, and
-    this serial with a --min-serial (the one asked for, if any). Returns the line's min serial."""
+    this serial with a --min-serial (the one asked for, if any). With os_name, it must also EQUAL the line main's publisher renders for
+    those slots (a line that holds the right digest and URL plus another statement is not that line). Returns the line's min serial."""
     url = f'https://github.com/{repo}/releases/download/install-{serial}/bootstrap.{kind}'
     flags = (r'-Serial {s} -MinSerial ([0-9]+)(?![0-9])' if kind == 'ps1' else r'--serial {s} --min-serial ([0-9]+)(?![0-9])').format(s=serial)
     m = re.search(flags, line)
     if '\n' in line or not line.strip() or f"'{url}'" not in line or sha not in line or not m or (min_serial is not None and int(m[1]) != min_serial):
         raise Refused('line', f'the check line is not the one for install-{serial} ({url}) with the pinned digest. Nothing was run.')
+    if os_name is not None:
+        try:
+            same = line == expected_line(os_name, repo, serial, sha, int(m[1]))
+        except Exception:  # main's publisher unreadable or changed shape: a line that cannot be compared is not run
+            same = False
+        if not same:
+            raise Refused('line', f'the check line is not the text the publisher renders for install-{serial} on {os_name}. Nothing was run.')
     return int(m[1])
 
 
@@ -318,7 +339,7 @@ def real_plan(a, os_name: str) -> tuple[str, str, str, str, int]:
             got = hashlib.sha256(f.read()).hexdigest()
     if n_sha != sha or got != sha:  # the notes and the asset may agree with each other: only main's pin counts
         raise Refused('digest-mismatch', f'the release\'s bootstrap is not the one main pins for serial {serial}. Nothing was run.')
-    check_shape(line, a.repo, serial, kind, sha, a.min_serial)
+    check_shape(line, a.repo, serial, kind, sha, a.min_serial, os_name)
     return line, kind, sha, key, serial
 
 
@@ -372,14 +393,17 @@ def run_real(line: str, kind: str, os_name: str, sha: str, fp: str, serial: int,
         before, home_before = snapshot(roots), set(os.listdir(home))  # the home as made: the folders a runner's tools expect
         argv = [POWERSHELL, '-NoProfile', '-Command', line] if os_name == 'win' else ['sh', '-c', line]
         try:
-            done = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=1500)
-            out, rc = done.stdout.decode('utf-8', 'replace'), done.returncode
+            done = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=RUN_TIMEOUT)
+            out, rc, hung = done.stdout.decode('utf-8', 'replace'), done.returncode, False
         except subprocess.TimeoutExpired:
-            out, rc = '', -1
+            out, rc, hung = '', -1, True
         outside = sorted(snapshot(roots) - before)
         left = os.listdir(tmp)
         print(f'made in the throwaway home: {sorted(set(os.listdir(home)) - home_before)}')
-    return judge_real(kind, out, rc, sha, fp, serial, mach, kvm, left, outside), out
+    bad = judge_real(kind, out, rc, sha, fp, serial, mach, kvm, left, outside)
+    if hung:  # a hung line is never a pass, whatever else it left
+        bad.insert(0, f'the line did not finish in {RUN_TIMEOUT} s')
+    return bad, out
 
 
 def cmd_real(a) -> int:

