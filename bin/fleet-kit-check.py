@@ -41,7 +41,12 @@ plus the `openssl` binary (3.x: Ed25519 with -rawin) for the throwaway admin key
                       within 120 s; then a 2xx-expecting admin call that meets exactly the Worker's fixed 404 is sent
                       again with a fresh signature, at most 3 times, ~2 s apart, and the summary prints the count. A key
                       that never propagates still refuses; calls that expect a refusal, the public requests and the
-                      front rejects get one try.
+                      front rejects get one try. Two measurements ride along (PY21): the cut vector (a 1 MiB object read
+                      in 64 KiB chunks, cut after the 3rd and after the 4th, each cut must give its download back) and
+                      rows read per failed decision (the Gate's rowsRead from /_k/state before and after the budget loop
+                      and `--rows-failures N` more rejects, default 200: prints rows_per_failure=<n> with the loop's and
+                      the flood's own figures, or rows_read=unavailable on a Worker without the counter (or whose counter
+                      did not move), or rows_read=reset if the number fell between reads).
   probe URL           the hostile probe against PRODUCTION: at most 5 well-formed failures, every answer byte-identical
                       to the first apart from date, cf-ray and the token in Cloudflare's own cf-nel report-to (below),
                       one of them with Accept-Encoding: gzip. It first waits out version propagation (run 38180769445:
@@ -124,6 +129,10 @@ MUST_REPORT_OFF = ('script-settings', 'worker')
 # echoed both as null; its schema makes them nullable there only). Not off, not a report: only not a refusal.
 STORES_OFF_AS_NULL = 'script-settings'
 FAILURE_BUDGET_PER_SOURCE = 30          # kit/gate-core.js LIMITS.perSource
+ROWS_FAILURES = 200                     # reject-shaped decisions the rows-read measurement adds (PY21; --rows-failures)
+CUT_BYTES = 1024 * 1024                 # the cut vector's object (PY21)
+CUT_CHUNK = 64 * 1024                   # ... read by a reader of this chunk size
+CUT_AFTER = (3, 4)                      # ... cut after the 3rd chunk, then after the 4th
 PROBE_MAX_FAILURES = 5                  # the hostile probe may spend at most this much of production's hourly budget
 # Worker sources that ship (everything else in kit/ is a test or a test stand-in).
 SKIP_NAME = re.compile(r'(\.test\.m?js|\.test-util\.m?js|^run-tests\.m?js|^fake-storage\.m?js)$')
@@ -1005,19 +1014,37 @@ def det_bytes(label: str, n: int) -> bytes:
     return hashlib.shake_256(('fleet-kit-staging:%s' % label).encode()).digest(n)
 
 
+def rows_read_of(state: dict) -> int | None:
+    """The Gate's rows-read counter from a /_k/state reply, or None when this kit does not report one (a Worker built
+    before PY21, or a value that is not a non-negative whole number)."""
+    v = state.get('rowsRead')
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+
+
 def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: float = 5.0, small_bytes: int = 65536,
+               rows_failures: int = ROWS_FAILURES,
                short_life_ms: int = 12000, ready_streak: int = READY_STREAK, ready_spacing: float = READY_SPACING,
                ready_timeout: float = READY_TIMEOUT, retry_max: int = RETRY_MAX, retry_wait: float = RETRY_WAIT,
                sleep=time.sleep, log=say) -> list[str]:
     """The staging replay. Waits out version propagation first (wait_ready) and sends a 2xx-expecting admin call again
     on the Worker's fixed 404 (ok_call, at most retry_max times, counted in the summary); see the Version propagation
-    note above (run 38140164568 attempts 1 and 2)."""
+    note above (run 38140164568 attempts 1 and 2).
+
+    Rows read per failed decision (G-AUD-KIT-WORKER-1b): the Gate counts the rows its decisions read and /_k/state shows the
+    number. The replay reads it before the budget loop, makes the loop's own failures plus `rows_failures` more reject-shaped
+    requests (the source is past its budget by then, so those are the Gate's flood path: the 429), reads it again and prints
+    rows_per_failure. A third read, between the loop and the flood, splits the figure: rows per decision of the loop (its 404s
+    and the 429 that ends them) and per 429 of the flood. A kit that does not report the number prints rows_read=unavailable
+    (no failure, no flood); so does a counter that did not move over the decisions (a figure of 0.0 would read as a pass); a
+    second read below the first prints rows_read=reset (the Gate was evicted between them)."""
     s1, s2, s3, s4, s5, gser = (S_BASE + i for i in (1, 2, 3, 4, 5, 1))
+    s6 = S_BASE + 6                                    # the cut vector's object
     small = det_bytes('s1', small_bytes)
     other = det_bytes('s5', small_bytes)
     big = det_bytes('s2', big_mib * 1024 * 1024)
     wrong = det_bytes('wrong', small_bytes)           # same length as `small`, other bytes
     gjson, gsig = det_bytes('gateway.json', 200), det_bytes('gateway.json.sig', 64)
+    cutobj = det_bytes('s6', CUT_BYTES)
     refs: list[str] = []
     seen404: list[tuple[str, Resp]] = []
     fails = 0                                          # well-formed failures spent at the gate, as the replay counts them
@@ -1074,7 +1101,8 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
         offset = state['now'] - int(time.time() * 1000)
 
         # -- uploads (upload role) ------------------------------------------------------------------------------------
-        for label, serial, data in (('upload small', s1, small), ('upload big', s2, big), ('upload other', s5, other)):
+        for label, serial, data in (('upload small', s1, small), ('upload big', s2, big), ('upload other', s5, other),
+                                    ('upload cut', s6, cutobj)):
             vector(label)
             d, _ = ok_call(label, lambda serial=serial, data=data: _put_bundle(admin, serial, data))
             if d.get('sha256') != sha256_hex(data) or d.get('size') != len(data):
@@ -1206,6 +1234,22 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
             raise Refused('a cut stream did not give the download back (%d of 2 restored)' % m['a_restored'])
         gate_404('B third download', get_kit(client, s2, 'bundle.tar', code_b))
 
+        vector('cut vector: 1 MiB in 64 KiB chunks, cut after chunk 3 and after chunk 4')
+        code_c, _ = add_invite('invite C', cap=2, lo=s6, hi=s6, life_ms=half_hour)
+        for chunks in CUT_AFTER:
+            cut = get_kit_cut(client, s6, code_c, chunk=CUT_CHUNK, chunks=chunks)
+            if cut != 200:
+                raise Refused('cut vector, after chunk %d: status %d, expected 200' % (chunks, cut))
+            sleep(cut_wait)
+        m['cv_cuts'], m['cv_restored'] = len(CUT_AFTER), 0
+        for i in (1, 2):                                                      # cap 2: both fit again only if each cut was released
+            r = get_kit(client, s6, 'bundle.tar', code_c)
+            if r.status == 200 and r.body == cutobj:
+                m['cv_restored'] += 1
+        if m['cv_restored'] != len(CUT_AFTER):
+            raise Refused('cut vector: a cut stream did not give the download back (%d of %d restored)'
+                          % (m['cv_restored'], len(CUT_AFTER)))
+
         vector('expiry, after')
         late = (short_life_ms + 2500) / 1000 - (time.monotonic() - t_e)
         if late > 0:
@@ -1217,6 +1261,9 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
         left = FAILURE_BUDGET_PER_SOURCE - fails
         if left < 1:
             raise Refused('the replay itself spent %d failures' % fails)
+        # The rows-read counter before the loop: nothing but this loop's decisions (and the flood below) moves it until the
+        # second read. A kit built before PY21 has none: no flood, and the summary says so.
+        rows_before = rows_read_of(ok_call('rows read before', lambda: admin.call('gateway', 'GET', '/_k/state'))[0])
         served = 0
         resp429 = None
         while True:
@@ -1233,6 +1280,35 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
             raise Refused('429 came after %d failures, expected after %d' % (fails + served, FAILURE_BUDGET_PER_SOURCE))
         m['b429_after'] = fails + served
         check_fixed_answer('429', resp429, 429, TRY_LATER)
+        if rows_before is None:
+            m['rows'] = 'rows_read=unavailable (this kit does not report rowsRead: a Worker built before PY21)'
+        else:
+            vector('rows read per failed decision')
+            rows_mid = rows_read_of(ok_call('rows read between', lambda: admin.call('gateway', 'GET', '/_k/state'))[0])
+            for i in range(rows_failures):                                   # the source is past its budget: the Gate's 429 path
+                r = get_kit(client, s1, 'bundle.tar', random_code())
+                if r.status != 429:
+                    raise Refused('rows read: flood request #%d: status %d, expected 429' % (i + 1, r.status))
+            decisions = served + 1 + rows_failures                         # the loop's 404s, its 429, then the flood
+            rows_after = rows_read_of(ok_call('rows read after', lambda: admin.call('gateway', 'GET', '/_k/state'))[0])
+            if rows_after is None:
+                m['rows'] = 'rows_read=unavailable (the second read of /_k/state had no rowsRead)'
+            elif rows_after < rows_before:
+                m['rows'] = ('rows_read=reset (%d, then %d: the Gate was evicted between the two reads; no figure, '
+                             'run the replay again)' % (rows_before, rows_after))
+            elif rows_after == rows_before:                                  # decisions > 0 here: a counter that never moves is no 0.0
+                m['rows'] = ('rows_read=unavailable (the counter did not move over %d decisions: this kit does not count '
+                             'the rows its cursors read)' % decisions)
+            else:
+                m['rows'] = ('rows_per_failure=%.1f (%d rows read over %d failed decisions: the loop\'s %d 404s and its 429, '
+                             'then %d more 429s)' % ((rows_after - rows_before) / decisions, rows_after - rows_before,
+                                                      decisions, served, rows_failures))
+                if rows_mid is not None and rows_before <= rows_mid <= rows_after:
+                    m['rows'] += ('; loop %.1f per decision (%d rows over its %d 404s and its 429)'
+                                  % ((rows_mid - rows_before) / (served + 1), rows_mid - rows_before, served))
+                    if rows_failures:
+                        m['rows'] += ('; flood %.1f per 429 (%d rows over %d)'
+                                      % ((rows_after - rows_mid) / rows_failures, rows_after - rows_mid, rows_failures))
         r = get_kit(client, s1, 'gateway.json', code_w)
         check_fixed_answer('valid request while the budget is spent', r, 429, TRY_LATER)
         r = client.request('POST', '/v1/kit/%d/bundle.tar' % s1, [('Authorization', 'FleetInvite ' + code_w)], b'')
@@ -1253,11 +1329,14 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
         *('  ' + line for line in m['edge']),
         '  429 after %d failures' % m['b429_after'],
         '  (a) client cuts: %d, count restored: %d' % (m['a_cuts'], m['a_restored']),
+        '  (a) cut vector: %d KiB in %d KiB chunks, cut after chunk %s, count restored: %d of %d'
+        % (CUT_BYTES // 1024, CUT_CHUNK // 1024, ' and '.join(str(c) for c in CUT_AFTER), m['cv_restored'], m['cv_cuts']),
         '  (b) not measurable over HTTP (needs an isolate restart)',
         '  (c) wrong bytes: %d (R2 checksum), overwrite: %d (Worker head guard; the R2 onlyIf wildcard is not separately '
         'observable), identical re-upload: %d' % (m['c_wrong_bytes'], m['c_overwrite'], m['c_identical']),
         '  (d) not measurable here (needs 100000 requests in a day)',
         '  (g) 404 answers, wall clock ms: p50 %d, max %d (not CPU time)' % (statistics.median(ms), max(ms)),
+        '  (h) ' + m['rows'],
     ]
 
 
@@ -1265,11 +1344,17 @@ def _put_bundle(admin: Admin, serial: int, data: bytes) -> Resp:
     return admin.call('upload', 'PUT', '/_k/file/%d/bundle.tar' % serial, data, stream_digest=sha256_hex(data))
 
 
-def get_kit_cut(client: Client, serial: int, code: str, read_bytes: int = 262144) -> int:
-    """Start a bundle download, read a little, hang up. Returns the status line's status."""
+def get_kit_cut(client: Client, serial: int, code: str, read_bytes: int = 262144, *, chunk: int = 0, chunks: int = 1) -> int:
+    """Start a bundle download, read a little, hang up. Returns the status line's status. With `chunk`, the reader takes
+    `chunks` reads of `chunk` bytes each (the cut vector: 64 KiB, after the 3rd and after the 4th) and hangs up after the last;
+    a stream that ends before that many full chunks is refused (the object is too short for the cut that was asked for)."""
     resp = client.request('GET', '/v1/kit/%d/bundle.tar' % serial, [('Authorization', 'FleetInvite ' + code)], read=False)
     try:
-        if resp.status == 200 and not resp.read(read_bytes):
+        if chunk:
+            for i in range(chunks if resp.status == 200 else 0):
+                if len(resp.read(chunk)) < chunk:
+                    raise Refused('cut: the stream ended inside chunk %d of %d' % (i + 1, chunks))
+        elif resp.status == 200 and not resp.read(read_bytes):
             raise Refused('cut: the stream ended at once')
         return resp.status
     finally:
@@ -1451,6 +1536,8 @@ def main(argv: list[str]) -> int:
     sub = ap.add_subparsers(dest='cmd', required=True)
     for name in ('keys', 'console', 'has-secret', 'settings-off', 'settings', 'replay', 'probe'):
         sub.add_parser(name).add_argument('arg')
+    sub.choices['replay'].add_argument('--rows-failures', type=int, default=ROWS_FAILURES, metavar='N',
+                                       help='reject-shaped decisions for the rows-read measurement (default %d)' % ROWS_FAILURES)
     args = ap.parse_args(argv)
     try:
         if args.cmd == 'keys':
@@ -1485,7 +1572,9 @@ def main(argv: list[str]) -> int:
             if not gate_dir:
                 raise Refused('replay: KIT_GATE_DIR is needed')
             client = Client(args.arg)
-            summary(run_replay(client, Admin(client, gate_dir)))
+            if not 0 <= args.rows_failures <= 100000:
+                raise Refused('replay: --rows-failures must be 0 to 100000')
+            summary(run_replay(client, Admin(client, gate_dir), rows_failures=args.rows_failures))
         elif args.cmd == 'probe':
             summary(run_probe(Client(args.arg)))
     except Refused as e:
