@@ -446,6 +446,14 @@ class Release(unittest.TestCase):
         code, out = self.in_tree(lambda: smoke(Fake(dump=self.D2604), dump_fixture=None))
         self.assertIn('DUMP-DIFFERS: the syscall-filter dump moved against tests/fixture/ubuntu2404-filter-dump.txt', out[-1])
 
+    def test_attribution_is_still_enforced_at_26_04_a_dying_leg_with_no_kernel_record_is_blind_and_with_one_passes(self):
+        f = Fake(records=(), version='systemd 259 (259.5-0ubuntu3.4)')
+        code, out = smoke(f, dump_fixture=DUMP, release='26.04')
+        self.assertEqual(code, 1)
+        self.assertEqual(out[-1], 'FAIL(' + ss.BLIND.format(leg='C') + '; ' + ss.BLIND.format(leg='A') + ')')
+        code, out = smoke(Fake(version='systemd 259 (259.5-0ubuntu3.4)'), dump_fixture=DUMP, release='26.04')   # the control: same machine, records present
+        self.assertEqual((code, out[-1]), (0, 'PASS'))
+
     def test_a_26_04_run_against_the_placeholder_is_dump_unpinned_with_the_legs_run_and_the_dump_printed(self):
         f = Fake()
         code, out = smoke(f, dump_fixture='UNPINNED: placeholder\n', release='26.04')
