@@ -1,3 +1,70 @@
-UNPINNED: placeholder (PZ03c). The first hosted ubuntu-26.04 run of seccomp-smoke fails DUMP-UNPINNED and prints the dump of
-`systemd-analyze syscall-filter @system-service @sandbox` (systemd 259) in its log and in the seccomp-dump-26.04 artifact;
-commit that dump here in place of this text, as ubuntu2404-filter-dump.txt was pinned from run 39247567865.
+@system-service
+    # General system service operations
+    @aio
+    @basic-io
+    @chown
+    @default
+    @file-system
+    @io-event
+    @ipc
+    @keyring
+    @memlock
+    @network-io
+    @process
+    @resources
+    @setuid
+    @signal
+    @sync
+    @timer
+    arm_fadvise64_64
+    capget
+    capset
+    copy_file_range
+    fadvise64
+    fadvise64_64
+    flock
+    get_mempolicy
+    getcpu
+    getpriority
+    ioctl
+    ioprio_get
+    kcmp
+    madvise
+    mremap
+    name_to_handle_at
+    oldolduname
+    olduname
+    personality
+    readahead
+    readdir
+    remap_file_pages
+    sched_get_priority_max
+    sched_get_priority_min
+    sched_getattr
+    sched_getparam
+    sched_getscheduler
+    sched_rr_get_interval
+    sched_rr_get_interval_time64
+    sched_yield
+    sendfile
+    sendfile64
+    setfsgid
+    setfsgid32
+    setfsuid
+    setfsuid32
+    setpgid
+    setsid
+    splice
+    sysinfo
+    tee
+    umask
+    uname
+    userfaultfd
+    vmsplice
+
+@sandbox
+    # Sandbox functionality
+    landlock_add_rule
+    landlock_create_ruleset
+    landlock_restrict_self
+    seccomp
