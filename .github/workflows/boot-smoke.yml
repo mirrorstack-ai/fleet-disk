@@ -85,6 +85,7 @@ jobs:
           - {runner: windows-2022, os: ps1, trust: root-store, must_run: true, experimental: false}
           - {runner: windows-2025, os: ps1, trust: root-store, must_run: true, experimental: false}
           - {runner: ubuntu-24.04, os: sh, trust: ca-certificates, must_run: true, experimental: false}
+          - {runner: ubuntu-26.04, os: sh, trust: ca-certificates, must_run: true, experimental: true}   # a hosted image that moves weekly must not gate a release; only here, never in install.yml (PZ03b)
           - {runner: ubuntu-22.04, os: sh, trust: none, must_run: false, experimental: false}   # refuses `os` before any network: no trust needed
           - {runner: macos-15, os: sh, trust: curl-ca-bundle, must_run: true, experimental: false}
           - {runner: macos-15, os: sh, trust: keychain, must_run: true, experimental: true}
