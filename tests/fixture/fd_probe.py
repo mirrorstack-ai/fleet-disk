@@ -49,8 +49,11 @@ def kind(mode):
             return name
     return 'other'
 
+SKIPPED = []   # the descriptors that were listed but could not be read: the verdict allows only the one listdir itself used
+
 def measure(fds='/proc/self/fd', maps='/proc/self/maps'):
     found = []
+    del SKIPPED[:]
     for name in os.listdir(fds):
         if not name.isdigit() or int(name) <= 2:
             continue
@@ -61,6 +64,7 @@ def measure(fds='/proc/self/fd', maps='/proc/self/maps'):
             flags = fcntl.fcntl(n, fcntl.F_GETFL)
             fdflags = fcntl.fcntl(n, fcntl.F_GETFD)
         except OSError:
+            SKIPPED.append(n)
             continue
         found.append((n, target, st, flags, fdflags))
     try:
@@ -87,7 +91,14 @@ def measure(fds='/proc/self/fd', maps='/proc/self/maps'):
                     'maps_over_cap': over, 'maps_dev_ino_agree': agree})
     return out
 ''' % MAPS_CAP
-PROBE_CODE = INNER + '\nimport ctypes\nprint(json.dumps({"executable": sys.executable, "version": sys.version, "extras": measure()}))\n'
+# After `import ctypes` the child opens /dev/null itself and must find it in what measure() lists: a positive control that the
+# enumeration reads descriptors at all (zero extras on a 24.04 control could otherwise mean "could not read any"). It is dropped from
+# `extras`. `realpath` is where sys.executable really points (the toolcache hides behind a /usr/bin/python3 symlink).
+PROBE_CODE = INNER + (
+    '\nimport ctypes\nsentinel = os.open("/dev/null", os.O_RDONLY)\nfound = measure()\n'
+    'seen = [e for e in found if e["fd"] == sentinel and e["target"] == "/dev/null"]\n'
+    'print(json.dumps({"executable": sys.executable, "realpath": os.path.realpath(sys.executable), "version": sys.version,\n'
+    '                  "sentinel_seen": len(seen) == 1, "skipped": SKIPPED, "extras": [e for e in found if e["fd"] != sentinel]}))\n')
 
 
 class Verdict(NamedTuple):
@@ -134,9 +145,11 @@ def descriptor_reasons(d: dict, dirs: tuple[str, ...]) -> list[str]:
     return why
 
 
-def judge(probe, *, expect_release: str, expect_arch: str, release: str | None, arch: str | None, python_owner: str | None) -> Verdict:
+def judge(probe, *, expect_release: str, expect_arch: str, release: str | None, arch: str | None, python_owner: str | None,
+          realpath_owner: str | None) -> Verdict:
     """The verdict of one leg. `probe` is the child's JSON (None when it printed none), `release` and `arch` what the host says
-    it is (VERSION_ID, machine), `python_owner` the `dpkg -S` line of /usr/bin/python3 (None: no package owns it)."""
+    it is (VERSION_ID, machine), `python_owner` the `dpkg -S` line of /usr/bin/python3 and `realpath_owner` that of the file the
+    child's sys.executable really resolves to (None: no package owns it)."""
     why = []
     if expect_release not in RELEASES:
         why.append(f'leg release {expect_release!r} is not one of {RELEASES}')
@@ -149,6 +162,16 @@ def judge(probe, *, expect_release: str, expect_arch: str, release: str | None, 
     if not isinstance(probe, dict) or not isinstance(probe.get('extras'), list):
         why.append('the probe printed no readable JSON')
         return Verdict('FAIL', tuple(why))
+    if not isinstance(probe.get('realpath'), str) or not realpath_owner:
+        why.append(f"the interpreter's real path {probe.get('realpath')!r} is not owned by a dpkg package (a toolcache Python behind a "
+                   f'{PYTHON} symlink would be measured, not the system one)')
+    if probe.get('sentinel_seen') is not True:
+        why.append('the enumeration control failed: a descriptor the child opened itself (/dev/null) was not in its own listing, '
+                   'so "zero extras" would mean nothing')
+    skipped = probe.get('skipped')
+    if not isinstance(skipped, list) or len(skipped) > 1:
+        why.append(f'listed descriptors that could not be read: {skipped!r} (only the one listdir itself used may vanish): the count of '
+                   'extras is not trustworthy')
     extras = probe['extras']
     if expect_release == '24.04' and extras:
         why.append(f'control leg: {len(extras)} descriptor(s) beyond 0-2 after `import ctypes` on 24.04 (expected none): '
@@ -204,11 +227,15 @@ def probe(expect_release: str, expect_arch: str, *, run=real_run, read=read_text
         data = json.loads(stdout.strip().splitlines()[-1]) if rc == 0 and stdout.strip() else None
     except ValueError:
         data = None
+    if not isinstance(data, dict) or not isinstance(data.get('extras'), list) or not all(isinstance(e, dict) for e in data['extras']):
+        data = None
     out(f'host: VERSION_ID={release} machine={machine} (this leg: {expect_release}/{expect_arch})')
     if data is None:
         out(f'child exit {rc}; stderr: {stderr.strip()[:2000]}')
     else:
-        out(f"interpreter: sys.executable={data.get('executable')}")
+        out(f"interpreter: sys.executable={data.get('executable')} realpath={data.get('realpath')}")
+        out(f"enumeration control (/dev/null opened by the child, found in its listing): {data.get('sentinel_seen')}; "
+            f"listed but unreadable descriptors: {data.get('skipped')}")
         out(f"sys.version: {' '.join(str(data.get('version')).split())}")
         for e in data.get('extras', []):
             directory = posixpath.dirname(e['target']) if isinstance(e.get('target'), str) and e['target'].startswith('/') else None
@@ -220,11 +247,18 @@ def probe(expect_release: str, expect_arch: str, *, run=real_run, read=read_text
     orc, oout, _ = run(['dpkg', '-S', PYTHON])
     owner = oout.strip().splitlines()[0] if orc == 0 and oout.strip() else None
     out(f'dpkg -S {PYTHON}: ' + (owner or f'no owner (exit {orc})'))
+    real = data.get('realpath') if data is not None else None
+    real_owner = None
+    if isinstance(real, str) and real.startswith('/'):
+        rrc, rout, _ = run(['dpkg', '-S', real])
+        real_owner = rout.strip().splitlines()[0] if rrc == 0 and rout.strip() else None
+        out(f'dpkg -S {real}: ' + (real_owner or f'no owner (exit {rrc})'))
     out(f"extra descriptors beyond 0-2 after `import ctypes`: {0 if data is None else len(data.get('extras', []))}")
     if data is not None:
         for e in data.get('extras', []):
             out('  ' + json.dumps(e, sort_keys=True))
-    v = judge(data, expect_release=expect_release, expect_arch=expect_arch, release=release, arch=machine, python_owner=owner)
+    v = judge(data, expect_release=expect_release, expect_arch=expect_arch, release=release, arch=machine, python_owner=owner,
+              realpath_owner=real_owner)
     for r in v.reasons:
         out(f'::error::{r}')
     out(f'fd-probe {expect_release}/{expect_arch}: {v}')

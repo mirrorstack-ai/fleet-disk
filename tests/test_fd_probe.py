@@ -20,7 +20,9 @@ sys.path.insert(0, str(ROOT / 'tests' / 'fixture'))
 import fd_probe as fp  # noqa: E402
 
 GOLDEN_PATH = ROOT / 'tests' / 'fixture' / 'fd_golden.json'
-# The key holder's repository carries a byte-identical tests/vm/fd_golden.json and asserts the same constant: change both or neither.
+# The key holder slice (PZ01, not built yet) is meant to carry a byte-identical tests/vm/fd_golden.json and assert the same constant: change both
+# or neither. The rows are {name, type, uid, mode (octal text), flags, target, maps_has_path, expect} plus maps_over_cap on the 4 MiB row, which
+# is wider than the plan entry's {type, uid, mode, flags, target, maps_has_path, expect}: PZ01's copy must take this file byte for byte.
 GOLDEN_SHA256 = '8e7606c636f24006e52c140ed375bbe07d97b9aa711db7e8f797bb9d5bf5104b'
 GOLDEN = json.loads(GOLDEN_PATH.read_text(encoding='utf-8'))
 WF = (ROOT / '.github' / 'workflows' / 'fd-probe.yml').read_text(encoding='utf-8')
@@ -28,6 +30,9 @@ TEST_WF = (ROOT / '.github' / 'workflows' / 'test.yml').read_text(encoding='utf-
 BOTH = tuple(fp.LIB_DIRS.values())
 X, A = '/usr/lib/x86_64-linux-gnu/', '/usr/lib/aarch64-linux-gnu/'
 OWNER = 'python3-minimal: /usr/bin/python3'
+REAL_OWNER = 'python3.14-minimal: /usr/bin/python3.14'
+# What the child prints besides `extras` (the real path, the /dev/null control, the unreadable descriptors).
+CHILD = {'executable': '/usr/bin/python3', 'realpath': '/usr/bin/python3.14', 'version': '3.14.4', 'sentinel_seen': True, 'skipped': [9]}
 
 
 def good(arch='x86_64', **kw):
@@ -37,9 +42,9 @@ def good(arch='x86_64', **kw):
     return d
 
 
-def verdict(extras, release='26.04', arch='x86_64', owner=OWNER, host_release=None, host_arch=None):
-    return fp.judge({'executable': '/usr/bin/python3', 'version': '3.14.4', 'extras': extras}, expect_release=release, expect_arch=arch,
-                    release=host_release or release, arch=host_arch or arch, python_owner=owner)
+def verdict(extras, release='26.04', arch='x86_64', owner=OWNER, host_release=None, host_arch=None, real_owner=REAL_OWNER, **child):
+    return fp.judge(dict(CHILD, extras=extras, **child), expect_release=release, expect_arch=arch,
+                    release=host_release or release, arch=host_arch or arch, python_owner=owner, realpath_owner=real_owner)
 
 
 class Golden(unittest.TestCase):
@@ -136,10 +141,54 @@ class Verdicts(unittest.TestCase):
 
     def test_unreadable_output_and_unknown_legs_fail(self):
         for bad in (None, {}, {'extras': 'x'}):
-            v = fp.judge(bad, expect_release='26.04', expect_arch='x86_64', release='26.04', arch='x86_64', python_owner=OWNER)
+            v = fp.judge(bad, expect_release='26.04', expect_arch='x86_64', release='26.04', arch='x86_64', python_owner=OWNER,
+                         realpath_owner=REAL_OWNER)
             self.assertEqual(v.status, 'FAIL', bad)
         self.assertEqual(verdict([], release='28.04', arch='x86_64').status, 'FAIL')
         self.assertEqual(verdict([good()], arch='riscv64').status, 'FAIL')
+
+    def test_unreadable_output_fails_on_a_24_04_control_where_zero_extras_would_otherwise_pass(self):
+        # A control leg passes on zero extras, so it is the only leg a missing python3, a crash or a failed import could turn green.
+        for arch in ('x86_64', 'aarch64'):
+            self.assertEqual(verdict([], release='24.04', arch=arch).status, 'PASS')
+            for bad in (None, {}, {'extras': 'x'}, {'extras': None}, [], 'x'):
+                v = fp.judge(bad, expect_release='24.04', expect_arch=arch, release='24.04', arch=arch, python_owner=OWNER,
+                             realpath_owner=REAL_OWNER)
+                self.assertEqual(v.status, 'FAIL', (arch, bad))
+                self.assertIn('no readable JSON', ' '.join(v.reasons))
+
+    def test_a_probe_that_cannot_prove_it_enumerates_fails_on_every_leg(self):
+        for release in ('24.04', '26.04'):
+            extras = [] if release == '24.04' else [good()]
+            self.assertEqual(verdict(extras, release=release).status, 'PASS', release)
+            for kw in ({'sentinel_seen': False}, {'sentinel_seen': None}, {'sentinel_seen': 1}):
+                v = verdict(extras, release=release, **kw)
+                self.assertEqual(v.status, 'FAIL', (release, kw))
+                self.assertIn('enumeration control', ' '.join(v.reasons))
+            no_key = {k: v for k, v in CHILD.items() if k != 'sentinel_seen'}
+            v = fp.judge(dict(no_key, extras=extras), expect_release=release, expect_arch='x86_64', release=release, arch='x86_64',
+                         python_owner=OWNER, realpath_owner=REAL_OWNER)
+            self.assertEqual(v.status, 'FAIL', release)
+
+    def test_more_than_the_one_listdir_descriptor_unreadable_fails_and_none_or_one_passes(self):
+        for release in ('24.04', '26.04'):
+            extras = [] if release == '24.04' else [good()]
+            for skipped in ([], [5]):
+                self.assertEqual(verdict(extras, release=release, skipped=skipped).status, 'PASS', (release, skipped))
+            for skipped in ([5, 6], None, 'x', 2):
+                v = verdict(extras, release=release, skipped=skipped)
+                self.assertEqual(v.status, 'FAIL', (release, skipped))
+                self.assertIn('could not be read', ' '.join(v.reasons))
+
+    def test_an_interpreter_whose_real_path_no_package_owns_fails_even_when_the_symlink_has_an_owner(self):
+        for release in ('24.04', '26.04'):
+            extras = [] if release == '24.04' else [good()]
+            for real_owner in (None, ''):
+                v = verdict(extras, release=release, real_owner=real_owner)
+                self.assertEqual(v.status, 'FAIL', release)
+                self.assertIn('real path', ' '.join(v.reasons))
+            v = verdict(extras, release=release, realpath=None)
+            self.assertEqual(v.status, 'FAIL', release)
 
 
 def fake_proc(tmp: Path, files: dict, maps_lines):
@@ -184,6 +233,33 @@ class Measure(unittest.TestCase):
         self.assertEqual(e['dev'], f'{os.major(st.st_dev)}:{os.minor(st.st_dev)}')
         self.assertTrue(e['maps_has_path'] and e['maps_dev_ino_agree'] and not e['maps_over_cap'])
         self.assertEqual(len(e['maps_lines']), 1)
+
+    def test_every_permission_bit_incl_setuid_setgid_and_sticky_survives_into_the_mode(self):
+        for m in (0o4755, 0o2755, 0o1755, 0o0664, 0o0646, 0o0644, 0o0600):
+            with self.subTest(oct(m)):
+                os.chmod(self.lib, m)
+                fd = self.open(self.lib)
+                tmp = Path(tempfile.mkdtemp(dir=self.tmp))
+                fds, maps = fake_proc(tmp, {fd: str(self.lib)}, [])
+                (e,) = self.ns['measure'](fds, maps)
+                self.assertEqual(e['mode'], format(m, '04o'))
+                self.assertEqual(not fp.descriptor_reasons(dict(e, target=X + 'libffi.so.8.1.4', uid=0, maps_has_path=True), BOTH), m in (0o0644, 0o0600))
+        os.chmod(self.lib, 0o4755)
+        fd = self.open(self.lib)
+        fds, maps = fake_proc(Path(tempfile.mkdtemp(dir=self.tmp)), {fd: str(self.lib)}, [])
+        (e,) = self.ns['measure'](fds, maps)
+        e = dict(e, target=X + 'libffi.so.8.1.4', uid=0, maps_has_path=True)   # the one fact that cannot be made real here
+        self.assertEqual(verdict([e]).status, 'FAIL')
+        self.assertIn('setuid', ' '.join(verdict([e]).reasons))
+
+    def test_a_descriptor_that_is_listed_but_cannot_be_read_is_counted_not_dropped(self):
+        fd = self.open(self.lib)
+        fds, maps = fake_proc(self.tmp, {fd: str(self.lib), 99999: '/gone'}, [])
+        self.assertEqual([e['fd'] for e in self.ns['measure'](fds, maps)], [fd])
+        self.assertEqual(self.ns['SKIPPED'], [99999])
+        fds2, maps2 = fake_proc(Path(tempfile.mkdtemp(dir=self.tmp)), {fd: str(self.lib)}, [])
+        self.ns['measure'](fds2, maps2)
+        self.assertEqual(self.ns['SKIPPED'], [])               # a second pass starts clean
 
     def test_descriptors_0_to_2_non_numbers_and_gone_descriptors_are_not_reported(self):
         fd = self.open(self.lib)
@@ -244,7 +320,11 @@ class Measure(unittest.TestCase):
         p = subprocess.run([sys.executable, '-I', '-S', '-c', fp.PROBE_CODE], pass_fds=(fd,), capture_output=True, text=True, timeout=60)
         self.assertEqual(p.returncode, 0, p.stderr)
         data = json.loads(p.stdout)
-        self.assertEqual(set(data), {'executable', 'version', 'extras'})
+        self.assertEqual(set(data), {'executable', 'realpath', 'version', 'sentinel_seen', 'skipped', 'extras'})
+        self.assertIs(data['sentinel_seen'], True)             # the child's own /dev/null was in its listing
+        self.assertLessEqual(len(data['skipped']), 1)          # only the descriptor listdir itself used may vanish
+        self.assertEqual(data['realpath'], os.path.realpath(sys.executable))
+        self.assertFalse([e for e in data['extras'] if e['target'] == '/dev/null'])   # the control is dropped from extras
         mine = [e for e in data['extras'] if e['target'] == str(self.lib)]
         self.assertEqual(len(mine), 1, data['extras'])
         self.assertEqual((mine[0]['type'], mine[0]['flags'] & 3, mine[0]['fdflags'], mine[0]['maps_has_path']), ('regular', 0, 0, False))
@@ -265,25 +345,28 @@ class ProbeCode(unittest.TestCase):
 
 class Fake:
     """A fake runner: the child's JSON and the answers of stat, dpkg-query and dpkg."""
-    def __init__(self, extras, child_rc=0, owner=(0, OWNER + '\n'), fs='ext2/ext3\n', stdout=None):
+    def __init__(self, extras, child_rc=0, owner=(0, OWNER + '\n'), fs='ext2/ext3\n', stdout=None, real_owner=(0, REAL_OWNER + '\n'), child=None):
         self.calls = []
         self.extras = extras
         self.child_rc = child_rc
         self.owner = owner
         self.fs = fs
         self.stdout = stdout
+        self.real_owner = real_owner
+        self.child = child or {}
 
     def __call__(self, argv, timeout=60):
         self.calls.append(argv)
         if argv[0] == fp.PYTHON:
-            out = self.stdout if self.stdout is not None else json.dumps({'executable': '/usr/bin/python3', 'version': '3.14.4 (main)\n[GCC 15]', 'extras': self.extras})
+            out = self.stdout if self.stdout is not None else json.dumps(dict(CHILD, version='3.14.4 (main)\n[GCC 15]', extras=self.extras, **self.child))
             return self.child_rc, out + '\n', 'child stderr'
         if argv[0] == 'stat':
             return 0, self.fs, ''
         if argv[0] == 'dpkg-query':
             return 0, 'libffi8:amd64\t3.5.2-1ubuntu1\n', ''
         if argv[0] == 'dpkg':
-            return self.owner[0], self.owner[1], ''
+            r = self.owner if argv[2] == fp.PYTHON else self.real_owner
+            return r[0], r[1], ''
         raise AssertionError(argv)
 
 
@@ -332,6 +415,34 @@ class Driver(unittest.TestCase):
             rc, out = self.run_probe(fake)
             self.assertEqual(rc, 1)
             self.assertTrue(any('child stderr' in x for x in out), out)
+
+    def test_a_child_that_fails_or_prints_garbage_fails_on_a_24_04_control_too(self):
+        # The control passes on zero extras: with no readable output it must still fail (missing python3, a crash, a failed import).
+        osrel24 = {'/etc/os-release': 'VERSION_ID="24.04"\n', '/proc/self/maps': 'x'}
+        for fake in (Fake([], child_rc=1), Fake([], child_rc=127, stdout=''), Fake([], stdout='not json'), Fake([], stdout='[1]'),
+                     Fake([], stdout='{"extras": "x"}'), Fake([], child_rc=None, stdout='')):
+            for arch in ('x86_64', 'aarch64'):
+                rc, out = self.run_probe(fake, '24.04', arch=arch, machine=arch, osrel=osrel24)
+                self.assertEqual(rc, 1, (arch, out))
+                self.assertIn('no readable JSON', '\n'.join(out))
+                self.assertTrue(out[-1].startswith(f'fd-probe 24.04/{arch}: FAIL('), out)
+
+    def test_a_24_04_control_with_a_child_that_cannot_enumerate_or_a_toolcache_python_fails(self):
+        osrel24 = {'/etc/os-release': 'VERSION_ID="24.04"\n', '/proc/self/maps': 'x'}
+        self.assertEqual(self.run_probe(Fake([]), '24.04', osrel=osrel24)[0], 0)
+        for fake in (Fake([], child={'sentinel_seen': False}), Fake([], child={'skipped': [4, 5]}),
+                     Fake([], real_owner=(1, '')), Fake([], child={'realpath': '/opt/hostedtoolcache/Python/3.14.4/x64/bin/python3.14'}, real_owner=(1, ''))):
+            rc, out = self.run_probe(fake, '24.04', osrel=osrel24)
+            self.assertEqual(rc, 1, out)
+
+    def test_the_real_path_is_asked_of_dpkg_and_printed(self):
+        fake = Fake([good()])
+        rc, out = self.run_probe(fake)
+        self.assertEqual(rc, 0, out)
+        self.assertIn(['dpkg', '-S', '/usr/bin/python3.14'], fake.calls)
+        text = '\n'.join(out)
+        for need in ('realpath=/usr/bin/python3.14', 'dpkg -S /usr/bin/python3.14: ' + REAL_OWNER, 'enumeration control', 'unreadable descriptors: [9]'):
+            self.assertIn(need, text)
 
     def test_a_host_that_is_another_release_or_machine_than_the_leg_fails(self):
         self.assertEqual(self.run_probe(Fake([good()]), release='24.04')[0], 1)

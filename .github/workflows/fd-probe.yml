@@ -2,8 +2,8 @@
 # ubuntu-24.04-arm (the controls: zero extra descriptors) and ubuntu-26.04 and ubuntu-26.04-arm (exactly one, a read-only libffi file
 # of this leg's own architecture). The hosted image moves weekly, so a libffi update that changes the descriptor the key holder's
 # rule admits is seen here the week it happens, not at the PC. tests/fixture/fd_probe.py describes the facts it prints and the
-# verdict; tests/fixture/fd_golden.json is the vector table shared with the key holder's rule (the fleet repository carries a
-# byte-identical copy, each side asserts the same sha256).
+# verdict; tests/fixture/fd_golden.json is the vector table shared with the key holder's rule (meant to be byte-identical to the
+# copy PZ01 adds to the fleet repository, each side to assert the same sha256; no such copy exists yet).
 # What this does NOT speak for: the image ships GNU sudo and coreutils on Azure's kernel, so nothing here says anything about
 # sudo-rs or uutils, and it measures the descriptor, it does not run the private key holder. Nothing here is secret, signed or
 # published: the only token is the run's own, read-only, and only the `report` job (weekly runs) holds a write scope, issues alone.

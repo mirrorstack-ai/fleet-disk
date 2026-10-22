@@ -470,12 +470,15 @@ the scheduled `report` job holds `issues: write` and opens one issue) runs `test
 `ubuntu-24.04-arm` (the controls) and `ubuntu-26.04`, `ubuntu-26.04-arm`. It starts `/usr/bin/python3 -I -S`, runs `import ctypes`
 and prints every descriptor beyond 0-2 (its `readlink`, `fstat` type, mode, uid, device and inode, `F_GETFL`, `F_GETFD`, the
 `/proc/self/maps` lines with the same path and whether their device and inode agree with `fstat`, the filesystem type of its
-directory), plus `dpkg-query -W libffi8`, `sys.version` and `dpkg -S` of the interpreter. The verdict is the shape the key
+directory), plus `dpkg-query -W libffi8`, `sys.version`, the interpreter's real path and `dpkg -S` of it and of `/usr/bin/python3`. The child also
+opens `/dev/null` after the import and must find it in its own listing (a positive control that the enumeration reads descriptors at
+all), and a descriptor it could not read fails the leg instead of vanishing from the count. The verdict is the shape the key
 holder's rule needs: no extra descriptor on 24.04; on 26.04 exactly one, a root-owned regular file without setuid, setgid, sticky,
 group or other write, `O_RDONLY`, directly in `/usr/lib/<this leg's architecture>-linux-gnu/` as `libffi.so.N...`, with a maps line
 for the same path. `F_GETFD` and the device/inode agreement are printed, not judged. Anything else fails, as does an
 `/usr/bin/python3` no dpkg package owns or a label that moved to another release. `tests/fixture/fd_golden.json` holds the
-vectors, shared byte for byte with the fleet repository's copy; `tests/test_fd_probe.py` runs the verdict over every row of it
-and checks its sha256. Caveats: the hosted kernel is Azure's and its root filesystem may differ from a production host's, so
+vectors, meant to be byte for byte the copy the fleet repository's key holder slice (PZ01) carries once it exists (a row is
+`name`, `type`, `uid`, `mode` as octal text, `flags`, `target`, `maps_has_path`, `expect`, and `maps_over_cap` on one row; its sha256 is
+the constant in the test); `tests/test_fd_probe.py` runs the verdict over every row of it and checks that sha256. Caveats: the hosted kernel is Azure's and its root filesystem may differ from a production host's, so
 the probe prints `stat -f` of the library directory; and the image ships GNU sudo and coreutils, so nothing here speaks for
 sudo-rs or uutils. It measures the descriptor; it does not run the private key holder.
