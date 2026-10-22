@@ -1,0 +1,303 @@
+[
+ {
+  "name": "good x86_64",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "pass"
+ },
+ {
+  "name": "good aarch64",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/aarch64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "pass"
+ },
+ {
+  "name": "good, short soname",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8",
+  "maps_has_path": true,
+  "expect": "pass"
+ },
+ {
+  "name": "good, with O_LARGEFILE in F_GETFL",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 32768,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "pass"
+ },
+ {
+  "name": "uid 1000",
+  "type": "regular",
+  "uid": 1000,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "mode 0664 (group write)",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0664",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "mode 0646 (other write)",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0646",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "mode 4755 (setuid)",
+  "type": "regular",
+  "uid": 0,
+  "mode": "4755",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "mode 2755 (setgid)",
+  "type": "regular",
+  "uid": 0,
+  "mode": "2755",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "mode 1755 (sticky)",
+  "type": "regular",
+  "uid": 0,
+  "mode": "1755",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "type directory",
+  "type": "directory",
+  "uid": 0,
+  "mode": "0755",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "type fifo",
+  "type": "fifo",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "type socket",
+  "type": "socket",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "type char device",
+  "type": "chardev",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "O_RDWR",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 2,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "O_WRONLY",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 1,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "O_PATH",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 2097152,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "target in /tmp",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/tmp/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "target in a subdirectory of the library directory",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/x/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "target in /usr/local/lib",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/local/lib/libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "target ending (deleted)",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4 (deleted)",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "basename libffi.so",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "basename libffi.so.8.bak",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.bak",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "basename xlibffi.so.8",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/xlibffi.so.8",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "basename libffi.so.8/..",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8/..",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "basename libffi.so.8.1.4.9",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4.9",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "basename libffi.so.8.1.4.9.9",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4.9.9",
+  "maps_has_path": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "no maps line for the path",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": false,
+  "expect": "refuse"
+ },
+ {
+  "name": "maps text over the 4 MiB cap",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "/usr/lib/x86_64-linux-gnu/libffi.so.8.1.4",
+  "maps_has_path": false,
+  "maps_over_cap": true,
+  "expect": "refuse"
+ },
+ {
+  "name": "relative target",
+  "type": "regular",
+  "uid": 0,
+  "mode": "0644",
+  "flags": 0,
+  "target": "libffi.so.8.1.4",
+  "maps_has_path": true,
+  "expect": "refuse"
+ }
+]
