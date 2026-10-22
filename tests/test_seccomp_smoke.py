@@ -1,4 +1,4 @@
-"""PW04: the hosted seccomp smoke's driver over a fake `systemd-run` (no systemd, no QEMU, no sudo), the twin files, and the
+"""PW04 and PZ03c: the hosted seccomp smoke's driver over a fake `systemd-run` (no systemd, no QEMU, no sudo), the twin files, and the
 workflow's static shape. The red run of the job itself is the hosted runner; these tests pin the judge and the argv."""
 from __future__ import annotations
 
@@ -412,6 +412,87 @@ class Dump(unittest.TestCase):
             self.assertEqual((Path(d) / 'sub' / 'dump.txt').read_text(encoding='utf-8'), DUMP.strip() + '\n')
 
 
+class Release(unittest.TestCase):
+    """PZ03c: one pinned dump per hosted release; 24.04 is the default and reads exactly the file it always read."""
+
+    D2404 = DUMP
+    D2604 = DUMP + '    mseal\n'   # a 259 table that moved: one more call in @sandbox
+
+    def in_tree(self, fn):
+        """Run `fn` with the driver's HERE pointing at a scratch tree holding both dump files (the file the driver reads is the one chosen)."""
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / 'ubuntu2404-filter-dump.txt').write_text(self.D2404, encoding='utf-8')
+            (Path(d) / 'ubuntu2604-filter-dump.txt').write_text(self.D2604, encoding='utf-8')
+            with mock.patch.object(ss, 'HERE', Path(d)):
+                return fn()
+
+    def test_the_choice_maps_each_release_to_its_own_file_and_24_04_is_the_default(self):
+        self.assertEqual(ss.DUMP_FILES, {'24.04': 'ubuntu2404-filter-dump.txt', '26.04': 'ubuntu2604-filter-dump.txt'})
+        self.assertEqual(ss.DEFAULT_RELEASE, '24.04')
+        self.assertEqual(ss.dump_file('24.04'), ROOT / 'tests/fixture/ubuntu2404-filter-dump.txt')   # the control: exactly as before
+        self.assertEqual(ss.dump_file('26.04'), ROOT / 'tests/fixture/ubuntu2604-filter-dump.txt')
+        self.assertEqual(ss.DUMP_FILE, ss.dump_file('24.04'))
+        with self.assertRaises(ValueError):
+            ss.dump_file('25.10')
+
+    def test_a_run_without_a_release_reads_the_24_04_file_and_a_26_04_run_reads_the_26_04_file(self):
+        code, out = self.in_tree(lambda: smoke(Fake(dump=self.D2404), dump_fixture=None))
+        self.assertEqual((code, out[-1]), (0, 'PASS'))
+        code, out = self.in_tree(lambda: smoke(Fake(dump=self.D2604), dump_fixture=None, release='26.04'))
+        self.assertEqual((code, out[-1]), (0, 'PASS'))
+        code, out = self.in_tree(lambda: smoke(Fake(dump=self.D2404), dump_fixture=None, release='26.04'))   # the 24.04 text is not the 26.04 pin
+        self.assertEqual(code, 1)
+        self.assertIn('DUMP-DIFFERS: the syscall-filter dump moved against tests/fixture/ubuntu2604-filter-dump.txt', out[-1])
+        code, out = self.in_tree(lambda: smoke(Fake(dump=self.D2604), dump_fixture=None))
+        self.assertIn('DUMP-DIFFERS: the syscall-filter dump moved against tests/fixture/ubuntu2404-filter-dump.txt', out[-1])
+
+    def test_attribution_is_still_enforced_at_26_04_a_dying_leg_with_no_kernel_record_is_blind_and_with_one_passes(self):
+        f = Fake(records=(), version='systemd 259 (259.5-0ubuntu3.4)')
+        code, out = smoke(f, dump_fixture=DUMP, release='26.04')
+        self.assertEqual(code, 1)
+        self.assertEqual(out[-1], 'FAIL(' + ss.BLIND.format(leg='C') + '; ' + ss.BLIND.format(leg='A') + ')')
+        code, out = smoke(Fake(version='systemd 259 (259.5-0ubuntu3.4)'), dump_fixture=DUMP, release='26.04')   # the control: same machine, records present
+        self.assertEqual((code, out[-1]), (0, 'PASS'))
+
+    def test_a_26_04_run_against_the_placeholder_is_dump_unpinned_with_the_legs_run_and_the_dump_printed(self):
+        f = Fake()
+        code, out = smoke(f, dump_fixture='UNPINNED: placeholder\n', release='26.04')
+        self.assertEqual(code, 1)
+        self.assertIn('DUMP-UNPINNED: tests/fixture/ubuntu2604-filter-dump.txt is the placeholder', out[-1])
+        self.assertNotIn('ubuntu2404', out[-1])
+        self.assertEqual(f.ran, ['B', 'C', 'Cd', 'A', 'Ad'])   # the legs still run: the dump step must run and upload even when the leg fails
+        self.assertIn(DUMP.strip(), out)
+        code, out = smoke(Fake(), dump_fixture='UNPINNED: placeholder\n')
+        self.assertIn('tests/fixture/ubuntu2404-filter-dump.txt is the placeholder', out[-1])   # the 24.04 wording is unchanged
+
+    def test_a_missing_26_04_file_is_unpinned_not_a_crash_and_an_unknown_release_is_refused_before_anything_runs(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(ss, 'HERE', Path(d)):
+            code, out = smoke(Fake(), dump_fixture=None, release='26.04')
+        self.assertEqual(code, 1)
+        self.assertIn('DUMP-UNPINNED', out[-1])
+        f = Fake()
+        with self.assertRaises(ValueError):
+            smoke(f, release='25.10')
+        self.assertEqual(f.calls, [])
+
+    def test_the_committed_26_04_file_is_the_placeholder_or_a_pinned_dump_with_no_escape_byte(self):
+        raw = (ROOT / 'tests/fixture/ubuntu2604-filter-dump.txt').read_bytes()
+        text = raw.decode('utf-8')
+        self.assertNotIn(b'\x1b', raw)
+        if text.startswith(ss.UNPINNED):
+            self.assertIn('PZ03c', text)
+        else:   # the second commit: exactly what the driver writes, from the first hosted run
+            self.assertEqual(ss.normal(text) + '\n', text)
+            self.assertEqual((text.splitlines()[0], '@sandbox' in text.splitlines()), ('@system-service', True))
+
+    def test_the_committed_26_04_file_is_what_a_26_04_run_compares_against(self):
+        text = (ROOT / 'tests/fixture/ubuntu2604-filter-dump.txt').read_text(encoding='utf-8')
+        pinned = not text.startswith(ss.UNPINNED)
+        _, out = smoke(Fake(dump=text if pinned else DUMP), dump_fixture=None, release='26.04')   # the file read from disk, as the hosted call does
+        self.assertEqual(out[-1] == 'PASS', pinned)
+        self.assertEqual('DUMP-UNPINNED' in out[-1], not pinned)
+
+
 class Main(unittest.TestCase):
     """The workflow reaches the dump comparison and the artifact only through main()'s argparse wiring."""
 
@@ -423,11 +504,20 @@ class Main(unittest.TestCase):
         return m.call_args.kwargs
 
     def test_the_default_run_compares_the_dump_and_writes_no_file(self):
-        self.assertEqual(self.kwargs_of([]), {'dump_out': None, 'dump_check': True})
+        self.assertEqual(self.kwargs_of([]), {'dump_out': None, 'dump_check': True, 'release': '24.04'})
 
     def test_the_flags_reach_smoke(self):
-        self.assertEqual(self.kwargs_of(['--no-dump-check', '--dump-out', 'x']), {'dump_out': 'x', 'dump_check': False})
-        self.assertEqual(self.kwargs_of(['--dump-out', 'seccomp-dump/d.txt']), {'dump_out': 'seccomp-dump/d.txt', 'dump_check': True})
+        self.assertEqual(self.kwargs_of(['--no-dump-check', '--dump-out', 'x']), {'dump_out': 'x', 'dump_check': False, 'release': '24.04'})
+        self.assertEqual(self.kwargs_of(['--dump-out', 'seccomp-dump/d.txt']),
+                         {'dump_out': 'seccomp-dump/d.txt', 'dump_check': True, 'release': '24.04'})
+
+    def test_the_release_choice_reaches_smoke_and_only_the_two_hosted_releases_are_choices(self):
+        self.assertEqual(self.kwargs_of(['--release', '26.04'])['release'], '26.04')
+        self.assertEqual(self.kwargs_of(['--release', '24.04', '--dump-out', 'x'])['release'], '24.04')
+        for bad in ('25.10', '2604', ''):
+            with mock.patch('sys.stderr'), self.assertRaises(SystemExit) as cm:
+                ss.main(['--release', bad])
+            self.assertEqual(cm.exception.code, 2, bad)
 
 
 class RealRun(unittest.TestCase):
@@ -498,17 +588,41 @@ class Workflow(unittest.TestCase):
         self.assertEqual(re.findall(r'(?m)^  (\w+):', on), ['pull_request', 'workflow_dispatch', 'schedule'])
         paths = re.findall(r'(?m)^      - (\S+)$', on)
         self.assertEqual(paths, ['.github/workflows/seccomp-smoke.yml', 'tests/fixture/seccomp_smoke.py', 'tests/fixture/l1_unit_filter.txt',
-                                 'tests/fixture/ubuntu2404-filter-dump.txt', 'tests/test_seccomp_smoke.py'])
+                                 'tests/fixture/ubuntu2404-filter-dump.txt', 'tests/fixture/ubuntu2604-filter-dump.txt',
+                                 'tests/test_seccomp_smoke.py'])
         self.assertEqual(len(re.findall(r"- cron: '[^']+'", on)), 1)
         self.assertRegex(on, r"- cron: '\d+ \d+ \* \* \d'")   # weekly: one minute, one hour, one weekday
         for word in ('push:', 'pull_request_target', 'workflow_run', 'self-hosted'):
             self.assertNotIn(word, WF)
 
-    def test_hosted_ubuntu_24_04_read_only_and_a_ten_minute_smoke(self):
+    def test_hosted_read_only_and_a_ten_minute_smoke_and_a_report_on_24_04(self):
         self.assertRegex(WF, r'(?m)^permissions:\n  contents: read\n')
-        self.assertEqual(re.findall(r'runs-on: (\S+)', WF), ['ubuntu-24.04', 'ubuntu-24.04'])
+        self.assertEqual(re.findall(r'runs-on: (.+)', WF), ['${{ matrix.runner }}', 'ubuntu-24.04'])   # the smoke is the matrix, the report is 24.04
         self.assertIn('    timeout-minutes: 10\n', self.SMOKE)
         self.assertNotIn('permissions:', self.SMOKE)
+
+    def test_the_matrix_is_the_24_04_control_and_a_26_04_leg_allowed_to_fail_in_week_one(self):
+        self.assertIn('    strategy:\n      fail-fast: false\n      matrix:\n        include:\n', self.SMOKE)   # one leg's red never cancels the other
+        legs = re.findall(r"(?m)^          - runner: (\S+)\n            release: '([\d.]+)'\n            experimental: (\w+)\n", self.SMOKE)
+        self.assertEqual(legs, [('ubuntu-24.04', '24.04', 'false'), ('ubuntu-26.04', '26.04', 'true')])
+        self.assertIn('    continue-on-error: ${{ matrix.experimental }}\n', self.SMOKE)
+        self.assertEqual(self.SMOKE.count('continue-on-error'), 1)
+        self.assertNotIn('continue-on-error', self.REPORT)
+        self.assertIn('    name: smoke (${{ matrix.release }})\n', self.SMOKE)
+        self.assertIn('    runs-on: ${{ matrix.runner }}\n', self.SMOKE)
+        for release in {r for _, r, _ in legs}:
+            self.assertIn(release, ss.DUMP_FILES)   # every matrix release has a pinned-dump choice in the driver
+
+    def test_the_release_and_the_artifact_name_come_from_the_matrix_through_env(self):
+        self.assertIn('        env:\n          RELEASE: ${{ matrix.release }}\n        run: ', self.SMOKE)
+        self.assertRegex(self.SMOKE, r'--release "\$RELEASE" --dump-out "seccomp-dump/ubuntu\$\{RELEASE//\./\}-filter-dump\.txt"')
+        self.assertIn('          name: seccomp-dump-${{ matrix.release }}\n', self.SMOKE)   # two legs, two artifacts: neither overwrites the other
+        # the file each leg writes is the name the driver compares with, so the artifact is committable as it is
+        for release, name in ss.DUMP_FILES.items():
+            self.assertEqual(f'ubuntu{release.replace(".", "")}-filter-dump.txt', name)
+
+    def test_the_control_leg_keeps_setup_python_and_the_26_04_leg_uses_the_image_python(self):
+        self.assertRegex(self.SMOKE, r"- if: matrix\.release == '24\.04'[^\n]*\n        uses: actions/setup-python@[0-9a-f]{40}")
 
     def test_actions_are_the_pins_the_repo_already_uses_and_checkout_keeps_no_token(self):
         pins = lambda t: set(re.findall(r'(actions/[\w-]+@[0-9a-f]{40})', t))  # noqa: E731
@@ -521,7 +635,7 @@ class Workflow(unittest.TestCase):
 
     def test_the_smoke_installs_qemu_from_the_archive_and_runs_the_driver_isolated(self):
         self.assertIn('sudo apt-get install -y --no-install-recommends qemu-system-x86', self.SMOKE)
-        self.assertRegex(self.SMOKE, r'python3 -I -B tests/fixture/seccomp_smoke\.py --dump-out \S+')
+        self.assertRegex(self.SMOKE, r'python3 -I -B tests/fixture/seccomp_smoke\.py --release "\$RELEASE" --dump-out \S+')
         self.assertNotIn('--no-dump-check', WF)
         self.assertRegex(self.SMOKE, r'(?s)if: always\(\)\n\s+uses: actions/upload-artifact@')
 
