@@ -5,7 +5,7 @@
 # The run that gates a release is the `smoke` job of install.yml (AF34): it takes the loaders from the fleet `release` tip, before
 # `sign`. This workflow is the manual twin for a folder committed in THIS repo (the release folder lives in the fleet repository
 # since fleet-disk#10, so a pull request here seldom carries one) and for edits of the fixture builder and the driver; it also
-# keeps the experimental keychain row, which install.yml does not run. A dispatch that finds no complete pair fails (AF24).
+# keeps the experimental keychain and ubuntu-26.04 rows, which install.yml does not run. A dispatch that finds no complete pair fails (AF24).
 name: boot-smoke
 on:
   pull_request:
@@ -85,6 +85,7 @@ jobs:
           - {runner: windows-2022, os: ps1, trust: root-store, must_run: true, experimental: false}
           - {runner: windows-2025, os: ps1, trust: root-store, must_run: true, experimental: false}
           - {runner: ubuntu-24.04, os: sh, trust: ca-certificates, must_run: true, experimental: false}
+          - {runner: ubuntu-26.04, os: sh, trust: ca-certificates, must_run: true, experimental: true}   # a hosted image that moves weekly must not gate a release; only here, never in install.yml (PZ03b)
           - {runner: ubuntu-22.04, os: sh, trust: none, must_run: false, experimental: false}   # refuses `os` before any network: no trust needed
           - {runner: macos-15, os: sh, trust: curl-ca-bundle, must_run: true, experimental: false}
           - {runner: macos-15, os: sh, trust: keychain, must_run: true, experimental: true}

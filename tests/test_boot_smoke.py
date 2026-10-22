@@ -211,14 +211,14 @@ class Workflow(unittest.TestCase):
 
     def test_the_runner_labels_are_the_designed_ones(self):
         got = set(re.findall(r'runner: ([a-z0-9.-]+)', WF))
-        self.assertEqual(got, {'windows-2022', 'windows-2025', 'ubuntu-24.04', 'ubuntu-22.04', 'macos-15'})
-        self.assertEqual(WF.count('experimental: true'), 1)
+        self.assertEqual(got, {'windows-2022', 'windows-2025', 'ubuntu-24.04', 'ubuntu-22.04', 'ubuntu-26.04', 'macos-15'})
+        self.assertEqual(WF.count('experimental: true'), 2)   # keychain and ubuntu-26.04: neither gates a release (PZ03b)
         self.assertEqual(len(re.findall(r'os: ps1', WF)), 2)
 
     def test_only_the_designed_refusal_may_skip_the_cases(self):  # a machine refusal would otherwise pass every case vacuously
         rows = re.findall(r'runner: ([a-z0-9.-]+),.*?must_run: (true|false)', WF)
         self.assertEqual(sorted(rows), sorted([('windows-2022', 'true'), ('windows-2025', 'true'), ('ubuntu-24.04', 'true'),
-                                                ('ubuntu-22.04', 'false'), ('macos-15', 'true'), ('macos-15', 'true')]))
+                                                ('ubuntu-22.04', 'false'), ('ubuntu-26.04', 'true'), ('macos-15', 'true'), ('macos-15', 'true')]))
         self.assertIn('--must-run', WF)
 
     # install.yml's `smoke` job runs the same rows and steps over the loaders of the release tip, before `sign` (AF34)
@@ -296,6 +296,14 @@ class Workflow(unittest.TestCase):
         strip = lambda st: re.sub(r' --(?:boot-dir "\$BOOT_DIR"|ps1 \S+ --sh \S+)$', '', st.strip().split('run: ', 1)[1])
         self.assertEqual(strip(run(mine)[0]), 'python3 tests/fixture/make_fixture.py --out fixture')
         self.assertEqual(strip(run(mine)[0]), strip(run(theirs)[0]))
+
+    def test_the_ubuntu_26_04_row_is_experimental_and_only_in_the_dispatch(self):  # PZ03b: a weekly-moving hosted image must not gate a release
+        rows = re.findall(r'(?m)^          - (\{runner: ubuntu-26\.04,[^\n]*\})', WF)
+        self.assertEqual(len(rows), 1)
+        self.assertRegex(rows[0], r'^\{runner: ubuntu-26\.04, os: sh, trust: ca-certificates, must_run: true, experimental: true\}')
+        self.assertNotIn('26.04', re.sub(r'(?m)^\s*#.*$', '', SMOKE.split('matrix:', 1)[1].split('steps:', 1)[0]))   # the release gate's rows never name it
+        self.assertNotIn('26.04', REAL_WF.split('matrix:', 1)[1].split('steps:', 1)[0])   # nor do smoke-real's
+        self.assertIn('    timeout-minutes: 25\n    continue-on-error: ${{ matrix.experimental }}\n', WF)   # the flag is what keeps a red row from failing the run; the row's bound is the job's 25
 
     def test_the_dispatch_stays_and_keeps_the_experimental_row(self):  # its no-loader failure is pinned by the plan-step tests above
         self.assertIn('workflow_dispatch:', WF)
