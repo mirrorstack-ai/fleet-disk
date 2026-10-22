@@ -1,0 +1,79 @@
+# PZ03 (G-KH-1): what `import ctypes` leaves open in the SYSTEM Python on a real hosted image, on four legs: ubuntu-24.04 and
+# ubuntu-24.04-arm (the controls: zero extra descriptors) and ubuntu-26.04 and ubuntu-26.04-arm (exactly one, a read-only libffi file
+# of this leg's own architecture). The hosted image moves weekly, so a libffi update that changes the descriptor the key holder's
+# rule admits is seen here the week it happens, not at the PC. tests/fixture/fd_probe.py describes the facts it prints and the
+# verdict; tests/fixture/fd_golden.json is the vector table shared with the key holder's rule (meant to be byte-identical to the
+# copy PZ01 adds to the fleet repository, each side to assert the same sha256; no such copy exists yet).
+# What this does NOT speak for: the image ships GNU sudo and coreutils on Azure's kernel, so nothing here says anything about
+# sudo-rs or uutils, and it measures the descriptor, it does not run the private key holder. Nothing here is secret, signed or
+# published: the only token is the run's own, read-only, and only the `report` job (weekly runs) holds a write scope, issues alone.
+name: fd-probe
+on:
+  pull_request:
+    paths:
+      - .github/workflows/fd-probe.yml
+      - tests/fixture/fd_probe.py
+      - tests/fixture/fd_golden.json
+      - tests/test_fd_probe.py
+  workflow_dispatch:
+  schedule:
+    - cron: '47 5 * * 1'
+permissions:
+  contents: read
+concurrency:
+  group: fd-probe-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+jobs:
+  probe:
+    name: probe (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            release: '24.04'
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            release: '24.04'
+            arch: aarch64
+          - runner: ubuntu-26.04
+            release: '26.04'
+            arch: x86_64
+          - runner: ubuntu-26.04-arm
+            release: '26.04'
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
+        with:
+          persist-credentials: false
+      - name: Probe the system Python's descriptors
+        env:
+          EXPECT_RELEASE: ${{ matrix.release }}
+          EXPECT_ARCH: ${{ matrix.arch }}
+        run: /usr/bin/python3 -I tests/fixture/fd_probe.py --expect-release "$EXPECT_RELEASE" --expect-arch "$EXPECT_ARCH"
+  report:
+    needs: probe
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open one issue naming the run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title='fd-probe: the weekly run failed'
+          body="The weekly fd-probe run failed: $RUN_URL
+
+          Read the log of the leg that ended red. A 24.04 leg that now shows a descriptor, or a 26.04 leg that shows none, two, or one of another shape, means the hosted image changed what \`import ctypes\` leaves open (G-KH-1); see tests/fixture/fd_probe.py."
+          open=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "Failed again: $RUN_URL"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
