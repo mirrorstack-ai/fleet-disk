@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hosted seccomp smoke (PW04): does QEMU start under the L1 unit's SystemCallFilter, and is the control attributed?
 
-  seccomp_smoke.py [--dump-out PATH] [--no-dump-check]       stdlib only; needs systemd as PID 1, QEMU and root (or `sudo -n`)
+  seccomp_smoke.py [--release 24.04|26.04] [--dump-out PATH] [--no-dump-check]   stdlib only; needs systemd as PID 1, QEMU and root (or `sudo -n`)
 
 Five `systemd-run` legs over one QEMU argv (`-machine none -S`, no KVM; stdin carries two QMP commands and QEMU exits 0 on `quit`):
   B   the shipped filter (tests/fixture/l1_unit_filter.txt, the twin of mirrorstack-fleet's unit)   must END Result=success
@@ -18,6 +18,10 @@ Ad died 31/SYS with a kernel record syscall=317 at the same ip as C and A, and t
 seccomp, so the twin must succeed" is FALSE on the real runner; the same run showed the runner logs type=1326 records in both journalctl
 -k and dmesg, and that systemd-analyze colorizes its output even when piped (so the dump is run with SYSTEMD_COLORS=0 and NO_COLOR=1 and
 its ANSI CSI sequences are stripped before it is printed, compared or written).
+`--release` picks which pinned dump the run is compared with: 24.04 (the default, tests/fixture/ubuntu2404-filter-dump.txt) or 26.04
+(ubuntu2604-filter-dump.txt, PZ03c: a hosted ubuntu-26.04 leg, systemd 259, so a move in the tables is seen before the PC). The 26.04
+fixture is the placeholder `UNPINNED` until a hosted run's dump is committed; that run fails DUMP-UNPINNED and prints the dump. The flag
+chooses the file only; it does not check that the runner is that release.
 The unit's text and QEMU's sandbox word are literals here; each twin repo pins its own copy (the limits are in PW04's entry)."""
 from __future__ import annotations
 
@@ -33,7 +37,9 @@ from typing import Callable, NamedTuple
 
 HERE = Path(__file__).resolve().parent
 FILTER_FILE = HERE / 'l1_unit_filter.txt'
-DUMP_FILE = HERE / 'ubuntu2404-filter-dump.txt'
+DUMP_FILES = {'24.04': 'ubuntu2404-filter-dump.txt', '26.04': 'ubuntu2604-filter-dump.txt'}   # one pinned dump per hosted release (PZ03c)
+DEFAULT_RELEASE = '24.04'
+DUMP_FILE = HERE / DUMP_FILES[DEFAULT_RELEASE]
 QEMU = '/usr/bin/qemu-system-x86_64'
 SANDBOX = 'on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny'   # twin of qemu.SANDBOX (fleet qemu.py:39)
 QMP_IN = '{"execute":"qmp_capabilities"}\n{"execute":"quit"}\n'
@@ -130,8 +136,15 @@ def twin_lines(legs: dict[str, Leg]) -> list[str]:
     return got
 
 
-def judge(legs: dict[str, Leg], dump: str, version: str) -> Verdict:
+def dump_file(release: str) -> Path:
+    if release not in DUMP_FILES:
+        raise ValueError(f'unknown release {release!r}; one of {", ".join(DUMP_FILES)}')
+    return HERE / DUMP_FILES[release]
+
+
+def judge(legs: dict[str, Leg], dump: str, version: str, release: str = DEFAULT_RELEASE) -> Verdict:
     """`dump` is `same`, `differs`, `unpinned`, `empty` or `skipped`."""
+    fixture_name = f'tests/fixture/{DUMP_FILES[release]}'
     bad, notes = [], []
 
     def usable(name: str) -> bool:
@@ -168,13 +181,13 @@ def judge(legs: dict[str, Leg], dump: str, version: str) -> Verdict:
         else:
             bad.append(BLIND.format(leg='A'))
     if dump == 'differs':
-        bad.append('DUMP-DIFFERS: the syscall-filter dump moved against tests/fixture/ubuntu2404-filter-dump.txt (an image bump changed the tables)')
+        bad.append(f'DUMP-DIFFERS: the syscall-filter dump moved against {fixture_name} (an image bump changed the tables)')
     elif dump == 'unpinned':
-        bad.append('DUMP-UNPINNED: tests/fixture/ubuntu2404-filter-dump.txt is the placeholder; commit the dump this run printed')
+        bad.append(f'DUMP-UNPINNED: {fixture_name} is the placeholder; commit the dump this run printed')
     elif dump == 'empty':
         bad.append('DUMP-EMPTY: systemd-analyze syscall-filter printed nothing')
     elif dump == 'skipped':
-        notes.append('DUMP-CHECK-SKIPPED (--no-dump-check: not the pinned 24.04 runner)')
+        notes.append('DUMP-CHECK-SKIPPED (--no-dump-check: not the pinned runner)')
     return Verdict('FAIL' if bad else 'PASS', tuple(bad), tuple(notes))
 
 
@@ -211,8 +224,9 @@ def normal(text: str) -> str:
 
 def smoke(run: Callable = real_run, *, which: Callable = shutil.which, exists: Callable = os.path.exists, euid: int | None = None,
           out: Callable = print, unit_text: str | None = None, dump_fixture: str | None = None, dump_out: str | None = None,
-          dump_check: bool = True) -> int:
+          dump_check: bool = True, release: str = DEFAULT_RELEASE) -> int:
     """0 PASS, 1 FAIL, 2 REFUSED. `run`, `which`, `exists`, `euid` and `out` are the test seam; the hosted call passes none."""
+    fixture_path = dump_file(release)
     el = [] if (os.geteuid() if euid is None else euid) == 0 else ['sudo', '-n']
     lines = unit_lines(FILTER_FILE.read_text(encoding='utf-8') if unit_text is None else unit_text)
     why = None if which('systemd-run') else 'systemd-run is not installed'
@@ -250,7 +264,7 @@ def smoke(run: Callable = real_run, *, which: Callable = shutil.which, exists: C
         dump = 'empty'
     else:
         if dump_fixture is None:
-            dump_fixture = DUMP_FILE.read_text(encoding='utf-8') if DUMP_FILE.exists() else ''
+            dump_fixture = fixture_path.read_text(encoding='utf-8') if fixture_path.exists() else ''
         fixture = normal(dump_fixture)
         dump = 'unpinned' if not fixture or fixture.startswith(UNPINNED) else 'same' if fixture == dump_text else 'differs'
     legs: dict[str, Leg] = {}
@@ -274,7 +288,7 @@ def smoke(run: Callable = real_run, *, which: Callable = shutil.which, exists: C
     a = go('A')
     if a.res.valid and not a.res.success:
         go('Ad')
-    verdict = judge(legs, dump, version)
+    verdict = judge(legs, dump, version, release)
     for n in twin_lines(legs):
         out(n)
     for n in verdict.notes:
@@ -288,9 +302,10 @@ def smoke(run: Callable = real_run, *, which: Callable = shutil.which, exists: C
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     p.add_argument('--dump-out', help='write the syscall-filter dump here (the workflow uploads it)')
-    p.add_argument('--no-dump-check', action='store_true', help="do not compare the dump with the 24.04 fixture (a machine that is not that runner)")
+    p.add_argument('--release', choices=sorted(DUMP_FILES), default=DEFAULT_RELEASE, help='the hosted release: picks the pinned dump to compare with')
+    p.add_argument('--no-dump-check', action='store_true', help="do not compare the dump with the pinned fixture (a machine that is not that runner)")
     a = p.parse_args(argv)
-    return smoke(dump_out=a.dump_out, dump_check=not a.no_dump_check)
+    return smoke(dump_out=a.dump_out, dump_check=not a.no_dump_check, release=a.release)
 
 
 if __name__ == '__main__':
