@@ -303,6 +303,7 @@ class Workflow(unittest.TestCase):
         self.assertRegex(rows[0], r'^\{runner: ubuntu-26\.04, os: sh, trust: ca-certificates, must_run: true, experimental: true\}')
         self.assertNotIn('26.04', re.sub(r'(?m)^\s*#.*$', '', SMOKE.split('matrix:', 1)[1].split('steps:', 1)[0]))   # the release gate's rows never name it
         self.assertNotIn('26.04', REAL_WF.split('matrix:', 1)[1].split('steps:', 1)[0])   # nor do smoke-real's
+        self.assertIn('    timeout-minutes: 25\n    continue-on-error: ${{ matrix.experimental }}\n', WF)   # the flag is what keeps a red row from failing the run; the row's bound is the job's 25
 
     def test_the_dispatch_stays_and_keeps_the_experimental_row(self):  # its no-loader failure is pinned by the plan-step tests above
         self.assertIn('workflow_dispatch:', WF)
