@@ -172,6 +172,8 @@ def report_to_values(kind: str, token: str) -> list[str]:
 class FakeKit:
     """The kit Worker and its Gate as the spec describes them, in memory. Flags make it wrong in one named way."""
 
+    POLL = 0.01                                  # how often a 'cut' pause looks at the release list
+
     def __init__(self, pubs: dict[str, str], **flags):
         self.pubs = pubs
         self.flags = flags
@@ -202,7 +204,9 @@ class FakeKit:
         self.per_target: dict[tuple[str, str | None], int] = {}
         self.admin_log: list[tuple[str, str, str, int, int]] = []  # (role, method, path, ts, status) per signed call
         self.skew_ms = 0                         # how far this kit's clock runs ahead of the real one (advance() moves it)
-        self.sleeps: list[tuple[float, bool]] = []   # fake_sleep's record: (seconds asked for, True if it moved the clock)
+        self.sleeps: list[float] = []            # fake_sleep's record: the seconds asked for (really slept)
+        self.pauses: list[tuple[str, float]] = []    # fake_pause's record: (why, seconds asked for)
+        self.cuts_seen = 0                       # how many releases the last 'cut' pause had already seen
 
     def now(self) -> int:
         return int(time.time() * 1000 + self.skew_ms)
@@ -212,18 +216,28 @@ class FakeKit:
         self.skew_ms += ms
 
     def fake_sleep(self, real=time.sleep):
-        """The `sleep` for run_replay. A wait of 2 s or more is the invite-expiry wait (short_life_ms 2500 + the 2500 ms
-        margin, about 5 s): the kit's clock moves instead of the test waiting. Every shorter wait (cut_wait 0.4, the spacings)
-        is real-time synchronisation with the fake server and really sleeps through `real`. A wait under 2 s that is the
-        expiry wait (a loaded runner already spent more than 3 s) is simply slept for real: correct, only slower."""
+        """The `sleep` for run_replay's spacings and retries: real-time synchronisation with the fake server, so it really
+        sleeps through `real`. The replay's two long waits are not here: they go through fake_pause (G-KITTEST-1)."""
         def sleep(s):
-            advanced = s >= 2.0
-            self.sleeps.append((s, advanced))
-            if advanced:
-                self.advance(s * 1000)
-            else:
-                real(s)
+            self.sleeps.append(s)
+            real(s)
         return sleep
+
+    def fake_pause(self, real=time.sleep):
+        """The `pause` for run_replay (G-KITTEST-1), named waits instead of a size heuristic. 'expiry' moves the kit's clock
+        by whatever was asked, large or small, with no real wait. 'cut' polls the release list every 10 ms, at most the
+        cut_wait asked, and returns once a release has landed since the last cut; a kit that never releases waits the whole
+        cut_wait and the replay then refuses."""
+        def pause(why, s):
+            self.pauses.append((why, s))
+            if why == 'expiry':
+                self.advance(s * 1000)
+                return
+            end = time.monotonic() + s
+            while len(self.releases) <= self.cuts_seen and time.monotonic() < end:
+                real(self.POLL)
+            self.cuts_seen = len(self.releases)
+        return pause
 
     def verify(self, role: str, ts: str, method: str, path: str, digest: str, sig_hex: str) -> bool:
         with tempfile.TemporaryDirectory() as d:
@@ -497,6 +511,7 @@ def make_handler(kit: FakeKit):
                     self.wfile.write(data[i:i + 65536])
             except OSError:
                 if name == 'bundle.tar' and not kit.flags.get('no_release') and serial != kit.flags.get('no_release_serial'):
+                    time.sleep(kit.flags.get('release_delay', 0))        # a Worker that notices the hang-up late
                     with kit.lock:
                         if inv['refunds'] < 3:
                             inv['used'] -= 1
@@ -691,12 +706,14 @@ class ServePoll(unittest.TestCase):
 
 class ReplayClock:
     """Stands in for the `time` module inside fleet-kit-check.py for one replay. run_replay asks for its late expiry wait as
-    (short_life_ms + 2500) / 1000 - (time.monotonic() - t_e): 5 s minus the REAL seconds spent since the invite was made.
-    On a slow runner those seconds already exceed 5, so no wait was asked for and the count failed (CI run 39247858912,
-    unit 3.13: `0 != 1`, every wait 0.0 to 0.4 s). Here monotonic() is virtual, one millisecond per read, so the wait is
-    always almost the full 5 s whatever the runner's speed. time(), sleep() and the rest are the real module's: the kit's
-    clock stays real + skew, so the invite still really expires when the fake sleep advances it."""
-    TICK = 0.001
+    (short_life_ms + late_margin_ms) / 1000 - (time.monotonic() - t_e): the whole wait minus the REAL seconds spent since
+    the invite was made. On a slow runner those seconds can exceed it, so no wait was asked for and the count failed (CI run
+    39247858912, unit 3.13: `0 != 1`, every wait 0.0 to 0.4 s). Here monotonic() is virtual, 0.1 ms per read, so the wait is
+    always almost the whole of it whatever the runner's speed. time(), sleep() and the rest are the real module's: the kit's
+    clock stays real + skew, so the invite still really expires when the expiry pause advances it. The test life stays 2500 ms
+    (CX04): the invite's exp is read off the real clock and two signed admin calls (an openssl child each) come between it and
+    the 'E before expiry' download, so a 300 ms life could run out in real time on a loaded runner; the margin is 200 ms."""
+    TICK = 0.0001
 
     def __init__(self):
         self.t = 0.0
@@ -1428,11 +1445,13 @@ class OverHttp(unittest.TestCase):
         time is measured on a ReplayClock, not on the runner's clock, unless real_clock (only the slow-runner control)."""
         kit = self.kit = FakeKit(self.pubs, **flags)
         # the readiness streak is the real one (10); only the waits are short here
-        kw = dict(big_mib=12, cut_wait=0.4, short_life_ms=2500, ready_spacing=0.0, retry_wait=0.0, rows_failures=20,
-              log=lambda *_: None)
+        kw = dict(big_mib=12, cut_wait=0.4, short_life_ms=2500, late_margin_ms=200, ready_spacing=0.0, retry_wait=0.0,
+                  rows_failures=20, log=lambda *_: None)
         kw.update(run or {})
-        # the expiry wait moves the kit's clock (no real wait); a `sleep` in `run` is the one every shorter wait really uses
+        # the expiry pause moves the kit's clock and the cut pause polls its releases (no flat sleep); a `sleep` in `run` is
+        # the one the spacings and retries really use
         kw['sleep'] = kit.fake_sleep(kw.get('sleep', time.sleep))
+        kw.setdefault('pause', kit.fake_pause())
         with Served(kit) as base, (nullcontext() if real_clock else mock.patch.object(kc, 'time', ReplayClock())):
             client = kc.Client(base, allow_http=True)
             lines = kc.run_replay(client, kc.Admin(client, self.gate_dir), **kw)
@@ -1885,25 +1904,52 @@ class OverHttp(unittest.TestCase):
         self.refused('root: status 200, expected 404', managed_robots_on='/', robots='managed')
 
     # -- PW08 (G-KITTEST-1): the expiry wait is the kit's clock moving, not about 5 s of sleep per replay ---------------
-    def assert_one_expiry_wait(self, kit):
-        asked = [s for s, advanced in kit.sleeps if advanced]
+    def assert_one_expiry_wait(self, kit, whole=2.7):
+        asked = [s for why, s in kit.pauses if why == 'expiry']
         # (a) the wait is still asked for (the live path is exercised) and it moved the kit's clock for it, once; with the
-        # replay's elapsed time on a ReplayClock it is almost the full 5 s, so this holds on any runner
-        self.assertEqual(len(asked), 1, kit.sleeps)
-        self.assertGreaterEqual(asked[0], 4.0)
-        self.assertLessEqual(asked[0], 5.0)
-        self.assertGreaterEqual(kit.skew_ms, asked[0] * 1000)
-        # (b) every other wait stayed real: the four cut_waits (two cuts, then the PY21 cut vector's two) are slept (not advanced); no 3 s 503 retry is ever asked for
-        # (the fake cannot answer 503 to the invite POST; if it ever does, the wrapper must exclude that literal 3)
-        real = [s for s, advanced in kit.sleeps if not advanced]
-        self.assertEqual(real.count(0.4), 4, kit.sleeps)
-        self.assertLess(max(real), 2.0)
-        self.assertNotIn(3, [s for s, _ in kit.sleeps])
-
-    def test_the_expiry_wait_costs_no_real_time(self):
-        kit, _ = self.replay()
-        self.assert_one_expiry_wait(kit)
+        # replay's elapsed time on a ReplayClock it is almost the whole wait, so this holds on any runner
+        self.assertEqual(len(asked), 1, kit.pauses)
+        self.assertGreaterEqual(asked[0], whole - 0.1)
+        self.assertLessEqual(asked[0], whole)
+        self.assertEqual(kit.skew_ms, asked[0] * 1000)
+        # (b) the cut waits are asked for four times (two cuts, then the PY21 cut vector's two), each at most cut_wait, and
+        # nothing else is paused; no 3 s 503 retry is ever slept (the fake cannot answer 503 to the invite POST; if it ever
+        # does, the wrapper must exclude that literal 3)
+        cuts = [s for why, s in kit.pauses if why == 'cut']
+        self.assertEqual(cuts, [0.4] * 4, kit.pauses)
+        self.assertEqual(len(kit.pauses), 5, kit.pauses)
+        self.assertNotIn(3, kit.sleeps)
         # no wall-clock bound on purpose: the record above is the evidence the expiry wait was not slept
+
+    # -- CX04 (G-KITTEST-1): the late margin is a parameter, the named waits cost no real time -----------------------------
+    def test_the_late_margin_defaults_to_the_live_2500_ms_and_the_live_wait_is_unchanged(self):
+        self.assertEqual(inspect.signature(kc.run_replay).parameters['late_margin_ms'].default, 2500)
+        kit, _ = self.replay(run={'short_life_ms': 2500, 'late_margin_ms': 2500})
+        self.assert_one_expiry_wait(kit, whole=5.0)                    # 2500 + 2500 ms, as before the parameter
+
+    def test_the_helpers_200_ms_margin_is_judged_expired_with_no_real_wait(self):
+        kit, _ = self.replay()                                         # the helper's own 2500 life, 200 margin
+        self.assert_one_expiry_wait(kit, whole=2.7)
+        self.assertLess(sum(kit.sleeps), 0.5, kit.sleeps)              # the spacings are 0: nothing was slept for expiry
+
+    def test_a_margin_larger_than_the_time_spent_still_waits_virtually(self):
+        kit, _ = self.replay(run={'late_margin_ms': 9000})
+        self.assert_one_expiry_wait(kit, whole=11.5)                   # 2500 + 9000 ms of the kit's clock, no real 11 s
+
+    def test_the_expiry_pause_moves_the_kit_clock_at_any_size_of_wait(self):
+        for seconds in (0.003, 0.5, 1.99, 2.0, 40.0):                  # the old heuristic moved only from 2.0 s up
+            kit, slept = FakeKit(self.pubs), []
+            before = kit.now()
+            kit.fake_pause(real=slept.append)('expiry', seconds)
+            self.assertEqual(kit.now() - before, int(seconds * 1000), seconds)
+            self.assertEqual(slept, [])
+
+    def test_a_cut_stream_the_fake_releases_late_is_waited_out_by_polling(self):
+        # the Worker notices each hang-up 0.1 s late: the poll waits for that release (cut_wait is only the ceiling, so a
+        # generous 3 s costs nothing). A kit that never releases still refuses: test_..._no_release and the serial variant
+        kit, _ = self.replay(run={'cut_wait': 3.0}, release_delay=0.1)
+        self.assertEqual(len(kit.releases), 4)
+        self.assertEqual([s for why, s in kit.pauses if why == 'cut'], [3.0] * 4)
 
     def test_a_slow_runner_still_gets_exactly_one_advanced_expiry_wait(self):
         # CI run 39247858912 (unit 3.13, 0 != 1): the runner spent the ~5 s before the late wait, so none was asked for.
@@ -1922,15 +1968,15 @@ class OverHttp(unittest.TestCase):
                 self.replay(real_clock=True)
             except kc.Refused as e:
                 self.assertIn('expired', str(e))
-        self.assertEqual([s for s, advanced in self.kit.sleeps if advanced], [], self.kit.sleeps)
+        self.assertEqual([s for why, s in self.kit.pauses if why == 'expiry'], [], self.kit.pauses)
 
-    def test_a_short_wait_really_sleeps_through_the_replays_own_sleep(self):
-        # the passthrough: every wait under 2 s reaches the `sleep` the replay was given (a recorder here), so dropping the
-        # real sleep for the cut_waits and spacings would be seen; the expiry wait never reaches it (it moves the clock)
+    def test_the_spacings_really_sleep_and_the_named_waits_never_reach_the_replays_own_sleep(self):
+        # the passthrough: a `sleep` the replay was given (a recorder here) hears the spacings and retries only; the cut
+        # waits and the expiry wait go through `pause`
         rec = []
         self.replay(run={'sleep': rec.append})
-        self.assertEqual(rec.count(0.4), 4, rec)       # the two cuts and the cut vector's two
-        self.assertLess(max(rec), 2.0, rec)
+        self.assertNotIn(0.4, rec)
+        self.assertEqual([s for s in rec if s > 0.2], [], rec)
 
     def test_without_the_clock_moving_the_invite_does_not_expire(self):
         # positive control: the replay needs the clock to move; with the expiry wait skipped and the kit's clock held,
