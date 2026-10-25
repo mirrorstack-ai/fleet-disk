@@ -338,14 +338,17 @@ stdout is the manifest, one `key value` line each: `tip <sha>`, `run <id>`, then
 land tool reads (`action` is `keep` when the tip's `.sig` verifies for the exact bytes, else `sign`). Review lines go to stderr
 behind `# `: per signed file its sha256, old and new serial and the names of the keys that changed, and per new or changed host its
 two key fingerprints; never a value, since this repository is public. A refusal prints `REFUSED <word> <path>` on stderr and exits
-1 with no manifest: `shape` (also a hosts line `vendor/pin-summary.py` refuses), `size` (over 1 MiB), `serial` (not above the previous
-signed body's, read unverified at the last commit that added or changed the `.sig`, unless the bytes are the same), `head` (a deploy
-head outside main's first 300 first parents, not an ancestor of the release tip, not a descendant of the previous signed head, or
-whose `fleet/slot/model.py` lacks the ctl namespace), `tree`, `blob` (a work-pin blob that is not the release tree's
+1 with no manifest: `shape` (also a hosts line `vendor/pin-summary.py` refuses), `size` (over 1 MiB), `serial` (not above every earlier
+signed body's, read unverified at each commit that added or changed the `.sig`, unless the bytes are the previous body's; a `keep`
+whose serial is below any of them is refused too), `head` (a deploy
+head outside main's first 300 first parents, not an ancestor of the release tip, not a descendant of the last signed non-null head, or
+whose `fleet/slot/model.py` has no module-level `SIG_NS` literal mapping `ctl` to the ctl namespace), `tree`, `blob` (a work-pin blob that is not the release tree's
 `.github/workflows/work.yml`), `tip-moved`, `unread`, `vendor`, `pub`, `fetch`. `fleet-pins-plan.py clone URL DIR` takes a
-`--filter=blob:none` clone and falls back to a full clone when that fails (not measured here: it needs the FLEET_READ key).
+`--filter=blob:none` clone and falls back to a full clone when that fails (not measured here: it needs the FLEET_READ key); a DIR that already holds files is
+refused (`fetch`) and never touched.
 `vendor/pin-summary.py` is the fleet's `bin/pin-summary.py` byte for byte at fleet main 754265e0, pinned by
-`vendor/pin-summary.sha256`; `tests/test_pins_plan.py` compares its tables with the fleet's copy when `FLEET_REPO` names a clone.
+`vendor/pin-summary.sha256`; `tests/test_pins_plan.py` holds the fleet's own digest as a literal (so a change to the vendored copy needs a visible edit there)
+and compares its tables with the fleet's copy when `FLEET_REPO` names a clone.
 
 ## Trust model
 

@@ -28,6 +28,8 @@ GIT_ENV = {'PATH': '/usr/bin:/bin:/opt/homebrew/bin', 'GIT_CONFIG_GLOBAL': os.de
            'GIT_TERMINAL_PROMPT': '0', 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@x', 'GIT_COMMITTER_NAME': 't',
            'GIT_COMMITTER_EMAIL': 't@x'}
 FLEET_HEAD = '754265e031aef3cf12b5767336569b234a1d7294'  # the fleet main vendor/pin-summary.py was copied at
+FLEET_PIN_SUMMARY_SHA256 = '09d264cce60a7b0cebc2303bfa796a70289f3aabd8e756bc9758d11c97a98d9d'  # sha256 of fleet's bin/pin-summary.py there
+CTL_NS = 'mirrorstack-fleet-ctl'  # a literal on purpose: the tests must not follow a changed pp.NS
 PLACE = {
     'fleet/hosts.json': b'{"serial": 0, "hosts": []}\n',
     'fleet/core/gateway.json': b'{"serial": 0, "address": null, "cert_sha256": null, "manifest_key": null, '
@@ -36,7 +38,7 @@ PLACE = {
     'fleet/core/deploy-pin.json': b'{"serial": 0, "head": null}\n',
     'fleet/core/proven.json': b'{"serial": 0, "digests": {}}\n'}
 HOSTS, GATEWAY, WORK, DEPLOY, PROVEN = pp.FILES
-MODEL = b"SIG_NS = {'pin': 'mirrorstack-fleet-pin', " + pp.CTL_TEXT + b"}\n"
+MODEL = b"SIG_NS = {'pin': 'mirrorstack-fleet-pin', 'ctl': 'mirrorstack-fleet-ctl'}\n"
 J = lambda doc: json.dumps(doc).encode() + b'\n'  # noqa: E731
 
 
@@ -87,7 +89,7 @@ class Plans(unittest.TestCase):
         self.git('branch', '-f', 'release', 'main')
         return self.git('rev-parse', 'release')
 
-    def sig(self, body: bytes, ns: str = pp.NS, key: Path | None = None) -> bytes:
+    def sig(self, body: bytes, ns: str = CTL_NS, key: Path | None = None) -> bytes:
         f = self.tmp / 'body'
         f.write_bytes(body)
         f.with_name('body.sig').unlink(missing_ok=True)  # ssh-keygen asks before it overwrites
@@ -162,19 +164,53 @@ class Plans(unittest.TestCase):
         self.with_body(PROVEN, J({'serial': 5, 'digests': {}}))  # above 4, below the deleted one's body
         self.assertEqual(self.rows(self.plan()[1])[PROVEN], ('5', 'sign'))
 
+    def test_an_older_signed_pair_committed_back_is_no_keep_and_no_lower_serial_signs_after_it(self):
+        old = {PROVEN: J({'serial': 2, 'digests': {}})}
+        self.sign_set(old)
+        self.sign_set({PROVEN: J({'serial': 5, 'digests': {}})})
+        self.assertEqual(self.rows(self.plan()[1])[PROVEN], ('5', 'keep'))
+        self.sign_set(old)  # the validly signed serial-2 body and sig, back at the tip
+        self.refused('serial', PROVEN)
+        self.with_body(PROVEN, J({'serial': 3, 'digests': {}}))  # and a fresh serial below the highest ever signed
+        self.refused('serial', PROVEN)
+        self.with_body(PROVEN, J({'serial': 6, 'digests': {}}))
+        self.assertEqual(self.rows(self.plan()[1])[PROVEN], ('6', 'sign'))
+
+    def test_the_serial_history_is_the_release_tips_not_mains(self):
+        self.sign_set({PROVEN: J({'serial': 2, 'digests': {}})})
+        self.commit({PROVEN: J({'serial': 9, 'digests': {}}), f'{PROVEN}.sig': self.sig(J({'serial': 9, 'digests': {}}))})  # main only
+        self.git('checkout', '-q', '-b', 'side', 'release')
+        self.commit({PROVEN: J({'serial': 3, 'digests': {}})})
+        self.git('branch', '-f', 'release', 'side')
+        self.git('checkout', '-q', 'main')
+        self.assertEqual(self.rows(self.plan()[1])[PROVEN], ('3', 'sign'))
+
     # ---- shapes and sizes
 
     def test_a_wrong_key_set_or_loader_rule_is_refused_per_file(self):
         sha, key = '1' * 40, self.publine
+        raw = 'ssh-ed25519 ' + base64.b64encode(bytes(51)).decode()  # key-shaped, but not an ed25519 key blob
         live = {'serial': 1, 'address': '203.0.113.9', 'cert_sha256': '2' * 64, 'manifest_key': f'ssh-ed25519 {key}',
                 'session_key': f'ssh-ed25519 {key}', 'next': None, 'r9_closed': False}
-        bad = {HOSTS: [{'serial': 1, 'hosts': [], 'x': 1}, {'serial': 1}, {'serial': 1, 'hosts': ['a']}],
+        nxt = {k: live[k] for k in ('address', 'cert_sha256', 'manifest_key', 'session_key')}
+        bad = {HOSTS: [{'serial': 1, 'hosts': [], 'x': 1}, {'serial': 1}, {'serial': 1, 'hosts': ['a']},
+                       {'serial': -1, 'hosts': []}],
                GATEWAY: [{k: v for k, v in live.items() if k != 'next'}, {**live, 'upload_port': 443}, {**live, 'address': '01.2.3.4'},
-                         {**live, 'manifest_key': 'ssh-rsa AAAA'}],
-               WORK: [{'serial': 1, 'pins': [], 'sub': None, 'x': 1}, {'serial': 1, 'pins': [{'work_sha': sha}], 'sub': 's'}],
+                         {**live, 'manifest_key': 'ssh-rsa AAAA'}, {**live, 'upload_port': 1023}, {**live, 'upload_port': 8443},
+                         {**live, 'upload_port': 65536}, {**live, 'upload_port': True}, {**live, 'address': 'fe80::1%eth0'},
+                         {**live, 'r9_closed': 1}, {**live, 'manifest_key': raw}, {**live, 'session_key': raw},
+                         {**live, 'next': {**nxt, 'cert_sha256': 'zz'}}, {**live, 'next': {**nxt, 'session_key': raw}},
+                         {**live, 'next': {**nxt, 'upload_port': 443}}, {**live, 'next': {**nxt, 'x': 1}}],
+               WORK: [{'serial': 1, 'pins': [], 'sub': None, 'x': 1}, {'serial': 1, 'pins': [{'work_sha': sha}], 'sub': 's'},
+                      {'serial': 1, 'pins': [{'work_sha': sha, 'blob': sha}, {'work_sha': sha, 'blob': '2' * 40}], 'sub': 's'},
+                      {'serial': 1, 'pins': [], 'sub': 's' * 513}, {'serial': 1, 'pins': [{'work_sha': sha, 'blob': sha}], 'sub': None},
+                      {'serial': 1, 'pins': [{'work_sha': sha.upper().replace('1', 'A'), 'blob': sha}], 'sub': 's'}],
                DEPLOY: [{'serial': 1, 'head': sha}, {'serial': 1, 'head': None, 'tree': sha}, {'serial': 1, 'head': sha, 'tree': None},
-                        {'serial': 1, 'head': sha, 'tree': sha, 'x': 1}],  # M8: no tree beside a head
-               PROVEN: [{'serial': 1, 'digests': {'amiga': '2' * 64}}, {'serial': 1, 'digests': {}, 'wire_floor': 0}]}
+                        {'serial': 1, 'head': sha, 'tree': sha, 'x': 1},  # M8: no tree beside a head
+                        {'serial': 1, 'head': 'A' * 40, 'tree': 'A' * 40}, {'serial': 1, 'head': sha, 'tree': 'A' * 40}],
+               PROVEN: [{'serial': 1, 'digests': {'amiga': '2' * 64}}, {'serial': 1, 'digests': {}, 'wire_floor': 0},
+                        {'serial': 2 ** 63, 'digests': {}}, {'serial': 1, 'digests': {}, 'wire_floor': 256}, {'serial': 1, 'digests': {'linux': 'A' * 64}},
+                        {'serial': 1, 'digests': {'linux': '2' * 40}}]}
         for path, docs in bad.items():
             for doc in docs:
                 with self.subTest(path=path, doc=doc):
@@ -189,6 +225,34 @@ class Plans(unittest.TestCase):
                 self.refused('shape', PROVEN)
         self.with_body(PROVEN, J({'serial': 1, 'digests': {'linux': '2' * 64}, 'wire_floor': 2}))  # the control
         self.assertEqual(self.plan()[0], 0)
+
+    def test_the_edges_of_each_shape_rule_are_accepted(self):
+        key = f'ssh-ed25519 {self.publine}'
+        live = {'serial': 1, 'address': '2001:db8::1', 'cert_sha256': '2' * 64, 'manifest_key': key, 'session_key': key,
+                'r9_closed': True, 'upload_port': 1024}
+        for path, doc in ((PROVEN, {'serial': 2 ** 63 - 1, 'digests': {}, 'wire_floor': 255}),
+                          (WORK, {'serial': 1, 'pins': [], 'sub': 's' * 512}),
+                          (GATEWAY, {**live, 'next': {**{k: live[k] for k in ('address', 'cert_sha256', 'manifest_key', 'session_key')},
+                                                      'upload_port': 65535}})):
+            with self.subTest(path=path):
+                self.with_body(path, J(doc))
+                self.assertEqual(self.plan()[0], 0)
+                self.with_body(path, PLACE[path])
+
+    def test_the_loader_caps_integers_at_19_digits_and_nesting_at_5(self):
+        for text, ok in ((b'{"serial": 1, "x": 9999999999999999999}\n', True), (b'{"serial": 1, "x": 10000000000000000000}\n', False),
+                         (b'{"serial": 1, "x": -999999999999999999}\n', True), (b'{"serial": 1, "x": -9999999999999999999}\n', True),
+                         (b'{"serial": 1, "x": -10000000000000000000}\n', False),
+                         (b'{"serial": 1, "x": [[[[1]]]]}\n', True), (b'{"serial": 1, "x": [[[[[1]]]]]}\n', False),
+                         (b'{"serial": 1, "x": {"y": {"z": [[]]}}}\n', True), (b'{"serial": 1, "x": {"y": {"z": [[{}]]}}}\n', False),
+                         (b'{"serial": 1, "x": "[[[[[[[[[[\\"]]]]]]]]]]"}\n', True)):
+            with self.subTest(text=text):
+                if ok:
+                    self.assertEqual(pp.load(text, 'p')['serial'], 1)
+                else:
+                    with self.assertRaises(pp.Refused):
+                        pp.load(text, 'p')
+        self.assertEqual(pp.NS, CTL_NS)
 
     def test_a_body_over_one_mib_is_refused(self):
         for extra, code in ((0, 0), (1, 1)):
@@ -240,11 +304,24 @@ class Plans(unittest.TestCase):
                 self.assertEqual(self.rows(self.plan()[1])[DEPLOY], ('1', 'sign'))
         self.git('checkout', '-q', 'main')
 
-    def test_a_head_without_the_ctl_namespace_text_is_refused(self):  # M7
-        old = self.commit({'fleet/slot/model.py': b"SIG_NS = {'pin': 'mirrorstack-fleet-pin'}\n"})
-        self.chain(1)
-        self.deploy(old)
-        self.refused('head', DEPLOY)
+    def test_a_head_without_the_ctl_namespace_in_its_sig_ns_is_refused(self):  # M7
+        real = (b"SIG_NS: Mapping[Literal['manifest', 'pin', 'ctl'], str] = MappingProxyType({  # raw Ed25519\n"
+                b"    'pin': 'mirrorstack-fleet-pin',\n    'ctl': 'mirrorstack-fleet-ctl'})\n")  # the fleet's own spelling
+        for label, model, ok in (('absent', b"SIG_NS = {'pin': 'mirrorstack-fleet-pin'}\n", False),
+                                 ('only a comment', b"# 'ctl': 'mirrorstack-fleet-ctl'\nSIG_NS = {'pin': 'p'}\n", False),
+                                 ('only a string', b"X = \"'ctl': 'mirrorstack-fleet-ctl'\"\nSIG_NS = {'pin': 'p'}\n", False),
+                                 ('another name', b"OTHER = {'ctl': 'mirrorstack-fleet-ctl'}\nSIG_NS = {'pin': 'p'}\n", False),
+                                 ('wrong value', b"SIG_NS = {'ctl': 'mirrorstack-fleet-ctlx'}\n", False),
+                                 ('not python', b"SIG_NS = {'ctl': 'mirrorstack-fleet-ctl'\n", False),
+                                 ('the real spelling', real, True), ('a bare dict', MODEL, True)):
+            with self.subTest(label):
+                head = self.commit({'fleet/slot/model.py': model})
+                self.chain(1)
+                self.deploy(head)
+                if ok:
+                    self.assertEqual(self.rows(self.plan()[1])[DEPLOY], ('1', 'sign'))
+                else:
+                    self.refused('head', DEPLOY)
 
     def test_a_previous_head_that_is_not_an_ancestor_is_refused_and_a_descendant_is_signed(self):
         a, b, c, _ = self.chain()
@@ -253,6 +330,19 @@ class Plans(unittest.TestCase):
         self.refused('head', DEPLOY)
         self.deploy(c, serial=2)
         self.assertEqual(self.rows(self.plan()[1])[DEPLOY], ('2', 'sign'))
+
+    def test_the_roll_forward_rule_holds_across_a_signed_null_head(self):
+        a, b, c, d = self.chain()
+        tree = lambda h: self.git('rev-parse', f'{h}^{{tree}}')  # noqa: E731
+        self.sign_set({DEPLOY: J({'serial': 1, 'head': c, 'tree': tree(c)})})
+        self.sign_set({DEPLOY: J({'serial': 2, 'head': None})})
+        self.deploy(a, serial=3)  # an older head than the last signed non-null one
+        self.refused('head', DEPLOY)
+        self.deploy(d, serial=3)
+        self.assertEqual(self.rows(self.plan()[1])[DEPLOY], ('3', 'sign'))
+        self.sign_set({DEPLOY: J({'serial': 3, 'head': 'xyz', 'tree': tree(d)})})  # a previous head that is no sha
+        self.deploy(d, serial=4)
+        self.refused('head', DEPLOY)
 
     # ---- hosts, work-pin (M5), and what is printed (M3)
 
@@ -270,6 +360,12 @@ class Plans(unittest.TestCase):
         self.assertEqual((code, self.rows(out)[HOSTS]), (0, ('1', 'sign')))
         self.assertRegex(err, r'# hosts new SHA256:\S+ -\n')
         self.assertNotRegex(err + out, r'box-1|owner-a')
+        self.sign_set({HOSTS: J({'serial': 1, 'hosts': [self.host()]})})
+        self.with_body(HOSTS, J({'serial': 2, 'hosts': [self.host(owner='owner-b')]}))  # the same box, one line changed
+        code, out, err = self.plan()
+        self.assertEqual((code, self.rows(out)[HOSTS]), (0, ('2', 'sign')))
+        self.assertRegex(err, r'# hosts changed SHA256:\S+ -\n')
+        self.assertNotRegex(err + out, r'hosts new|owner-b')
 
     def test_each_work_pin_blob_must_be_the_release_trees_work_yml(self):
         yml = self.commit({'.github/workflows/work.yml': b'name: work\n'})
@@ -324,11 +420,62 @@ class Plans(unittest.TestCase):
         self.assertRegex(out.getvalue(), r'clone (filtered|full)\n')
         self.assertTrue((dest / '.git').is_dir())
 
+    def test_clone_never_touches_a_folder_that_already_holds_files(self):
+        calls = []
+        full = self.tmp / 'full'
+        full.mkdir()
+        (full / 'keep.txt').write_text('mine')
+        with self.assertRaises(pp.Refused):
+            pp.clone('url', str(full), lambda *a, **k: calls.append(a))
+        self.assertEqual((calls, (full / 'keep.txt').read_text()), ([], 'mine'))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(pp.main(['p', 'clone', str(self.repo), str(full)]), 1)
+        self.assertEqual((err.getvalue(), (full / 'keep.txt').read_text()), ('REFUSED fetch -\n', 'mine'))
+        empty = self.tmp / 'empty'  # an empty folder stays, and stays empty, when both tries fail
+        empty.mkdir()
+        self.assertTrue(empty.is_dir() and not any(empty.iterdir()))
+
+        def junk(*args, **kw):
+            (empty / 'half').write_text('x')
+            return None
+        with self.assertRaises(pp.Refused):
+            pp.clone('url', str(empty), junk)
+        self.assertTrue(empty.is_dir() and not any(empty.iterdir()))
+        with self.assertRaises(pp.Refused):  # a failed clone into a path the planner would create leaves nothing
+            pp.clone('url', str(self.tmp / 'new'), junk)
+        self.assertFalse((self.tmp / 'new').exists())
+
+    def test_the_release_and_main_defaults_are_origin_release_and_origin_main(self):
+        base = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '-q', '-b', 'side', base)
+        head = self.commit({'side': b'x'})  # on the release side only
+        tree = self.git('rev-parse', f'{head}^{{tree}}')
+        deploy = self.commit({DEPLOY: J({'serial': 1, 'head': head, 'tree': tree})})
+        self.git('checkout', '-q', 'main')
+        plain = self.commit({'plain': b'y'})
+        main = self.commit({'m': b'z'})
+        run = lambda: self.run_defaults()  # noqa: E731
+        self.git('update-ref', 'refs/remotes/origin/main', main)
+        self.git('update-ref', 'refs/remotes/origin/release', plain)  # a tip that is not main's
+        code, out, err = run()
+        self.assertEqual((code, out.splitlines()[0], err), (0, f'tip {plain}', err))
+        self.git('update-ref', 'refs/remotes/origin/release', deploy)  # its head is in release but not in main's first parents
+        self.assertEqual(run()[::2], (1, 'REFUSED head fleet/core/deploy-pin.json\n'))
+
+    def run_defaults(self) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = pp.main(['p', 'plan', '--repo', str(self.repo), '--pub', self.pub, '--run-id', '1'])
+        return code, out.getvalue(), err.getvalue()
+
 
 class Vendor(unittest.TestCase):
     def test_the_vendored_summary_is_its_pin_and_runs(self):
         data = (ROOT / 'vendor/pin-summary.py').read_bytes()
         self.assertEqual(hashlib.sha256(data).hexdigest() + '\n', (ROOT / 'vendor/pin-summary.sha256').read_text())
+        # the fleet's own digest, held here: a change to the vendored copy (and its .sha256) needs a visible edit of this literal
+        self.assertEqual(hashlib.sha256(data).hexdigest(), FLEET_PIN_SUMMARY_SHA256)
         self.assertEqual(pp.vendored_summary().check_hosts(PLACE[HOSTS]), {})
 
     @unittest.skipUnless(os.environ.get('FLEET_REPO'), 'FLEET_REPO (a fleet clone) is not set')
@@ -343,6 +490,7 @@ class Vendor(unittest.TestCase):
         for name in tables:
             a, b = getattr(ours, name), getattr(mod, name)
             self.assertEqual(getattr(a, 'pattern', a), getattr(b, 'pattern', b), name)
+        self.assertEqual(hashlib.sha256(theirs).hexdigest(), FLEET_PIN_SUMMARY_SHA256)
         self.assertEqual(theirs, (ROOT / 'vendor/pin-summary.py').read_bytes())  # and unchanged
 
 
