@@ -1,0 +1,37 @@
+{
+  "serial": 18,
+  "files": [
+    {
+      "path": "carrier-check.py",
+      "sha256": "3626b85a654857bf7d67f27b4def6ca1a096518fdb9e253afcf946dadf523a02"
+    },
+    {
+      "path": "check.ps1",
+      "sha256": "c0a942e33fcd4af8513136da03aac2e2bbe6ccdae1688b5df0175ca9114c5567"
+    },
+    {
+      "path": "carrier-check.sh",
+      "sha256": "0a95383714f16d43a96b4ea30bfa6168db2ac0079d5402a9648a0b85b467e19c"
+    },
+    {
+      "path": "verify-archive.py",
+      "sha256": "30f4ccc69cb7c0a6978446bf7355521b5c5dcf6274e53828fec4416009eb8a33"
+    },
+    {
+      "path": "VERIFY.txt",
+      "sha256": "d9cf1654048465b46ae4b277e654c9fcd3a5ddb0f3f34b5a71f1015149bf1c04"
+    }
+  ],
+  "python_zip": {
+    "version": "3.14.7",
+    "sha256": "d297e5ff019966817ad8502465176139f2d3d840fa4ed84b13bed399a6ab1f15"
+  },
+  "python_mac": {
+    "version": "3.14.7",
+    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260929/cpython-3.14.7+20260929-aarch64-apple-darwin-install_only.tar.gz",
+    "sha256": "0211ccf04c5e0a0feb0b9bf1148030e1f6a31b8eae624f13919a7752a4e3dc79"
+  },
+  "refuse_hosts_sha256": [
+    "d1160c80219b48cc63bdebe1ef74a134aa4f7afbfea9c09acbcc70f0efbc619e"
+  ]
+}

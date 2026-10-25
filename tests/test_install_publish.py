@@ -3256,7 +3256,7 @@ class Workflow(unittest.TestCase):
                           'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093', 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02'])
         self.assertIn('          name: loaders\n          path: loaders\n', fixture)
         self.assertEqual(re.findall(r'(?m)^      - run: (.*)$', fixture),
-                         ['python3 tests/fixture/make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh'])
+                         ['python3 tests/fixture/make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh --kit-json loaders/kit.json'])
         self.assertNotIn('inputs.', body)   # the dispatch inputs reach it through no step
         self.assertEqual(fixture.count('persist-credentials: false'), 1)
         self.assertLess(fixture.index('name: loaders'), fixture.index('make_fixture.py'))
@@ -3277,7 +3277,7 @@ class Workflow(unittest.TestCase):
         self.assertLess(self.TEXT.index('\n  plan:\n'), self.TEXT.index('\n  smoke:\n'))
         self.assertLess(self.TEXT.index('\n  smoke:\n'), self.TEXT.index('\n  sign:\n'))
 
-    def test_the_plan_job_hands_only_the_two_loaders_to_the_fixture_job(self):
+    def test_the_plan_job_hands_only_the_two_loaders_and_the_kit_to_the_fixture_job(self):
         plan = self.JOBS['plan']
         self.assertEqual(re.findall(r'(?m)^          name: (\S+)$', plan), ['loaders', 'install-stage'])
         up = re.search(r'(?ms)^      - uses: actions/upload-artifact@\w+ +# v4\.6\.2\n        with:\n          name: loaders\n(.*?)(?=^      - |\Z)', plan)
@@ -3324,7 +3324,7 @@ class Workflow(unittest.TestCase):
     SH, PS1 = b'#!/bin/sh\necho sh\n', b'# ps1\n$x = 1\n'
 
     @unittest.skipUnless(os.path.exists(fp.GIT), 'git is missing')
-    def test_the_loaders_step_reads_the_lf_blobs_though_the_checked_out_ps1_is_crlf_and_uploads_only_those_two(self):
+    def test_the_loaders_step_reads_the_lf_blobs_though_the_checked_out_ps1_is_crlf_and_uploads_only_those_three(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             rt, tip = self.loaders_repo(tmp, {'bootstrap.sh': self.SH, 'bootstrap.ps1': self.PS1, 'install.json': b'{}\n', 'kit.json': b'{}\n'})
@@ -3337,7 +3337,8 @@ class Workflow(unittest.TestCase):
             done = self.run_loaders(tmp, rt, tip=tip)
             self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
             out = rt / 'loaders'
-            self.assertEqual(sorted(p.name for p in out.iterdir()), ['bootstrap.ps1', 'bootstrap.sh'])   # nothing else of the folder goes out
+            self.assertEqual(sorted(p.name for p in out.iterdir()), ['bootstrap.ps1', 'bootstrap.sh', 'kit.json'])   # nothing else of the folder goes out (G-SMOKE-MAC-1: the kit's python_mac pin)
+            self.assertEqual((out / 'kit.json').read_bytes(), b'{}\n')
             self.assertEqual((out / 'bootstrap.ps1').read_bytes(), self.PS1)   # the blob, not the working tree
             self.assertNotIn(b'\r', (out / 'bootstrap.ps1').read_bytes())
             self.assertEqual((out / 'bootstrap.sh').read_bytes(), self.SH)
@@ -3349,6 +3350,7 @@ class Workflow(unittest.TestCase):
             for what, files, want in (('no ps1', {'bootstrap.sh': self.SH}, 'REFUSED loader bootstrap.ps1'),
                                       ('no sh', {'bootstrap.ps1': self.PS1}, 'REFUSED loader bootstrap.sh'),
                                       ('an empty sh', {'bootstrap.sh': b'', 'bootstrap.ps1': self.PS1}, 'REFUSED loader bootstrap.sh'),
+                                      ('no kit.json', {'bootstrap.sh': self.SH, 'bootstrap.ps1': self.PS1}, 'REFUSED loader kit.json'),
                                       ('neither', {'install.json': b'{}\n'}, 'REFUSED loader bootstrap.sh')):
                 with self.subTest(what):
                     (tmp / what.replace(' ', '-')).mkdir()
