@@ -196,8 +196,14 @@ class Fixture(unittest.TestCase):
     def bundle(self, **kw):
         return self.invoke('bundle', str(self.folder), '--owner-pub', str(self.pub), **kw)
 
+    def sig_args(self) -> tuple[str, ...]:
+        """`--sig FILE` over the fixture tip's own signature file, as the kit job passes gwsign's (CV05d: the verb never reads the tip's):
+        the tip holds an owner signature of the record in the pin namespace, which stands in for gwsign's here; no such file, no option."""
+        found = self.origin / 'fleet/core/gateway.json.sig'
+        return ('--sig', str(found)) if found.exists() else ()
+
     def gateway(self, **kw):
-        return self.invoke('gateway', '--owner-pub', str(self.pub), **kw)
+        return self.invoke('gateway', '--owner-pub', str(self.pub), *self.sig_args(), **kw)
 
     def assertClean(self):
         """Nothing is left behind: the runner's temp folder and the key's folder are empty again."""
@@ -506,7 +512,7 @@ class TestGateway(Fixture):
     def test_a_missing_pair_or_a_serial_the_host_cannot_hold_is_refused(self):
         git(self.origin, 'rm', '-q', 'fleet/core/gateway.json.sig')
         git(self.origin, 'commit', '-q', '-m', 'no sig')
-        self.assertEqual(self.gateway()[:2], (1, 'REFUSED gateway\n'))
+        self.assertEqual(self.gateway()[:2], (1, 'REFUSED sig\n'))  # a live record and no --sig (CV05d)
         record = json.dumps(self.record(3))
         bodies = [record.replace('"serial": 3', f'"serial": {bad}') for bad in ('0', '"3"', 'true', '3000000000', '1000000000', '3.5')]
         bodies += ['{}', '[]', record.replace('"serial": 3', '"serial": 3, "serial": 4')]
@@ -642,7 +648,7 @@ class TestGatewayNotLive(Fixture):
         git(self.origin, 'commit', '-q', '--allow-empty', '-m', 'edit')
 
     def check(self, **kw):
-        return self.invoke('gateway', '--check', '--owner-pub', str(self.pub), **kw)
+        return self.invoke('gateway', '--check', '--owner-pub', str(self.pub), *self.sig_args(), **kw)
 
     def refuses(self, word: str, why: str) -> None:
         for run in (self.gateway, self.check):
@@ -713,20 +719,21 @@ class TestGatewayNotLive(Fixture):
         self.tip(PLACEHOLDER, 'install')
         self.refuses('sig', 'a placeholder signed in the wrong namespace')
         self.tip(PLACEHOLDER, 'empty')
-        self.refuses('gateway', 'a placeholder with an empty signature file')
+        self.refuses('sig', 'a placeholder with an empty signature file')
         self.tip(PLACEHOLDER, 'dir')
-        self.refuses('gateway', 'a placeholder and a folder where the signature should be')
+        self.refuses('sig', 'a placeholder and a folder where the signature should be')
         self.tip(json.dumps({**json.loads(PLACEHOLDER), 'address': '203.0.113.9'}), 'pin')
         self.refuses('gateway', 'a signed serial 0 with an address')
 
     def test_serial_zero_with_an_address_or_a_null_address_with_a_serial_is_refused_unsigned(self):
+        """With no --sig every record that is not the placeholder is `REFUSED sig` (CV05d; it was `REFUSED gateway` while the tip's own file decided)."""
         base = json.loads(PLACEHOLDER)
         for name, edit in {'serial 0 with an address': {'address': '203.0.113.9'},
                            'address null with serial 3': {'serial': 3},
                            'address null with serial 1': {'serial': 1},
                            'a live-looking record': {'serial': 3, 'address': '203.0.113.9', 'cert_sha256': 'ab' * 32}}.items():
             self.tip(json.dumps({**base, **edit}), None)
-            self.refuses('gateway', name)
+            self.refuses('sig', name)
 
     def test_a_record_that_only_looks_like_the_placeholder_is_refused(self):
         """End to end through both verbs, a few of each kind; the whole list is judged by is_placeholder just below."""
@@ -739,7 +746,7 @@ class TestGatewayNotLive(Fixture):
                   'an oversized record': json.dumps({**base, 'pad': 'x' * fk.MAX_GATEWAY_JSON})}
         for name, body in bodies.items():
             self.tip(body, None)
-            self.refuses('gateway', name)
+            self.refuses('gateway' if name in ('an empty file', 'an oversized record') else 'sig', name)  # no record the host takes, or no --sig
 
     def test_is_placeholder_is_an_exact_match(self):
         base = json.loads(PLACEHOLDER)
@@ -771,14 +778,14 @@ class TestGatewayNotLive(Fixture):
         record.chmod(0o755)
         git(self.origin, 'add', '-A')
         git(self.origin, 'commit', '-q', '-m', 'mode')
-        self.refuses('gateway', 'mode 100755')
+        self.refuses('sig', 'mode 100755')
         record.chmod(0o644)
         record.unlink()
         (self.origin / 'fleet/core/target.json').write_text(PLACEHOLDER + '\n')
         record.symlink_to('target.json')
         git(self.origin, 'add', '-A')
         git(self.origin, 'commit', '-q', '-m', 'symlink')
-        self.refuses('gateway', 'mode 120000')
+        self.refuses('sig', 'mode 120000')
 
     def test_a_signed_record_with_a_null_address_and_a_serial_is_judged_live_as_before(self):
         self.tip(json.dumps({**json.loads(PLACEHOLDER), 'serial': 3}), 'pin')
@@ -791,32 +798,72 @@ class TestGatewayNotLive(Fixture):
     def test_a_git_failure_while_reading_the_tip_refuses_and_never_skips(self):
         self.tip(PLACEHOLDER)
         real = fk.git_run
-        sig_listing = ('ls-tree', fk.FLEET_TIP, '--', fk.GATEWAY_SIG_PATH)
+        listing = ('ls-tree', fk.FLEET_TIP, '--', fk.GATEWAY_PATH)
 
         def failing(repo, env, *args, **kw):
-            if args == sig_listing:
+            if args == listing:
                 raise fk.Refused('fetch')
             return real(repo, env, *args, **kw)
 
         def strange(repo, env, *args, **kw):
-            return b'something else\n' if args == sig_listing else real(repo, env, *args, **kw)
+            return b'something else\n' if args == listing else real(repo, env, *args, **kw)
 
         for name, replacement in (('ls-tree fails', failing), ('ls-tree answers something unexpected', strange)):
             with mock.patch.object(fk, 'git_run', replacement):
                 self.refuses('gateway', name)
 
+    def test_the_tips_own_signature_file_is_never_asked_for_in_any_state(self):
+        """CV05d: no git call of the verb names fleet/core/gateway.json.sig, whether the record is live, the placeholder or absent, and
+        whether a --sig is given or not."""
+        real, asked = fk.git_run, []
+
+        def spy(repo, env, *args, **kw):
+            asked.append(args)
+            return real(repo, env, *args, **kw)
+
+        sig = self.tmp / 'given.sig'
+        sig.write_bytes(b'x')
+        with mock.patch.object(fk, 'git_run', spy):
+            for text, sigkind in ((PLACEHOLDER, 'pin'), (PLACEHOLDER, None), (json.dumps(self.record(3)), 'pin'), (json.dumps(self.record(3)), None), (None, 'pin')):
+                self.tip(text, sigkind)
+                for extra in ((), ('--sig', str(sig))):
+                    for verb in (('gateway',), ('gateway', '--check')):
+                        self.invoke(*verb, '--owner-pub', str(self.pub), *extra, net=Boom())
+        self.assertGreater(len(asked), 20)
+        self.assertEqual([a for a in asked if any(fk.GATEWAY_SIG_PATH in str(x) or str(x).endswith('.sig') for x in a)], [])
+        self.assertIn(('ls-tree', fk.FLEET_TIP, '--', fk.GATEWAY_PATH), asked)  # control: the spy sees the record's own listing
+
+    def test_the_placeholder_is_a_skip_whatever_signature_file_the_tip_holds_beside_it(self):
+        for kind in ('pin', 'install', 'stale', 'empty', 'dir'):
+            self.tip(PLACEHOLDER, kind)
+            for verb in (('gateway',), ('gateway', '--check')):
+                net = Boom()
+                self.assertEqual(self.invoke(*verb, '--owner-pub', str(self.pub), net=net), (0, SKIP_LINE, ''), kind)  # no --sig: the tip's file is not read
+                self.assertEqual(net.calls, [])
+        self.assertClean()
+
+    def test_a_live_looking_record_with_no_sig_option_is_refused_sig_whatever_the_tip_holds_beside_it(self):
+        live = json.dumps(self.record(3))
+        for kind in (None, 'pin', 'install', 'stale', 'empty', 'dir'):
+            self.tip(live, kind)
+            for verb in (('gateway',), ('gateway', '--check')):
+                net = Boom()
+                self.assertEqual(self.invoke(*verb, '--owner-pub', str(self.pub), net=net)[:2], (1, 'REFUSED sig\n'), (kind, verb))
+                self.assertEqual(net.calls, [])
+        self.assertClean()
+
     def test_a_live_looking_record_without_a_signature_or_with_a_bad_one_is_refused(self):
         live = json.dumps(self.record(3))
         self.tip(live, None)
-        self.refuses('gateway', 'no signature')
+        self.refuses('sig', 'no signature')
         self.tip(json.dumps(self.record(4)), 'stale')  # the stale signature is of the serial 3 record
         self.refuses('sig', 'a signature of other bytes')
         self.tip(live, 'install')
         self.refuses('sig', 'the wrong namespace')
         self.tip(live, 'empty')
-        self.refuses('gateway', 'an empty signature')
+        self.refuses('sig', 'an empty signature')
         self.tip(live, 'dir')
-        self.refuses('gateway', 'a folder of that name')
+        self.refuses('sig', 'a folder of that name')
 
     def test_the_check_never_uploads_in_any_state(self):
         base = json.loads(PLACEHOLDER)
@@ -909,10 +956,33 @@ class TestGatewayCiSignature(Fixture):
         self.assertEqual((net.calls, self.net.calls), ([], []))
         self.assertClean()
 
-    def test_without_the_option_the_tips_own_signature_is_still_what_is_judged(self):
-        # control: the same tip without --sig carries another key's signature, so it is REFUSED sig, as before AF08
-        self.assertEqual(self.gateway(net=Boom())[:2], (1, 'REFUSED sig\n'))
+    def test_without_the_option_a_live_record_is_refused_sig_and_the_tips_own_signature_is_not_read(self):
+        # CV05d: it was judged before. The same tip without --sig carries another key's signature: REFUSED sig, as it did
+        self.assertEqual(self.invoke('gateway', '--owner-pub', str(self.pub), net=Boom())[:2], (1, 'REFUSED sig\n'))
         self.assertEqual(self.check(net=Boom())[:2], (1, 'REFUSED sig\n'))
+        # and a tip signature the baked key made, in the pin namespace (which the verb once took), no longer rescues it
+        (self.origin / 'fleet/core/gateway.json.sig').write_bytes(self.sig_file().read_bytes())
+        git(self.origin, 'add', '-A')
+        git(self.origin, 'commit', '-q', '-m', 'a good pin signature at the tip')
+        for verb in (('gateway',), ('gateway', '--check')):
+            self.assertEqual(self.invoke(*verb, '--owner-pub', str(self.pub), net=Boom())[:2], (1, 'REFUSED sig\n'), verb)
+        self.assertEqual(self.net.calls, [])
+
+    def test_a_tip_signature_in_the_control_namespace_is_ignored_and_the_file_in_the_pin_namespace_passes(self):
+        CTL = 'mirrorstack-fleet-' + 'ctl'  # what CV05e puts at the tip: the same key, another namespace; the verb must not touch it
+        tip = self.origin / 'fleet/core/gateway.json'
+        (self.origin / 'fleet/core/gateway.json.sig').unlink()
+        ssh_sign(self.ci, tip, CTL)
+        git(self.origin, 'add', '-A')
+        git(self.origin, 'commit', '-q', '-m', 'a control namespace signature at the tip')
+        self.assertIn(b'BEGIN SSH SIGNATURE', (self.origin / 'fleet/core/gateway.json.sig').read_bytes())
+        sig = self.sig_file()
+        for check in (True, False):
+            code, out, err = self.with_sig(sig, check, net=Boom() if check else None)
+            self.assertEqual((code, err), (0, ''), out)
+            self.assertTrue(out.startswith('OK gateway-check serial=3' if check else 'OK gateway serial=3 json='), out)
+        self.assertEqual(json.loads(self.net.calls[0]['body'])['sig'], base64.b64encode(sig.read_bytes()).decode())  # gwsign's, not the tip's
+        self.assertEqual(self.check(net=Boom())[:2], (1, 'REFUSED sig\n'))  # with no --sig, the control signature does not stand in
 
     def test_a_signature_by_another_key_is_refused_sig(self):
         self.refuses_sig(self.sig_file(key=self.owner), 'sig', 'the control key')
@@ -930,7 +1000,7 @@ class TestGatewayCiSignature(Fixture):
         (self.origin / 'fleet/core/gateway.json.sig').write_bytes(self.sig_file().read_bytes())  # the tip now holds a good CI signature
         git(self.origin, 'add', '-A')
         git(self.origin, 'commit', '-q', '-m', 'ci signature at the tip')
-        self.assertIn('serial=3', self.check()[1])  # control: that tip is good without --sig
+        self.assertEqual(self.check()[:2], (1, 'REFUSED sig\n'))  # control: that tip's signature is not read without --sig either (CV05d)
         self.refuses_sig(self.sig_file(key=self.owner), 'sig', 'bad file, good tip')
         self.refuses_sig(self.sig_file(namespace=fp.NS), 'sig', 'wrong namespace file, good tip')
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -102,7 +103,9 @@ class Signs(unittest.TestCase):
 
 @unittest.skipUnless(HAVE_TOOLS, 'ssh-keygen or git is missing')
 class GwsignRuns(unittest.TestCase):
-    """The two run: blocks of the job `gwsign`, run for real."""
+    """The two run: blocks of the job `gwsign`, run for real. CV05d: live is a body that is not the placeholder and the very bytes the plan
+    judged (its output `gateway_sha`, which these tests take from the committed record unless they say otherwise), in both series; the tip's
+    own gateway.json.sig is never looked at, so it is committed here or not as each test likes."""
 
     @classmethod
     def setUpClass(cls):
@@ -154,8 +157,12 @@ class GwsignRuns(unittest.TestCase):
     def fetch(self, tip: str, **over):
         script = body('gwsign', 'fetch')
         self.assertIn('/dev/shm/gwfetch.', script)
-        env = {**GIT_ENV, 'HOME': str(self.tmp), 'RUNNER_TEMP': str(self.runner), 'GITHUB_OUTPUT': str(self.out), 'SERIES': 'test',
-               'GH_HOSTKEY': 'github.com ssh-ed25519 AAAA', 'FLEET_REPO': self.origin.as_uri(), 'FLEET_READ': 'THROWAWAY-READ-KEY', 'TIP': tip}
+        env = {**GIT_ENV, 'PATH': f'{self.bin}:{GIT_ENV["PATH"]}', 'HOME': str(self.tmp), 'RUNNER_TEMP': str(self.runner),
+               'GITHUB_OUTPUT': str(self.out), 'SERIES': 'test', 'GH_HOSTKEY': 'github.com ssh-ed25519 AAAA', 'FLEET_REPO': self.origin.as_uri(),
+               'FLEET_READ': 'THROWAWAY-READ-KEY', 'TIP': tip}
+        shown = subprocess.run([fp.GIT, '-C', str(self.origin), 'show', f'{tip}:fleet/core/gateway.json'], env=GIT_ENV, capture_output=True).stdout \
+            if re.fullmatch('[0-9a-f]{40}', tip) else b''
+        env['GATEWAY_SHA'] = sha(shown) if shown else ''   # what the plan's `gateway` step hands on for this tip's record
         env.update(over)
         done = subprocess.run(['/bin/bash', '-c', script.replace('/dev/shm/', f'{self.shm}/')], env=env, capture_output=True, text=True, cwd=self.tmp)
         self.assertEqual(list(self.shm.iterdir()), [], 'the read key is gone on every path')
@@ -178,13 +185,46 @@ class GwsignRuns(unittest.TestCase):
         for word in ('MANIFEST-KEY-WORD', 'SESSION-KEY-WORD', '203.0.113.9'):
             self.assertNotIn(word, done.stdout + done.stderr)
 
-    def test_no_signature_file_at_the_tip_is_not_live_and_nothing_is_kept(self):
-        for record in (PLACEHOLDER, RECORD, None):
-            with self.subTest(record):
+    def test_the_placeholder_is_not_live_whatever_signature_file_the_tip_holds_and_nothing_is_kept(self):
+        for sig in (None, b'a signature\n', b''):
+            with self.subTest(sig):
                 self.out.unlink(missing_ok=True)
-                done, out = self.fetch(self.commit(record, None))
+                done, out = self.fetch(self.commit(PLACEHOLDER, sig))
                 self.assertEqual((done.returncode, out, done.stdout), (0, {'live': 'no'}, 'SKIP gwsign not-live\n'))
                 self.assertFalse(self.record_file.exists())
+                self.assertFalse(self.record_file.parent.exists())
+
+    def test_a_five_key_record_with_no_signature_at_the_tip_is_live_in_both_series(self):
+        """CV05d: the tip's own signature was the old live switch; the plan's verdict on the bytes is the new one, so none is needed."""
+        for series in ('test', 'release'):
+            for sig in (None, b'a signature\n'):
+                with self.subTest(series=series, sig=sig):
+                    self.out.unlink(missing_ok=True)
+                    shutil.rmtree(self.runner / 'gwsign', ignore_errors=True)
+                    done, out = self.fetch(self.commit(RECORD, sig), SERIES=series)
+                    self.assertEqual((done.returncode, out, done.stdout), (0, {'live': 'yes'}, f'gateway record: {len(RECORD)} bytes\n'))
+                    self.assertEqual(self.record_file.read_bytes(), RECORD)
+
+    def test_no_record_at_the_tip_is_refused_not_skipped_with_or_without_a_signature(self):
+        for sig in (None, b'a signature\n'):
+            self.out.unlink(missing_ok=True)
+            done, out = self.fetch(self.commit(None, sig))
+            self.assertEqual((done.returncode, out, done.stdout), (1, {}, 'REFUSED gateway\n'), sig)
+
+    def test_bytes_the_plan_did_not_judge_are_refused_unchecked_and_not_kept(self):
+        """The plan's `gateway_sha` is the verdict: none (the plan saw the placeholder, or refused), or another sha256, is not a signature."""
+        tip = self.commit()
+        for what, over in (('no verdict', {'GATEWAY_SHA': ''}), ('another body', {'GATEWAY_SHA': sha(RECORD + b' ')}), ('upper case', {'GATEWAY_SHA': sha(RECORD).upper()}),
+                           ('a prefix', {'GATEWAY_SHA': sha(RECORD)[:63]})):
+            with self.subTest(what):
+                self.out.unlink(missing_ok=True)
+                done, out = self.fetch(tip, **over)
+                self.assertEqual((done.returncode, out, done.stdout), (1, {}, 'REFUSED gateway unchecked\n'), what)
+                self.assertFalse(self.record_file.exists())
+                self.assertFalse(self.record_file.parent.exists())
+        self.out.unlink(missing_ok=True)
+        done, out = self.fetch(tip)   # control: the plan's own sha256 of these bytes is taken
+        self.assertEqual((done.returncode, out), (0, {'live': 'yes'}))
 
     def test_a_tip_that_moved_since_the_plan_is_refused(self):
         old = self.commit()
@@ -221,8 +261,12 @@ class GwsignRuns(unittest.TestCase):
                 self.assertFalse(self.record_file.exists())
                 self.assertFalse(self.record_file.parent.exists())
         self.out.unlink(missing_ok=True)
-        done, out = self.fetch(self.commit(PLACEHOLDER))   # control: the check can say yes; the placeholder names all five keys
+        done, out = self.fetch(self.commit(RECORD))   # control: the check can say yes
         self.assertEqual((done.returncode, out), (0, {'live': 'yes'}))
+        self.out.unlink(missing_ok=True)
+        shutil.rmtree(self.runner / 'gwsign')   # the control kept the record, as it should
+        done, out = self.fetch(self.commit(PLACEHOLDER))   # the placeholder names all five keys and is still not live: nothing to sign
+        self.assertEqual((done.returncode, out, done.stdout), (0, {'live': 'no'}, 'SKIP gwsign not-live\n'))
 
     def test_a_tip_that_is_not_a_full_lower_case_sha_is_refused_before_anything_is_read(self):
         tip = self.commit()
@@ -231,12 +275,13 @@ class GwsignRuns(unittest.TestCase):
                 done, out = self.fetch(bad)
                 self.assertEqual((done.returncode, out, done.stdout), (1, {}, 'REFUSED gateway tip\n'))
 
-    def test_a_release_series_run_signs_nothing_and_keeps_nothing(self):
-        done, out = self.fetch(self.commit(), SERIES='release')
-        self.assertEqual((done.returncode, out, done.stdout), (0, {'live': 'no'}, 'SKIP gwsign series\n'))
-        self.assertFalse(self.record_file.exists())
-        done, out = self.fetch(self.commit(), SERIES='')
-        self.assertEqual((done.returncode, done.stdout), (0, 'SKIP gwsign series\n'))   # only the word `test` signs
+    def test_the_series_does_not_reach_the_fetch_step_and_no_series_word_is_skipped(self):
+        for series in ('release', 'test', ''):
+            self.out.unlink(missing_ok=True)
+            shutil.rmtree(self.runner / 'gwsign', ignore_errors=True)
+            done, out = self.fetch(self.commit(), SERIES=series)
+            self.assertEqual((done.returncode, out, done.stdout), (0, {'live': 'yes'}, f'gateway record: {len(RECORD)} bytes\n'), series)
+        self.assertNotIn('SKIP gwsign series', TEXT.split('\njobs:\n', 1)[1])
 
     # --- the sign step, then the kit verb on what it made
 
@@ -294,8 +339,18 @@ class GwsignRuns(unittest.TestCase):
             self.assertEqual(ok.returncode == 0, good, namespace)
         self.assertEqual(self.kit_check(sig, record=RECORD + b' '), (1, 'REFUSED sig\n'))   # another record is not covered
 
-    def test_the_sign_step_in_a_release_series_run_or_with_another_key_signs_nothing(self):
-        for want, over in (('REFUSED series', {'SERIES': 'release'}), ('REFUSED series', {'SERIES': ''}), ('REFUSED key', {'key': self.stranger}),
+    def test_the_sign_step_signs_in_the_release_series_too_under_the_same_key_rule(self):
+        self.place()
+        done, out = self.sign(SERIES='release')
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(set(out), {'gateway_sig'})
+        self.out.unlink()
+        self.place()
+        done, out = self.sign(SERIES='release', key=self.stranger)   # the key rule is the series' own: another key signs nothing
+        self.assertEqual((done.returncode, out, done.stdout), (1, {}, 'REFUSED key\n'))
+
+    def test_the_sign_step_in_an_unknown_series_or_with_another_key_signs_nothing(self):
+        for want, over in (('REFUSED series', {'SERIES': 'Release'}), ('REFUSED series', {'SERIES': ''}), ('REFUSED key', {'key': self.stranger}),
                            ('REFUSED key-not-set', {'KEY_SHA256': 'SHA256:NOT-SET-fill-in-after-keygen'})):
             self.place()   # a refused run removes the record with the key, so each starts from a fresh one
             done, out = self.sign(**over)
@@ -349,6 +404,248 @@ class GwsignRuns(unittest.TestCase):
         sig.write_bytes(base64.b64decode(out['gateway_sig']))
         self.assertEqual(self.kit_check(sig, record=RECORD), (0, 'OK gateway-check serial=3\n'))
 
+
+
+class GatewayPlanStatic(unittest.TestCase):
+    """CV05d, ledger G-CV05-M10: the plan's `gateway` step stands before anything is signed, and gwsign takes only its verdict."""
+
+    def test_the_gateway_step_runs_the_pins_planner_on_the_record_alone_before_the_loaders_the_smoke_and_any_signature(self):
+        plan = JOBS['plan']
+        ids = re.findall(r'(?m)^      - id: (\w+)$', plan)
+        self.assertEqual(ids[:4], ['immutable', 'plan', 'gateway', 'loaders'])   # right after the plan, before the loaders artifact
+        self.assertLess(plan.index('      - id: gateway\n'), plan.index('actions/upload-artifact'))
+        run = body('plan', 'gateway')
+        self.assertIn('python3 bin/fleet-pins-plan.py plan --repo "$RUNNER_TEMP/fleet"', run)
+        self.assertIn('--only fleet/core/gateway.json', run)
+        self.assertIn('--tip "$TIP"', run)   # the planner judges the tip the plan judged
+        self.assertLess(run.index('"$KEY_SHA256"'), run.index('python3 '))   # the public line is checked against the baked fingerprint first
+        self.assertNotIn('secrets.', step('plan', 'gateway'))
+        self.assertEqual(re.findall(r'(?m)^          (\w+): ', step('plan', 'gateway')), ['TIP'])
+        self.assertIn('/dev/shm/gwplan.', run)
+        # nothing that signs runs before it: sign and gwsign need the plan job as a whole, which fails with this step
+        self.assertIn('    needs: [plan, smoke]\n', JOBS['sign'])
+        self.assertIn('    needs: [plan, sign]\n', JOBS['gwsign'])
+        self.assertIn('GATEWAY_SHA: ${{ needs.plan.outputs.gateway_sha }}', step('gwsign', 'fetch'))
+
+    def test_gwsign_never_looks_at_the_tips_signature_and_signs_in_both_series(self):
+        job = JOBS['gwsign']
+        self.assertNotIn('fleet/core/gateway.json.sig', job)
+        self.assertNotIn('ls-tree "$TIP" -- fleet/core/gateway.json.sig', job)
+        self.assertNotIn('gwsign series', TEXT)
+        self.assertNotIn('SERIES" != test', job)
+        self.assertNotIn('SERIES" = test', job)
+        self.assertIn('case "$SERIES" in test | release) ;; *) echo \'REFUSED series\'; exit 1;; esac', body('gwsign', 'sign'))
+        self.assertIn('namespaces="mirrorstack-fleet-pin"', job)   # still the kit host's namespace, never the control one
+        self.assertNotIn(CTL, job)
+
+    def test_the_kit_job_passes_the_signature_whenever_gwsign_made_one_and_the_verb_reads_no_tip_signature(self):
+        kit = JOBS['kit']
+        self.assertIn('GATEWAY_SIG: ${{ needs.gwsign.outputs.gateway_sig }}', kit)
+        self.assertIn('if [ -n "$GATEWAY_SIG" ]; then', kit)
+        self.assertEqual(kit.count('--sig '), 1)
+        self.assertEqual(kit.count('${args[@]+"${args[@]}"}'), 2)   # the check and the upload both get it
+        source = inspect.getsource(fk.read_gateway_pair)
+        self.assertNotIn('GATEWAY_SIG_PATH', source)   # the verb reads the record at the tip and nothing else there
+        self.assertEqual(source.count('tip_blob('), 1)
+
+
+def _live_record(mkey: str, skey: str, serial: int = 3, **over) -> bytes:
+    doc = {'serial': serial, 'address': '203.0.113.9', 'cert_sha256': 'ab' * 32, 'manifest_key': mkey, 'session_key': skey,
+           'next': None, 'r9_closed': False, **over}
+    return json.dumps(doc).encode() + b'\n'
+
+
+@unittest.skipUnless(HAVE_TOOLS, 'ssh-keygen or git is missing')
+class GatewayPlanRuns(unittest.TestCase):
+    """The plan job's `gateway` step run for real over the real planner, a local git repository standing in for the fleet clone, then the
+    gwsign steps over what it output: an unchecked body is refused before any signing (G-CV05-M10)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.keys = Path(tempfile.mkdtemp(prefix='gwplan-test-keys-'))
+        cls.baked = keygen(cls.keys, 'baked')
+        cls.pin = fingerprint(cls.baked)
+        cls.pub = ' '.join((cls.keys / 'baked.pub').read_text().split()[:2])
+        cls.mkey, cls.skey = (' '.join((keygen(cls.keys, n)).with_suffix('.pub').read_text().split()[:2]) for n in ('m', 's'))
+        cls.live = _live_record(cls.mkey, cls.skey)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.keys, ignore_errors=True)
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='gwplan-test-'))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.shm, self.runner, self.bin = self.tmp / 'shm', self.tmp / 'runner', self.tmp / 'bin'
+        for folder in (self.shm, self.runner, self.bin):
+            folder.mkdir()
+        (self.bin / 'base64').write_text('#!/bin/sh\nif [ "$1" = -w0 ]; then /usr/bin/base64 | tr -d "\\n"; else exec /usr/bin/base64 "$@"; fi\n')
+        sum_tool = '/usr/bin/shasum -a 256' if os.path.exists('/usr/bin/shasum') else '/usr/bin/sha256sum'
+        (self.bin / 'sha256sum').write_text(f'#!/bin/sh\nexec {sum_tool} "$@"\n')
+        (self.bin / 'python3').symlink_to(__import__('sys').executable)
+        for tool in ('base64', 'sha256sum'):
+            (self.bin / tool).chmod(0o755)
+        self.fleet = self.runner / 'fleet'   # the plan job's clone: refs/remotes/origin/release is the tip
+        self.fleet.mkdir()
+        git(self.fleet, 'init', '-q', '-b', 'release')
+        self.out = self.runner / 'out'
+
+    def commit(self, record: bytes | None, sig: bytes | None = None) -> str:
+        """A commit on the release branch holding the record (and a signature file when `sig` is given); the clone's remote ref follows."""
+        core = self.fleet / 'fleet/core'
+        core.mkdir(parents=True, exist_ok=True)
+        for name, data in (('gateway.json', record), ('gateway.json.sig', sig)):
+            (core / name).unlink(missing_ok=True)
+            if data is not None:
+                (core / name).write_bytes(data)
+        git(self.fleet, 'add', '-A')
+        git(self.fleet, 'commit', '-q', '--allow-empty', '-m', 'tip')
+        tip = git(self.fleet, 'rev-parse', 'HEAD')
+        git(self.fleet, 'update-ref', 'refs/remotes/origin/release', tip)
+        return tip
+
+    def base_env(self, **over) -> dict[str, str]:
+        env = {'PATH': f'{self.bin}:/usr/bin:/bin', 'HOME': str(self.tmp), 'RUNNER_TEMP': str(self.runner), 'GITHUB_OUTPUT': str(self.out),
+               'GITHUB_RUN_ID': '4242', 'SERIES': 'test', 'KEY_SHA256': self.pin, 'KEY_PUB': self.pub, **{k: v for k, v in GIT_ENV.items() if k.startswith('GIT_')}}
+        env.update(over)
+        return env
+
+    def plan(self, tip: str, **over):
+        script = body('plan', 'gateway').replace('/dev/shm/', f'{self.shm}/')
+        done = subprocess.run(['/bin/bash', '-c', script], env=self.base_env(TIP=tip, **over), capture_output=True, text=True, cwd=ROOT)
+        self.assertEqual(list(self.shm.iterdir()), [])
+        out = dict(line.split('=', 1) for line in self.out.read_text().splitlines()) if self.out.exists() else {}
+        return done, out
+
+    def gwfetch(self, tip: str, sha_out: str):
+        script = body('gwsign', 'fetch').replace('/dev/shm/', f'{self.shm}/')
+        env = self.base_env(TIP=tip, GATEWAY_SHA=sha_out, FLEET_REPO=self.fleet.as_uri(), FLEET_READ='THROWAWAY', GH_HOSTKEY='github.com ssh-ed25519 AAAA')
+        env['PATH'] = f'{self.bin}:{GIT_ENV["PATH"]}'
+        self.out.unlink(missing_ok=True)
+        done = subprocess.run(['/bin/bash', '-c', script], env=env, capture_output=True, text=True, cwd=self.tmp)
+        out = dict(line.split('=', 1) for line in self.out.read_text().splitlines()) if self.out.exists() else {}
+        return done, out
+
+    def gwsign(self, series: str = 'test'):
+        script = body('gwsign', 'sign').replace('/dev/shm/', f'{self.shm}/')
+        env = self.base_env(SIGN_KEY=(self.keys / 'baked').read_text(), SERIES=series)
+        self.out.unlink(missing_ok=True)
+        done = subprocess.run(['/bin/bash', '-c', script], env=env, capture_output=True, text=True, cwd=self.tmp)
+        out = dict(line.split('=', 1) for line in self.out.read_text().splitlines()) if self.out.exists() else {}
+        return done, out
+
+    def test_a_good_live_record_is_planned_output_by_sha256_and_signed_by_the_two_gwsign_steps_in_both_series(self):
+        tip = self.commit(self.live)
+        for series in ('test', 'release'):
+            self.out.unlink(missing_ok=True)
+            shutil.rmtree(self.runner / 'gwsign', ignore_errors=True)
+            done, out = self.plan(tip, SERIES=series)
+            self.assertEqual((done.returncode, out), (0, {'gateway_sha': sha(self.live)}), done.stdout + done.stderr)
+            self.assertIn('gateway planned: serial 3, sha256 ' + sha(self.live) + ', sign\n', done.stdout)
+            for word in ('203.0.113.9', self.mkey.split()[1], self.skey.split()[1]):
+                self.assertNotIn(word, done.stdout + done.stderr)   # no value of the record is printed
+            fetched, out2 = self.gwfetch(tip, out['gateway_sha'])
+            self.assertEqual((fetched.returncode, out2), (0, {'live': 'yes'}), fetched.stdout + fetched.stderr)
+            signed, out3 = self.gwsign(series)
+            self.assertEqual((signed.returncode, set(out3)), (0, {'gateway_sig'}), signed.stdout + signed.stderr)
+
+    def test_the_placeholder_is_planned_as_not_live_with_an_empty_sha_and_gwsign_then_skips(self):
+        placeholder = (b'{"serial": 0, "address": null, "cert_sha256": null, "manifest_key": null, "session_key": null, "next": null, '
+                       b'"r9_closed": false}\n')
+        tip = self.commit(placeholder)
+        done, out = self.plan(tip)
+        self.assertEqual((done.returncode, out, done.stdout), (0, {'gateway_sha': ''}, 'SKIP gateway-plan not-live\n'))
+        fetched, out2 = self.gwfetch(tip, out['gateway_sha'])
+        self.assertEqual((fetched.returncode, out2, fetched.stdout), (0, {'live': 'no'}, 'SKIP gwsign not-live\n'))
+
+    def refused(self, tip: str, word: str, **over):
+        done, out = self.plan(tip, **over)
+        self.assertEqual(out, {}, 'a refused plan outputs nothing')
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn(word, done.stdout, done.stdout + done.stderr)
+        return done
+
+    def unchecked_is_never_signed(self, tip: str) -> None:
+        """After a refusal the plan outputs no sha256: a gwsign fetch over the same tip, given what the plan output (nothing), signs nothing."""
+        fetched, out = self.gwfetch(tip, '')
+        self.assertEqual((fetched.returncode, out), (1, {}))
+        self.assertIn(fetched.stdout, ('REFUSED gateway unchecked\n', 'REFUSED gateway\n'))   # unchecked, or the older shape grep got there first
+        self.assertFalse((self.runner / 'gwsign').exists())
+
+    def test_a_body_with_the_wrong_keys_is_refused_by_the_plan_before_any_signing(self):
+        """The old gwsign check (five names, fixed strings) took all of these: the RECORD of the gwsign tests has no `next` and no `r9_closed`."""
+        live = json.loads(self.live)
+        bodies = {'no next, no r9_closed (the old five-key record)': json.dumps({k: v for k, v in live.items() if k not in ('next', 'r9_closed')}).encode() + b'\n',
+                  'an extra key': json.dumps({**live, 'extra': 1}).encode() + b'\n',
+                  'a key short': json.dumps({k: v for k, v in live.items() if k != 'session_key'}).encode() + b'\n',
+                  'an address that is not an address': _live_record(self.mkey, self.skey, address='not-an-ip'),
+                  'a manifest key that is not a key': _live_record('MANIFEST-KEY-WORD', self.skey),
+                  'a cert sha that is short': _live_record(self.mkey, self.skey, cert_sha256='ab' * 31),
+                  'a text serial': _live_record(self.mkey, self.skey, serial='3')}
+        for what, record in bodies.items():
+            with self.subTest(what):
+                self.out.unlink(missing_ok=True)
+                tip = self.commit(record)
+                self.refused(tip, 'REFUSED ')
+                self.unchecked_is_never_signed(tip)
+        done = self.refused(self.commit(json.dumps({**live, 'extra': 1}).encode() + b'\n'), 'REFUSED shape fleet/core/gateway.json')
+        self.assertNotIn('REFUSED manifest', done.stdout)
+
+    def test_a_serial_that_is_not_above_the_previous_signed_one_is_refused_by_the_plan_before_any_signing(self):
+        self.commit(_live_record(self.mkey, self.skey, serial=5), b'a signature of the serial 5 record\n')   # the history: a signed 5
+        for what, record in (('a lower serial', _live_record(self.mkey, self.skey, serial=3)),
+                             ('the same serial, other bytes', _live_record(self.mkey, self.skey, serial=5, r9_closed=True))):
+            with self.subTest(what):
+                tip = self.commit(record, b'a signature of the serial 5 record\n')
+                self.out.unlink(missing_ok=True)
+                self.refused(tip, 'REFUSED serial fleet/core/gateway.json')
+                self.unchecked_is_never_signed(tip)
+        # controls: a higher serial, and the very bytes again, are planned
+        for what, record, want in (('a higher serial', _live_record(self.mkey, self.skey, serial=6), 6),
+                                   ('the same bytes again', _live_record(self.mkey, self.skey, serial=5), 5)):
+            with self.subTest(what):
+                tip = self.commit(record, b'a signature of the serial 5 record\n')
+                self.out.unlink(missing_ok=True)
+                done, out = self.plan(tip)
+                self.assertEqual((done.returncode, out), (0, {'gateway_sha': sha(record)}), done.stdout + done.stderr)
+                self.assertIn(f'gateway planned: serial {want}, ', done.stdout)
+
+    def test_a_tip_that_is_not_the_one_the_plan_judged_and_a_wrong_key_line_are_refused(self):
+        tip = self.commit(self.live)
+        self.commit(_live_record(self.mkey, self.skey, serial=4))   # the release moved on
+        self.refused(tip, 'REFUSED tip-moved')
+        tip = self.commit(self.live)
+        self.refused('x' * 40, 'REFUSED gateway tip')
+        self.refused('', 'REFUSED gateway tip')
+        other = keygen(self.keys, 'other-pub')
+        done = self.refused(tip, 'REFUSED key-pub', KEY_PUB=' '.join(Path(str(other) + '.pub').read_text().split()[:2]))
+        self.assertNotIn('REFUSED shape', done.stdout)
+
+    def test_a_null_address_with_a_serial_is_not_for_the_kit_host(self):
+        null = _live_record(self.mkey, self.skey, serial=4, address=None, cert_sha256=None, manifest_key=None, session_key=None)
+        self.refused(self.commit(null), 'REFUSED gateway')
+
+    def test_a_manifest_the_planner_did_not_print_is_refused_whatever_it_says(self):
+        """The step re-reads what the planner printed (a stand-in planner here): another file's row, a row more, or a sha256 that is not the tip's body."""
+        tip = self.commit(self.live)
+        stub = self.tmp / 'stub'
+        (stub / 'bin').mkdir(parents=True)
+        (stub / 'bin/fleet-pins-plan.py').write_text('import os, sys\nsys.stdout.write(open(os.environ["STUB_MANIFEST"]).read())\n')
+        row = f'fleet/core/gateway.json {sha(self.live)} 3 sign'
+        cases = {'control': (f'tip {tip}\nrun 1\n{row}\n', None), 'another path': (f'tip {tip}\nrun 1\n{row.replace("gateway", "hosts")}\n', 'REFUSED manifest'),
+                 'two rows': (f'tip {tip}\nrun 1\n{row}\n{row}\n', 'REFUSED manifest'), 'an unknown action': (f'tip {tip}\nrun 1\n{row[:-4]}maybe\n', 'REFUSED manifest'),
+                 'another body': (f'tip {tip}\nrun 1\n{row.replace(sha(self.live), sha(b"x"))}\n', 'REFUSED gateway'),
+                 'a field more': (f'tip {tip}\nrun 1\n{row} x\n', 'REFUSED manifest')}
+        script = body('plan', 'gateway').replace('/dev/shm/', f'{self.shm}/')
+        for what, (text, want) in cases.items():
+            with self.subTest(what):
+                self.out.unlink(missing_ok=True)
+                (self.tmp / 'm').write_text(text)
+                done = subprocess.run(['/bin/bash', '-c', script], env=self.base_env(TIP=tip, STUB_MANIFEST=str(self.tmp / 'm')), capture_output=True, text=True, cwd=stub)
+                if want is None:
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                else:
+                    self.assertEqual((done.returncode, done.stdout, self.out.exists()), (1, want + '\n', False))
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------

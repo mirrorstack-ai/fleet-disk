@@ -16,32 +16,40 @@
 #            not refuse what it must refuse. It proves the pipeline in VMs (no /dev/kvm: the good run ends in `kvm`), not the install.
 #   sign     needs plan and smoke (which needs fixture); runs no repository code and no third-party action: holds SIGN_KEY only in memory, refuses unless its
 #            fingerprint is KEY_SHA256 below, signs the three files, verifies them and wipes the key.
-#   gwsign   needs plan and sign; signs the gateway record for the kit host, in the TEST series only (SERIES=test; the owner's answer
-#            of 2026-10-21 to D311, option 5B). The kit job's `gateway` verb and both bootstraps verify gateway.json.sig under the baked key,
-#            and nothing but this job signs gateway.json under it, so a live pair signed by anybody else ends `REFUSED sig` there.
+#   gwsign   needs plan and sign; signs the gateway record for the kit host, in BOTH series (SERIES test or release, the same key rule: the
+#            fingerprint of SIGN_KEY must be KEY_SHA256) and only when a gateway is live: the record at the release tip is not the placeholder
+#            (address null) and is the very body the plan's `gateway` step judged (CV05d, D342; the owner's answer of 2026-10-21 to D311,
+#            option 5B, made it test-only and keyed on a `gateway.json.sig` at the tip, which a hand-made signature once switched on. From CV05e the
+#            tip's own gateway.json.sig is the control VM's, under the control namespace, so this job never looks at it and nothing but this
+#            job makes the kit host's signature). The kit job's `gateway` verb and both bootstraps verify the pair under the baked key and the
+#            namespace `pin`, and nothing but this job signs gateway.json under it, so a live pair signed by anybody else ends `REFUSED sig` there.
 #            Two steps, no checkout, no action, no python, no output but the signature: `fetch` (FLEET_READ only) reads the record from the
-#            release tip, refuses `tip-moved` unless it is the tip the plan judged, and keeps the bytes in a file of this job's runner; no
-#            `gateway.json.sig` at the tip is not live (nothing is signed, the kit job keeps `SKIP gateway not-live`); a signature without
-#            a record, or a record over 65536 bytes, is `REFUSED gateway`. `sign` (SIGN_KEY only, no git, ssh or network child) signs that
+#            release tip, refuses `tip-moved` unless it is the tip the plan judged, and keeps the bytes in a file of this job's runner; the
+#            placeholder is not live (`SKIP gwsign not-live`, nothing is signed, the kit job keeps `SKIP gateway not-live`); a missing record, one
+#            that is not a regular file or one over 65536 bytes is `REFUSED gateway`; a body whose sha256 is not the plan's `gateway_sha` is
+#            `REFUSED gateway unchecked`. `sign` (SIGN_KEY only, no git, ssh or network child) signs that
 #            file under the namespace mirrorstack-fleet-pin and verifies it (a failed verify stops the step). Before `live=yes` the
 #            fetch step checks the bytes name the five keys of a gateway record (serial, address, cert_sha256, manifest_key, session_key;
 #            a fixed-string grep, no python or jq, a shape check and not a schema check): the pin namespace is shared with kit.json and
 #            deploy-pin.json, so without it this job would sign any file at that path for the test key; a body without them is
 #            `REFUSED gateway`. The kit verb's full schema check still runs after. The record's bytes never leave the job: the output is the
-#            signature only, the log shows a size and a sha256 at most. The tip's own gateway.json.sig stays as it is, for the control VM.
-#            In a release series run it signs nothing (`SKIP gwsign series`): the kit job then judges the tip's own signature, which must
-#            be the release key's, as before this job existed. The kit host then serves the CI signature (the test series) and no
-#            longer the tip's: the kit pipeline does not verify the tip's own signature in the test series.
+#            signature only, the log shows a size and a sha256 at most.
+#            The human live switch of the old design (a signature at the tip) is replaced by the plan's check, not dropped (attack M10, ledger
+#            G-CV05-M10): the `gateway` step of `plan` runs `bin/fleet-pins-plan.py --only fleet/core/gateway.json` over the release tip before
+#            anything is signed: the exact key set and types of a gateway record (`REFUSED shape`), at most 1 MiB, and a serial above the
+#            serial of every body that ever had a signature at the tip (`REFUSED serial`; the same bytes again are allowed). A refusal stops
+#            the whole run in `plan`, before the loaders, the boot smoke or any signature. A live body is output as `gateway_sha` (its sha256); the
+#            placeholder as an empty one; a body with address null and a serial above 0 is `REFUSED gateway` (a withdrawn record is not for the kit host).
 #   kit      puts the bundle and the gateway record on the kit host. It holds only FLEET_READ and KIT_UPLOAD_KEY (the Ed25519
 #            key whose signature the host takes; it has no Cloudflare power at all). It rebuilds the bundle from the fleet
 #            commit install.json names, with the vendored packer, refuses unless size, sha256, head and tree equal the signed
 #            install.json, and uploads it. Before the bundle it judges the gateway pair at the release tip (`gateway --check`, no
 #            upload), so a bad pair is refused before a bundle the host can never delete is stored; after the bundle it reads
-#            the record from the release tip again, checks the signature (gwsign's, passed as `--sig`, or else the tip's own
-#            gateway.json.sig) and uploads the pair.
-#            While no gateway is live (the record is the placeholder, serial 0 and address null, with no signature file) the
-#            gateway step prints `SKIP gateway not-live` and uploads nothing; any other state without a good signed pair is
-#            still a refusal. Nothing goes through the plan's files, an artifact, a cache or a log.
+#            the record from the release tip again, checks gwsign's signature (always passed as `--sig` when gwsign made one; the verb
+#            never reads the tip's own gateway.json.sig) and uploads the pair.
+#            While no gateway is live (the record is the placeholder, serial 0 and address null, and gwsign made no signature) the
+#            gateway step prints `SKIP gateway not-live` and uploads nothing; a record that is not the placeholder with no gwsign signature
+#            is `REFUSED sig`. Nothing goes through the plan's files, an artifact, a cache or a log.
 #   tag      creates the tag install-<serial> on this run's commit with the deploy key TAG_KEY.
 #   publish  runs the publisher on the plan's files plus the signatures; no environment, no secret.
 # Tag and publish both need kit, so no install tag or release page exists for a bundle the host cannot serve; a failed
@@ -132,6 +140,7 @@ jobs:
       pin_b64: ${{ steps.plan.outputs.pin_b64 }}
       pin_sha: ${{ steps.plan.outputs.pin_sha }}
       tip: ${{ steps.plan.outputs.tip }}
+      gateway_sha: ${{ steps.gateway.outputs.gateway_sha }}
       immutable: ${{ steps.immutable.outputs.immutable }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
@@ -170,6 +179,37 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           IMMUTABLE_CONFIRMED: ${{ steps.immutable.outputs.immutable }}
         run: python3 bin/fleet-install-publish.py plan "$RUNNER_TEMP/fleet" --serial "$SERIAL" --min-serial "$MIN_SERIAL" --out "$RUNNER_TEMP/out"
+      - id: gateway
+        env:
+          TIP: ${{ steps.plan.outputs.tip }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$TIP" =~ ^[0-9a-f]{40}$ ]] || { echo 'REFUSED gateway tip'; exit 1; }
+          d=$(mktemp -d /dev/shm/gwplan.XXXXXX)
+          trap 'rm -rf "$d"' EXIT
+          printf '%s\n' "$KEY_PUB" > "$d/pub"
+          [ "$(/usr/bin/ssh-keygen -l -f "$d/pub" | cut -d ' ' -f 2)" = "$KEY_SHA256" ] || { echo 'REFUSED key-pub'; exit 1; }
+          ref=refs/remotes/origin/release
+          if ! python3 bin/fleet-pins-plan.py plan --repo "$RUNNER_TEMP/fleet" --pub "$d/pub" --release "$ref" --main "$ref" --tip "$TIP" --only fleet/core/gateway.json --run-id "$GITHUB_RUN_ID" > "$d/manifest" 2> "$d/review"; then
+            cat "$d/review"
+            exit 1
+          fi
+          [ "$(grep -c . "$d/manifest")" = 3 ] || { echo 'REFUSED manifest'; exit 1; }
+          IFS=' ' read -r p h s a x < <(sed -n 3p "$d/manifest")
+          [ "$p" = fleet/core/gateway.json ] && [ -z "$x" ] && [[ "$h" =~ ^[0-9a-f]{64}$ ]] && [[ "$s" =~ ^(0|[1-9][0-9]{0,18})$ ]] && { [ "$a" = sign ] || [ "$a" = keep ]; } || { echo 'REFUSED manifest'; exit 1; }
+          git -C "$RUNNER_TEMP/fleet" show "$TIP:fleet/core/gateway.json" > "$d/body"
+          [ "$(sha256sum "$d/body" | cut -d ' ' -f 1)" = "$h" ] || { echo 'REFUSED gateway'; exit 1; }
+          if grep -qE '"address" *: *null' "$d/body"; then
+            [ "$s" = 0 ] || { echo 'REFUSED gateway'; exit 1; }
+            echo 'SKIP gateway-plan not-live'
+            echo gateway_sha= >> "$GITHUB_OUTPUT"
+          else
+            [[ "$s" =~ ^[1-9][0-9]{0,8}$ ]] || { echo 'REFUSED gateway'; exit 1; }
+            echo "gateway_sha=$h" >> "$GITHUB_OUTPUT"
+            cat "$d/review"
+            echo "gateway planned: serial $s, sha256 $h, $a"
+          fi
       - id: loaders
         env:
           SERIAL: ${{ steps.plan.outputs.serial }}
@@ -374,6 +414,7 @@ jobs:
         env:
           FLEET_READ: ${{ secrets.FLEET_READ }}
           TIP: ${{ needs.plan.outputs.tip }}
+          GATEWAY_SHA: ${{ needs.plan.outputs.gateway_sha }}
         run: |
           set -eu
           umask 077
@@ -388,26 +429,22 @@ jobs:
           git -C "$d/repo" fetch -q --no-tags --depth 1 "$FLEET_REPO" '+refs/heads/release:refs/remotes/origin/release'
           [ "$(git -C "$d/repo" rev-parse refs/remotes/origin/release)" = "$TIP" ] || { echo 'REFUSED tip-moved'; exit 1; }
           rec=$(git -C "$d/repo" ls-tree "$TIP" -- fleet/core/gateway.json | cut -f 1)
-          sig=$(git -C "$d/repo" ls-tree "$TIP" -- fleet/core/gateway.json.sig | cut -f 1)
-          if [ -z "$sig" ]; then
-            echo 'SKIP gwsign not-live'
-            echo live=no >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           case "$rec" in '100644 blob '*) ;; *) echo 'REFUSED gateway'; exit 1;; esac
           n=$(git -C "$d/repo" cat-file -s "$TIP:fleet/core/gateway.json")
           case "$n" in '' | *[!0-9]*) echo 'REFUSED gateway'; exit 1;; esac
           [ "$n" -gt 0 ] && [ "$n" -le 65536 ] || { echo 'REFUSED gateway'; exit 1; }
-          if [ "$SERIES" != test ]; then
-            echo 'SKIP gwsign series'
-            echo live=no >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           mkdir "$RUNNER_TEMP/gwsign"
           git -C "$d/repo" cat-file blob "$TIP:fleet/core/gateway.json" > "$RUNNER_TEMP/gwsign/gateway.json"
           for k in serial address cert_sha256 manifest_key session_key; do
             grep -qF "\"$k\"" "$RUNNER_TEMP/gwsign/gateway.json" || { rm -rf "$RUNNER_TEMP/gwsign"; echo 'REFUSED gateway'; exit 1; }
           done
+          if grep -qE '"address" *: *null' "$RUNNER_TEMP/gwsign/gateway.json"; then
+            rm -rf "$RUNNER_TEMP/gwsign"
+            echo 'SKIP gwsign not-live'
+            echo live=no >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [ -n "$GATEWAY_SHA" ] && [ "$(sha256sum "$RUNNER_TEMP/gwsign/gateway.json" | cut -d ' ' -f 1)" = "$GATEWAY_SHA" ] || { rm -rf "$RUNNER_TEMP/gwsign"; echo 'REFUSED gateway unchecked'; exit 1; }
           echo live=yes >> "$GITHUB_OUTPUT"
           echo "gateway record: $n bytes"
       - id: sign
@@ -417,7 +454,7 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          [ "$SERIES" = test ] || { echo 'REFUSED series'; exit 1; }
+          case "$SERIES" in test | release) ;; *) echo 'REFUSED series'; exit 1;; esac
           g="$RUNNER_TEMP/gwsign/gateway.json"
           [ -f "$g" ] && [ ! -L "$g" ] || { echo 'REFUSED gateway'; exit 1; }
           n=$(wc -c < "$g" | tr -d ' ')

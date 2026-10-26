@@ -10,23 +10,22 @@ runs here), builds the bundle with the vendored packer (vendor/bundle.py) and re
 equal install.json (`REFUSED bundle-hash`). Only then does it PUT /_k/file/<serial>/bundle.tar and compare what the host
 says it stored.
 
-`gateway`: reads fleet/core/gateway.json and fleet/core/gateway.json.sig from the tip of the fleet `release` branch, checks
-the owner's signature under the pin's namespace (ssh-keygen -Y verify) and the shape of the record, and PUTs the pair as one
-request, so the host flips to it whole or not at all. These two files are not part of the public release folder and never pass through an artifact.
-Until a gateway is live the record is the placeholder (serial exactly 0, address null) and has no signature file: that state alone
-is not a refusal; the verb prints `SKIP gateway not-live`, uploads nothing, makes no request and exits 0 (ledger D309). Every other
-state refuses as before, so a signed placeholder, a signature beside a not-live record, a live-looking record without a signature,
-a serial 0 with an address and an unsigned record with a null address and a serial of 1 or more are all `REFUSED gateway`
-(`REFUSED sig` when a signature is there and does not verify). The not-live test is an exact match with the placeholder as the
-fleet repository holds it: every field, its type, no other key, a plain `0`, a regular file. A signed record with a null address and
-a serial of 1 or more is judged live, as it was before: the address is not read here.
-
-`gateway --sig FILE`: the signature is taken from FILE (a pair the test series' CI signed, ledger D311 as the owner answered it on
-2026-10-21: the kit host's copy is signed under the baked key by CI, for TEST releases only) in place of the tip's own
-gateway.json.sig, which is then not read at all, so a good signature at the tip never rescues a bad FILE, and no signature file at
-the tip is not a refusal. Every other check is the same: FILE must be 1 to MAX_GATEWAY_SIG bytes and verify under the owner key in
-the pin's namespace over the very record at the tip (else `REFUSED sig`), and the record must be a live gateway record. Without
-`--sig` nothing changes. The kit job passes it only when the job `gwsign` made one.
+`gateway [--sig FILE]`: reads fleet/core/gateway.json from the tip of the fleet `release` branch, takes the owner's signature from
+FILE (the one the job `gwsign` of install.yml made over that record under the baked key, in the pin's namespace, in both series:
+the kit host's copy is CI's alone, ledger D311 of 2026-10-21 and CV05d of D342), checks it (ssh-keygen -Y verify) and the shape of
+the record, and PUTs the pair as one request, so the host flips to it whole or not at all. These two files are not part of the public
+release folder and never pass through an artifact. The tip's own fleet/core/gateway.json.sig is NEVER read, not even to see whether
+it is there: from CV05e on it is the control VM's signature, in another namespace (the control VM's), and the kit pipeline must
+not take it for the kit host's. FILE must be 1 to MAX_GATEWAY_SIG bytes and verify under the owner key in the pin's namespace over the
+very record at the tip (else `REFUSED sig`), and the record must be a live gateway record.
+Until a gateway is live the record is the placeholder (serial exactly 0, address null) and the job `gwsign` makes no signature: with no
+--sig that state alone is not a refusal; the verb prints `SKIP gateway not-live`, uploads nothing, makes no request and exits 0 (ledger
+D309). With no --sig, every other record, however it looks (and whatever signature file the tip holds beside it), is `REFUSED sig`; a
+placeholder with a --sig, a serial 0 with an address, a missing record and a record over the host's cap are `REFUSED gateway`. The
+not-live test is an exact match with the placeholder as the fleet repository holds it: every field, its type, no other key, a plain `0`,
+a regular file. A signed record with a null address and a serial of 1 or more is judged live, as it was before: the address is not
+read here. The kit job passes --sig exactly when the job `gwsign` made a signature, which it does only for a record that is not the
+placeholder and that the plan's pins planner judged (shape, serial) before anything was signed.
 
 `gateway --check`: the same read and the same verdict, no upload and no upload key: `OK gateway-check serial=N`, `SKIP gateway
 not-live` or a refusal. The kit job runs it first, so a bad pair is refused before the bundle, which the host can never delete,
@@ -165,7 +164,7 @@ GATEWAY_KEYS = ('serial', 'address', 'cert_sha256', 'manifest_key', 'session_key
 # kit.json and deploy-pin.json, signed under the same namespace by the same key, do not
 MAX_ANSWER = 65536  # the most of an answer that is read
 CLOSURE_PATH = 'fleet/install/closure.txt'
-GATEWAY_PATH, GATEWAY_SIG_PATH = 'fleet/core/gateway.json', 'fleet/core/gateway.json.sig'
+GATEWAY_PATH, GATEWAY_SIG_PATH = 'fleet/core/gateway.json', 'fleet/core/gateway.json.sig'  # the second is never read (CV05d); tests name it
 NOT_LIVE = 'SKIP gateway not-live'  # the one line of the not-live state (ledger D309)
 # The record the fleet repository holds while no gateway is live (fleet/core/gateway.json on its main branch). The not-live test
 # is an exact match with this, value by value and type by type, so a half-edited record never skips.
@@ -486,24 +485,24 @@ def is_placeholder(text: bytes, mode: str = '100644') -> bool:
 def read_gateway_pair(owner_pub: bytes, environ: dict[str, str], work: Path,
                       sig_file: Path | None = None) -> tuple[bytes, bytes, int] | None:
     """(json, signature, serial) of the live pair at the release tip, once every check has passed; None when no gateway is
-    live: the record is the placeholder and no signature file exists beside it. Every other state is Refused. With sig_file the
-    signature is that file's (Refused('sig') when it is unreadable, empty or over MAX_GATEWAY_SIG) and the tip's own signature file
-    is not read: the record is still the tip's, and every check below is the same."""
+    live: the record at the tip is exactly the placeholder and no sig_file was given. Every other state is Refused. The signature
+    is sig_file's (Refused('sig') when it is unreadable, empty or over MAX_GATEWAY_SIG), and the tip's own gateway.json.sig is
+    never read, not even to see whether it is there (CV05d, D342: from CV05e on it is a control-namespace signature for the
+    control VM, and the kit host's copy is gwsign's alone): a live-looking record with no sig_file is `REFUSED sig`, whatever the
+    tip holds beside it. The record is still the tip's."""
     env, repo, log = git_env(environ), work / 'fleet', work / 'fetch.log'
     repo.mkdir()
     git_run(repo, env, 'init', '-q', log=log)
     fetch_fleet(environ['FLEET_REPO'], repo, env, log, tip=True)
     record = tip_blob(repo, env, log, GATEWAY_PATH)
-    signature = (tip_blob(repo, env, log, GATEWAY_SIG_PATH) if sig_file is None
-                 else ('100644', read_bounded(sig_file, MAX_GATEWAY_SIG, 'sig')))
+    sig = None if sig_file is None else read_bounded(sig_file, MAX_GATEWAY_SIG, 'sig')
     if record is None or not 0 < len(record[1]) <= MAX_GATEWAY_JSON:  # no record, or one the host would not take
         raise Refused('gateway')
     mode, text = record
-    if signature is None:
+    if sig is None:
         if is_placeholder(text, mode):
             return None
-        raise Refused('gateway')  # a live-looking record nobody signed
-    sig = signature[1]
+        raise Refused('sig')  # a live-looking record nobody signed for the kit host
     if not 0 < len(sig) <= MAX_GATEWAY_SIG:
         raise Refused('gateway')
     fp.verify_pin_signature(text, sig, owner_pub, fp.run_argv)  # Refused('sig'): the owner signed this very pair
