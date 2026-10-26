@@ -7,3 +7,6 @@ vendor/VENDORED.sha256 -text
 vendor/standin-bundle.sha256 -text
 vendor/standin-bundle/** -text
 kit/vectors/** -text
+tests/fixture/pinned/** -text
+vendor/pin-summary.py -text
+vendor/pin-summary.sha256 -text

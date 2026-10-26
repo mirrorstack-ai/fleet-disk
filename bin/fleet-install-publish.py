@@ -167,11 +167,13 @@ TOOL_TIMEOUT, UPLOAD_TIMEOUT = 600, 1800  # seconds: gh queries; the release upl
 USAGE, REFUSED = 2, 1
 USAGE_TEXT = ('usage: fleet-install-publish.py publish|verify <dir> --owner-pub <path> --min-serial N\n'
               '       fleet-install-publish.py plan <fleet-git-dir> --serial N --min-serial N --out <dir>\n'
+              '       fleet-install-publish.py untag-check --serial N\n'
               '  <dir> is release/install-<serial>;\n'
               '  OWNER_PIN_SHA256 is the fingerprint the key must have (plan and publish need it);\n'
               '  SERIES (test or release) is needed by plan and publish;\n'
               '  KIT_HOST (the one host install.json\'s bundle.url may name) is needed by plan and publish;\n'
-              '  plan and publish also need GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN\n')
+              '  plan and publish also need GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN;\n'
+              '  untag-check only reads (GitHub: the tag install-N and the releases) and needs the same three\n')
 DIR_NAME = re.compile(r'install-(0|[1-9][0-9]{0,9})', re.ASCII)  # canonical decimal: install-007 is not install-7
 INSTALL_TAG = re.compile(r'install-(0|[1-9][0-9]{0,9})', re.ASCII)
 OWNER_LINE = re.compile(r'ssh-ed25519 [A-Za-z0-9+/]{68}(?: [ -~]*)?', re.ASCII)  # one key line, an optional comment
@@ -189,6 +191,10 @@ SIGNED = (('install', 'install.json', NS), ('kit', 'kit.json', PIN_NS), ('pin', 
 OS_BOOT = {'win': 'ps1', 'mac': 'sh', 'ubuntu': 'sh'}  # the bootstrap each OS's line runs
 _CURL = "-fsSL --max-redirs 3 --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 120"
 _NOT_RUN = 'Nothing was run. Tell the owner.'
+# the two sentences the fleet's line.py (AF18) adds to the Ubuntu and Windows check lines; held equal by hand and by the literal tests
+# copied from mirrorstack-fleet fleet/install/line.py @77b7fc2 (line.py last changed in e66e08a)
+_NO_CURL = 'curl is missing, or is the snap one. Run: sudo apt install curl, then paste the line again. Nothing was run.'
+_MANAGED = 'A group policy sets the PowerShell execution policy on this PC, so the file cannot run. ' + _NOT_RUN
 
 
 class Io(Protocol):
@@ -566,25 +572,33 @@ def check_pin_floor(io: Io, env: dict[str, str], tag: str, serial: int) -> None:
 
 
 def check_line(os_name: str, repo: str, serial: int, sha256: str, min_serial: int) -> str:
-    """The paste text for os_name: download to a fresh temp file, compare the sha256, run, delete. Byte for byte the
-    fleet's `check` line (a test pins one), so the line a helper gets from the release page is the one the fleet makes."""
+    """The paste text for os_name: download to a fresh temp file, compare the sha256, run, delete. It is the fleet's
+    `check` line (`fleet.install.line.render`, AF18) with this repository's URL: the Ubuntu line refuses a missing or
+    snap curl (`REFUSED tools`), the Windows line a PC whose group policy sets the execution policy (`REFUSED policy`),
+    the Mac line has neither. No test crosses the two repositories: the two texts are held equal by hand and by the
+    literal tests (`ReleaseBody`), each copied from the fleet's render, so a change there is made here by hand."""
     url = f'https://github.com/{repo}/releases/download/install-{serial}/bootstrap.{OS_BOOT[os_name]}'
     if os_name == 'win':
         return ("$f = Join-Path $env:TEMP ('mirrorstack-' + [guid]::NewGuid().ToString('N') + '.ps1'); "
                 f"& \"$env:SystemRoot\\System32\\curl.exe\" {_CURL} --max-filesize 262144 -o $f '{url}'; "
                 f"if ($LASTEXITCODE -ne 0) {{ 'REFUSED fetch'; 'The download failed. {_NOT_RUN}'; $rc = 1 }} "
                 f"elseif ((Get-FileHash -Algorithm SHA256 $f).Hash -eq '{sha256}') "
-                f"{{ powershell -NoProfile -ExecutionPolicy Bypass -File $f -Serial {serial} -MinSerial {min_serial}; "
-                '$rc = $LASTEXITCODE } '
+                "{ if ((Get-ExecutionPolicy -Scope MachinePolicy) -ne 'Undefined' "
+                "-or (Get-ExecutionPolicy -Scope UserPolicy) -in 'AllSigned', 'Restricted') "
+                f"{{ 'REFUSED policy'; '{_MANAGED}'; $rc = 1 }} "
+                f"else {{ powershell -NoProfile -ExecutionPolicy Bypass -File $f -Serial {serial} -MinSerial {min_serial}; "
+                '$rc = $LASTEXITCODE } } '
                 f"else {{ 'REFUSED boot-hash'; 'The download is not the file the owner signed. {_NOT_RUN}'; $rc = 1 }}; "
                 'Remove-Item -Force -ErrorAction SilentlyContinue $f; cmd /c exit $rc')
     check = 'sha256sum -c -' if os_name == 'ubuntu' else 'shasum -a 256 -c -'
-    return (f'd=$(mktemp -d) && {{ if ! curl {_CURL} --max-filesize 262144 -o "$d/bootstrap.sh" \'{url}\'; '
-            f"then echo 'REFUSED fetch'; echo 'The download failed. {_NOT_RUN}'; rc=1; "
-            f'elif printf \'%s  %s\\n\' \'{sha256}\' "$d/bootstrap.sh" | {check} >/dev/null; '
-            f'then sh "$d/bootstrap.sh" --serial {serial} --min-serial {min_serial}; rc=$?; '
-            f"else echo 'REFUSED boot-hash'; echo 'The download is not the file the owner signed. {_NOT_RUN}'; rc=1; "
-            'fi; rm -rf "$d"; (exit $rc); }')
+    fetch = (f'if ! curl {_CURL} --max-filesize 262144 -o "$d/bootstrap.sh" \'{url}\'; '
+             f"then echo 'REFUSED fetch'; echo 'The download failed. {_NOT_RUN}'; rc=1; "
+             f'elif printf \'%s  %s\\n\' \'{sha256}\' "$d/bootstrap.sh" | {check} >/dev/null; '
+             f'then sh "$d/bootstrap.sh" --serial {serial} --min-serial {min_serial}; rc=$?; '
+             f"else echo 'REFUSED boot-hash'; echo 'The download is not the file the owner signed. {_NOT_RUN}'; rc=1; fi")
+    if os_name == 'ubuntu':  # a stock desktop has no curl and the snap one cannot write the temp file; the Mac line keeps its text
+        fetch = f"c=$(command -v curl); case $c in '' | */snap/*) echo 'REFUSED tools'; echo '{_NO_CURL}'; rc=1 ;; *) {fetch} ;; esac"
+    return f'd=$(mktemp -d) && {{ {fetch}; rm -rf "$d"; (exit $rc); }}'
 
 
 def release_notes(plan: Plan, repo: str) -> str:
@@ -663,6 +677,57 @@ def release_state(io: Io, env: dict[str, str], plan: Plan, sha: str, confirmed: 
             raise Refused('immutable-unreadable')
         print('fleet-install-publish: Immutable releases is unreadable by this token; going on the owner\'s recorded'
               ' confirmation', file=sys.stderr, flush=True)
+
+
+def untag_check(io: Io, env: dict[str, str], serial: int) -> str:
+    """The read-only judgement before the workflow mode `untag` removes the tag install-<serial>: the tag's commit id (40
+    hex), only for a tag that exists, is a lightweight commit tag (an object of type commit) and has no release at all.
+    Else Refused: `tag-missing` (no such tag), `tag-moved` (an annotated or other object), `tag-exists` (a published release
+    of the tag exists: a release holds its tag and it may never go) or `draft-left` (a draft of it exists: remove the draft
+    first, see the README), `tag-check-failed` for an answer that cannot be read (fail closed). A read-only token may not be
+    shown drafts: the read cannot see one, the ref delete then leaves the draft with no tag, which a repo writer removes.
+    Nothing here writes: every call is a GET of gh api or a release list."""
+    tag = f'install-{serial}'
+    refs = json_out(io, [GH, 'api', f'repos/{env["GH_REPO"]}/git/matching-refs/tags/{tag}'], env, list)  # a PREFIX match
+    made = [r for r in refs if isinstance(r, dict) and r.get('ref') == f'refs/tags/{tag}']
+    if not made:
+        raise Refused('tag-missing')
+    if len(made) > 1:
+        raise Refused('tag-check-failed')
+    target = made[0].get('object')
+    sha = target.get('sha') if isinstance(target, dict) else None
+    if not isinstance(target, dict) or target.get('type') != 'commit' or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha):
+        raise Refused('tag-moved')
+    releases = json_out(io, [GH, 'release', 'list', '--limit', '1000', '--json', 'tagName,isDraft'], env, list)
+    mine = [r for r in releases if isinstance(r, dict) and r.get('tagName') == tag]
+    if any(r.get('isDraft') is not True for r in mine):  # a row that does not say draft counts as published: the worse word
+        raise Refused('tag-exists')
+    if mine:
+        raise Refused('draft-left')
+    return sha
+
+
+def untag_check_main(argv: list[str], environ: dict[str, str], io: Io) -> int:
+    """`untag-check --serial N`: 0 and the line `tag install-N sha <sha>, no release` (also the output `sha` and the run
+    summary), 1 refused, 2 usage. Needs GITHUB_REPOSITORY, GITHUB_SHA and GH_TOKEN (the job's), as plan does."""
+    if len(argv) != 4 or argv[2] != '--serial' or not re.fullmatch(r'(0|[1-9][0-9]{0,9})', argv[3], re.ASCII):
+        sys.stderr.write(USAGE_TEXT)
+        return USAGE
+    serial = int(argv[3])
+    try:
+        sha = untag_check(io, gh_env(environ.get('GITHUB_REPOSITORY', ''), environ.get('GITHUB_SHA', ''),
+                                     environ.get('GH_TOKEN', '')), serial)
+    except Refused as why:
+        sys.stderr.write(f'fleet-install-publish: refused {why.code}\n')
+        print(f'REFUSED {why.code}')
+        return REFUSED
+    line = f'tag install-{serial} sha {sha}, no release'
+    if environ.get('GITHUB_OUTPUT'):
+        with open(environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+            f.write(f'sha={sha}\n')
+    append_summary(environ, line)
+    print(line)
+    return 0
 
 
 def remove_leftover(io: Io, env: dict[str, str], tag: str, known: bool = False, mutable: bool = False) -> None:
@@ -919,6 +984,8 @@ def main(argv: list[str], environ: dict[str, str], io: Io, run: Run = run_argv, 
     optionally IMMUTABLE_CONFIRMED=yes; plan needs the same three and reads GitHub the same way (it only reads). plan and
     publish need SERIES (test or release), KIT_HOST (the one host the bundle URL may name) and OWNER_PIN_SHA256, the
     fingerprint the signing key must have; verify takes OWNER_PIN_SHA256 and KIT_HOST as optional pins."""
+    if argv[1:2] == ['untag-check']:
+        return untag_check_main(argv, environ, io)
     if argv[1:2] == ['plan']:
         planned = parse_plan_args(argv)
         if planned is None:

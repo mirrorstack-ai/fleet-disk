@@ -2622,19 +2622,62 @@ class PlanJob(unittest.TestCase):
 
 
 class ReleaseBody(unittest.TestCase):
-    UBUNTU = ("d=$(mktemp -d) && { if ! curl -fsSL --max-redirs 3 --proto '=https' --proto-redir '=https' --tlsv1.2 "
-              "--connect-timeout 20 --max-time 120 --max-filesize 262144 -o \"$d/bootstrap.sh\" "
-              "'https://github.com/org/repo/releases/download/install-5/bootstrap.sh'; then echo 'REFUSED fetch'; echo 'The "
-              "download failed. Nothing was run. Tell the owner.'; rc=1; elif printf '%s  %s\\n' '" + 'ab' * 32 + "' "
-              "\"$d/bootstrap.sh\" | sha256sum -c - >/dev/null; then sh \"$d/bootstrap.sh\" --serial 5 --min-serial 3; rc=$?; "
-              "else echo 'REFUSED boot-hash'; echo 'The download is not the file the owner signed. Nothing was run. Tell the "
-              "owner.'; rc=1; fi; rm -rf \"$d\"; (exit $rc); }")
+    """The check line each OS gets on the release page. The fleet's `fleet.install.line.render` (AF18) makes the same
+    text; no test crosses the two repositories, the two are held equal by hand and by these literals, each copied from
+    `line.render(os, 5, 'ab' * 32, 3)` with this repository's URL swapped for org/repo."""
+    SHA = 'ab' * 32
+    # the three literals below are copied from mirrorstack-fleet fleet/install/line.py @77b7fc2 (line.py last changed in e66e08a);
+    # a later fleet edit to the text is made here by hand, and this sha says which fleet text these are
+    UBUNTU = ("d=$(mktemp -d) && { c=$(command -v curl); case $c in '' | */snap/*) echo 'REFUSED tools'; "
+              "echo 'curl is missing, or is the snap one. Run: sudo apt install curl, then paste the line again. Nothing was run.'; "
+              'rc=1 ;; '
+              '*) if ! curl -fsSL --max-redirs 3 --proto \'=https\' --proto-redir \'=https\' --tlsv1.2 --connect-timeout 20 --max-time 120 --max-filesize 262144 -o "$d/bootstrap.sh" \'https://github.com/org/repo/releases/download/install-5/bootstrap.sh\'; '
+              "then echo 'REFUSED fetch'; echo 'The download failed. Nothing was run. Tell the owner.'; rc=1; "
+              "elif printf '%s  %s\\n' '" + SHA + '\' "$d/bootstrap.sh" | sha256sum -c - >/dev/null; '
+              'then sh "$d/bootstrap.sh" --serial 5 --min-serial 3; rc=$?; else echo \'REFUSED boot-hash\'; '
+              "echo 'The download is not the file the owner signed. Nothing was run. Tell the owner.'; rc=1; fi ;; "
+              'esac; rm -rf "$d"; (exit $rc); }')
+
+    MAC = ('d=$(mktemp -d) && { if ! curl -fsSL --max-redirs 3 --proto \'=https\' --proto-redir \'=https\' --tlsv1.2 --connect-timeout 20 --max-time 120 --max-filesize 262144 -o "$d/bootstrap.sh" \'https://github.com/org/repo/releases/download/install-5/bootstrap.sh\'; '
+           "then echo 'REFUSED fetch'; echo 'The download failed. Nothing was run. Tell the owner.'; rc=1; "
+           "elif printf '%s  %s\\n' '" + SHA + '\' "$d/bootstrap.sh" | shasum -a 256 -c - >/dev/null; '
+           'then sh "$d/bootstrap.sh" --serial 5 --min-serial 3; rc=$?; else echo \'REFUSED boot-hash\'; '
+           "echo 'The download is not the file the owner signed. Nothing was run. Tell the owner.'; rc=1; fi; "
+           'rm -rf "$d"; (exit $rc); }')
+
+    WIN = ("$f = Join-Path $env:TEMP ('mirrorstack-' + [guid]::NewGuid().ToString('N') + '.ps1'); "
+           '& "$env:SystemRoot\\System32\\curl.exe" -fsSL --max-redirs 3 --proto \'=https\' --proto-redir \'=https\' --tlsv1.2 --connect-timeout 20 --max-time 120 --max-filesize 262144 -o $f \'https://github.com/org/repo/releases/download/install-5/bootstrap.ps1\'; '
+           "if ($LASTEXITCODE -ne 0) { 'REFUSED fetch'; "
+           "'The download failed. Nothing was run. Tell the owner.'; "
+           "$rc = 1 } elseif ((Get-FileHash -Algorithm SHA256 $f).Hash -eq '" + SHA + "') { if ((Get-ExecutionPolicy -Scope MachinePolicy) -ne 'Undefined' -or (Get-ExecutionPolicy -Scope UserPolicy) -in 'AllSigned', 'Restricted') { 'REFUSED policy'; "
+           "'A group policy sets the PowerShell execution policy on this PC, so the file cannot run. Nothing was run. Tell the owner.'; "
+           '$rc = 1 } else { powershell -NoProfile -ExecutionPolicy Bypass -File $f -Serial 5 -MinSerial 3; '
+           "$rc = $LASTEXITCODE } } else { 'REFUSED boot-hash'; "
+           "'The download is not the file the owner signed. Nothing was run. Tell the owner.'; $rc = 1 }; "
+           'Remove-Item -Force -ErrorAction SilentlyContinue $f; cmd /c exit $rc')
 
     def test_a_line_is_the_text_the_fleet_makes_for_its_check_mode(self):
-        self.assertEqual(fp.check_line('ubuntu', 'org/repo', 5, 'ab' * 32, 3), self.UBUNTU)  # copied from the fleet's render
-        self.assertEqual(fp.check_line('mac', 'org/repo', 5, 'ab' * 32, 3), self.UBUNTU.replace('sha256sum -c -', 'shasum -a 256 -c -'))
-        for want in ('bootstrap.ps1', "-eq '" + 'ab' * 32 + "'", '-Serial 5 -MinSerial 3', 'curl.exe'):
-            self.assertIn(want, fp.check_line('win', 'org/repo', 5, 'ab' * 32, 3))
+        for os_name, want in (('ubuntu', self.UBUNTU), ('mac', self.MAC), ('win', self.WIN)):
+            with self.subTest(os_name):
+                self.assertEqual(fp.check_line(os_name, 'org/repo', 5, self.SHA, 3), want)  # copied from the fleet's render
+
+    def test_each_line_is_one_line_and_the_shell_lines_parse(self):
+        for os_name in ('ubuntu', 'mac', 'win'):
+            line = fp.check_line(os_name, 'org/repo', 5, self.SHA, 3)
+            with self.subTest(os_name):
+                self.assertNotIn('\n', line)
+                if os_name != 'win':
+                    done = subprocess.run(['sh', '-n', '-c', line], capture_output=True, text=True)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_only_the_ubuntu_line_refuses_a_missing_or_snap_curl_and_only_the_windows_line_a_managed_pc(self):
+        for os_name, words in (('ubuntu', ('REFUSED tools', 'sudo apt install curl')), ('mac', ()),
+                               ('win', ('REFUSED policy', 'A group policy sets'))):
+            line = fp.check_line(os_name, 'org/repo', 5, self.SHA, 3)
+            for word in ('REFUSED tools', 'sudo apt install curl', 'REFUSED policy', 'A group policy sets'):
+                self.assertEqual(word in line, word in words, (os_name, word))
+        self.assertIn('sha256sum', fp.check_line('ubuntu', 'org/repo', 5, self.SHA, 3))
+        self.assertIn('shasum -a 256', fp.check_line('mac', 'org/repo', 5, self.SHA, 3))
 
     def test_the_series_decides_which_serials_a_key_may_sign(self):
         for serial, series in ((0, 'test'), (999, 'test'), (1000, 'release'), (2 ** 31, 'release')):
@@ -2642,6 +2685,101 @@ class ReleaseBody(unittest.TestCase):
         for serial, series in ((1000, 'test'), (999, 'release'), (5, ''), (5, 'Test')):
             with self.assertRaisesRegex(fp.Refused, 'series'):
                 fp.check_series(serial, series)
+
+
+class UntagCheck(unittest.TestCase):
+    """The read-only verb `untag-check --serial N` (AF42), over the FakeGh: it never writes, and answers with the commit
+    of a lightweight tag that has no release, or with the word that says why the tag may not be removed."""
+
+    ENV = {'GITHUB_REPOSITORY': REPO, 'GITHUB_SHA': SHA, 'GH_TOKEN': TOKEN}
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.out, self.summary = Path(self._tmp.name) / 'out', Path(self._tmp.name) / 'summary'
+
+    def check(self, gh, serial: str = str(SERIAL), drop: tuple = ()):
+        env = {k: v for k, v in self.ENV.items() if k not in drop}
+        env.update(GITHUB_OUTPUT=str(self.out), GITHUB_STEP_SUMMARY=str(self.summary))
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = fp.main(['fleet-install-publish.py', 'untag-check', '--serial', serial], env, gh)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_a_tag_with_no_release_passes_prints_its_sha_and_every_call_is_a_read(self):
+        gh = FakeGh(refs=[tag_ref(), tag_ref('install-50', 'cd' * 20)],  # a prefix match of another tag is not this one
+                    releases=[{'tagName': 'install-4', 'isDraft': False}, {'tagName': 'install-6', 'isDraft': True}])
+        code, out, err = self.check(gh)
+        self.assertEqual((code, out, err), (0, f'tag install-{SERIAL} sha {SHA}, no release\n', ''))
+        self.assertEqual(self.out.read_text(), f'sha={SHA}\n')
+        self.assertEqual(self.summary.read_text(), f'tag install-{SERIAL} sha {SHA}, no release\n')
+        self.assertEqual(gh.calls, [['/usr/bin/gh', 'api', f'repos/{REPO}/git/matching-refs/tags/{TAG}'],
+                                    ['/usr/bin/gh', 'release', 'list', '--limit', '1000', '--json', 'tagName,isDraft']])
+        for call in gh.calls:  # no verb that writes, no method, no field: the two GETs of release_state's own reads
+            self.assertNotRegex(' '.join(call), r'(?:^| )(?:create|delete|edit|upload|-X|--method|-f|-F|--field|--input)(?: |$)')
+        self.assertEqual({tuple(sorted(e)) for e in gh.envs}, {('GH_PROMPT_DISABLED', 'GH_REPO', 'GH_TOKEN', 'PATH')})
+
+    def test_each_answer_that_forbids_the_removal_is_its_own_word_and_nothing_is_written(self):
+        draft, shown = {'tagName': TAG, 'isDraft': True}, {'tagName': TAG, 'isDraft': False}
+        for what, refs, releases, word in (
+                ('no tag at all', [], [], 'tag-missing'),
+                ('only another tag it prefixes', [tag_ref('install-50')], [], 'tag-missing'),
+                ('an annotated tag', [tag_ref(kind='tag')], [], 'tag-moved'),
+                ('a tag on a tree', [tag_ref(kind='tree')], [], 'tag-moved'),
+                ('a tag with no object', [{'ref': f'refs/tags/{TAG}'}], [], 'tag-moved'),
+                ('a tag whose sha is no commit id', [tag_ref(sha_='nothex')], [], 'tag-moved'),
+                ('a published release', [tag_ref()], [shown], 'tag-exists'),
+                ('a draft release', [tag_ref()], [draft], 'draft-left'),
+                ('a draft and a published release', [tag_ref()], [draft, shown], 'tag-exists'),
+                ('a release row that does not say draft', [tag_ref()], [{'tagName': TAG}], 'tag-exists')):
+            with self.subTest(what):
+                gh = FakeGh(refs=refs, releases=releases)
+                code, out, _ = self.check(gh)
+                self.assertEqual((code, out), (1, f'REFUSED {word}\n'))
+                self.assertFalse(self.out.exists())  # no output: the approve and untag jobs get no sha
+                self.assertEqual([c[1:3] for c in gh.calls if c[1:3] in (['release', 'create'], ['release', 'delete'])], [])
+        gh = FakeGh(refs=[])
+        self.check(gh)
+        self.assertEqual(len(gh.calls), 1)  # a missing tag stops before the release list is read
+
+    def test_an_answer_that_cannot_be_read_is_tag_check_failed_and_never_a_pass(self):
+        two = [tag_ref(), tag_ref()]
+        for what, gh in (('refs exit 1', self.fake(refs=(1, ''))), ('refs not json', self.fake(refs=(0, 'x'))),
+                         ('refs not a list', self.fake(refs=(0, '{}'))), ('two refs of one name', FakeGh(refs=two)),
+                         ('releases exit 1', self.fake(releases=(1, ''))), ('releases not json', self.fake(releases=(0, 'x'))),
+                         ('releases not a list', self.fake(releases=(0, '{}')))):
+            with self.subTest(what):
+                code, out, _ = self.check(gh)
+                self.assertEqual((code, out), (1, 'REFUSED tag-check-failed\n'))
+                self.assertFalse(self.out.exists())
+
+    @staticmethod
+    def fake(**raw):
+        gh = FakeGh()
+        gh.raw.update(raw)
+        return gh
+
+    def test_a_bad_command_line_is_usage_and_a_job_without_a_token_or_commit_is_release_env_before_any_call(self):
+        for argv in (['untag-check'], ['untag-check', '--serial'], ['untag-check', '--serial', '05'], ['untag-check', '--serial', '-1'],
+                     ['untag-check', '--serial', '5 '], ['untag-check', '--serial', '\u0665'], ['untag-check', '--serial', '5', 'x'],
+                     ['untag-check', '5'], ['untag-check', '--serial', '12345678901']):
+            with self.subTest(argv):
+                gh = FakeGh()
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    self.assertEqual(fp.main(['x', *argv], dict(self.ENV), gh), fp.USAGE)
+                self.assertEqual((gh.calls, stderr.getvalue()), ([], fp.USAGE_TEXT))
+        for name in ('GITHUB_SHA', 'GH_TOKEN', 'GITHUB_REPOSITORY'):
+            with self.subTest(name):
+                gh = FakeGh()
+                self.assertEqual(self.check(gh, drop=(name,))[:2], (1, 'REFUSED release-env\n'))
+                self.assertEqual(gh.calls, [])
+        self.assertIn('fleet-install-publish.py untag-check --serial N', fp.USAGE_TEXT)
+
+    def test_the_serial_of_the_check_is_the_one_asked_about(self):
+        gh = FakeGh(refs=[tag_ref('install-1000', 'cd' * 20)], releases=[])
+        self.assertEqual(self.check(gh, '1000')[:2], (0, f'tag install-1000 sha {"cd" * 20}, no release\n'))
+        self.assertEqual(gh.calls[0][2], f'repos/{REPO}/git/matching-refs/tags/install-1000')
 
 
 class Readme(unittest.TestCase):
@@ -2665,43 +2803,62 @@ class Readme(unittest.TestCase):
         for word in ('draft-left', 'release-left'):
             self.assertIn(word, fp.PUBLISH_CODES)
 
+    def test_the_readme_names_the_untag_mode_its_three_jobs_and_the_reviewer_setting_that_must_be_on_first(self):
+        section = self.TEXT.split('**Untag.**', 1)[1].split('\n\n', 1)[0]
+        for need in ('`mode` untag', '`untag-check`', '`untag-approve`', '`untag`', '`kit-floor`', 'required reviewer',
+                     'TAG_KEY', '--force-with-lease', 'has no release', 'tag-exists', 'draft-left', 'not a lightweight',
+                     'Turn the `kit-floor` required reviewer on first', 'nothing stops an untag run'):
+            self.assertIn(need, section)
+        self.assertIn('| `tag-moved` |', self.TEXT)
+        self.assertNotIn('until AF42', self.TEXT)  # the stated manual cure moved into the mode
+        self.assertIn('`mode` untag', self.TEXT.split('Seven jobs run in order', 1)[0])  # named where the modes are listed
+
 
 class Workflow(unittest.TestCase):
     TEXT = (ROOT / '.github/workflows/install.yml').read_text(encoding='utf-8')
     DISK = (ROOT / '.github/workflows/disk.yml').read_text(encoding='utf-8')
-    JOBS = {m[1]: m[2] for m in re.finditer(r'(?ms)^  (plan|sign|kit|tag|publish|floor-approve|floor):\n(.*?)(?=^  [\w-]+:\n|\Z)',
+    JOBS = {m[1]: m[2] for m in re.finditer(r'(?ms)^  (plan|fixture|smoke|sign|gwsign|kit|tag|publish|floor-approve|floor|untag-check|untag-approve|untag):\n(.*?)(?=^  [\w-]+:\n|\Z)',
                                             TEXT.split('\njobs:\n', 1)[1])}
 
-    def test_it_is_a_release_branch_dispatch_of_five_jobs_and_a_floor_job(self):
+    def test_it_is_a_release_branch_dispatch_of_the_eight_signing_jobs_the_floor_pair_and_the_untag_trio(self):
         self.assertRegex(self.TEXT, r'(?m)^on:\n  workflow_dispatch:\n    inputs:\n      mode:\n')
         self.assertEqual(re.findall(r'(?m)^      (\w+):\n        (?:description|required)', self.TEXT),
                          ['mode', 'serial', 'min_serial', 'floor'])
-        self.assertRegex(self.TEXT, r'(?m)^        options: \[sign, pubkey, floor\]\n        default: sign\n')
-        self.assertEqual(list(self.JOBS), ['plan', 'sign', 'kit', 'tag', 'publish', 'floor-approve', 'floor'])
-        self.assertEqual(re.findall(r'(?m)^  ([\w-]+):$', self.TEXT.split('\njobs:\n', 1)[1]), list(self.JOBS))  # and no other job
+        self.assertRegex(self.TEXT, r'(?m)^        options: \[sign, pubkey, floor, untag, pins\]\n        default: sign\n')
+        self.assertEqual(list(self.JOBS), ['plan', 'fixture', 'smoke', 'sign', 'gwsign', 'kit', 'tag', 'publish', 'floor-approve',
+                                                 'floor', 'untag-check', 'untag-approve', 'untag'])
+        self.assertEqual(re.findall(r'(?m)^  ([\w-]+):$', self.TEXT.split('\njobs:\n', 1)[1]),
+                         list(self.JOBS) + ['pins-plan', 'pins-approve', 'pins-sign', 'pins-publish'])  # and no other job; the four of mode pins (CV05c) are tested in test_install_workflow.py
         for bad in ('pull_request', 'push:', 'self-hosted', 'refs/heads/main', 'actions/cache'):
             self.assertNotIn(bad, self.TEXT)
         for name, job in self.JOBS.items():
             self.assertIn("github.ref == 'refs/heads/release'", job.split('steps:')[0], name)
-        self.assertEqual(re.findall(r'runs-on: (\S+)', self.TEXT), ['ubuntu-24.04'] * 7)
+        self.assertEqual(re.findall(r'runs-on: (.+)', self.TEXT),
+                         ['ubuntu-24.04', 'ubuntu-24.04', '${{ matrix.runner }}'] + ['ubuntu-24.04'] * 14)  # the smoke job is the only hosted-matrix one; the fixture is built once on ubuntu
         self.assertEqual([re.findall(r'(?m)^    environment: (\S+)$', j) for j in self.JOBS.values()],
-                         [['release'], ['release'], ['release'], ['release'], [], ['kit-floor'], ['release']])  # publish has none: no secret, no variable of release
+                         [['release'], [], [], ['release'], ['release'], ['release'], ['release'], [], ['kit-floor'], ['release'], [], ['kit-floor'], ['release']])  # fixture, smoke and publish have none: no secret, no variable of release
 
     def test_only_publish_writes_and_only_contents_and_sign_and_tag_hold_no_token(self):
         self.assertRegex(self.TEXT, r'(?m)^permissions:\n  contents: read\n')
         self.assertEqual(re.findall(r'(\w[\w-]*): write', self.TEXT), ['contents'])
         self.assertIn('    permissions:\n      contents: write\n', self.JOBS['publish'])
-        for name in ('sign', 'tag'):
+        for name in ('fixture', 'smoke', 'sign', 'gwsign', 'tag', 'untag-approve', 'untag'):
             self.assertTrue('    permissions: {}\n' in self.JOBS[name] and 'github.token' not in self.JOBS[name])
+        self.assertIn('    permissions:\n      contents: read\n', self.JOBS['untag-check'])  # the one new job with a token: read only
 
     def test_each_secret_is_read_by_one_job_and_the_sign_and_tag_jobs_run_no_action_and_no_repository_code(self):
         self.assertEqual(sorted(re.findall(r'secrets\.(\w+)', self.TEXT)),
-                         ['FLEET_READ', 'FLEET_READ', 'KIT_UPLOAD_KEY', 'KIT_UPLOAD_KEY', 'SIGN_KEY', 'TAG_KEY'])
-        for name, secrets in (('plan', ['FLEET_READ']), ('sign', ['SIGN_KEY']), ('kit', ['FLEET_READ', 'KIT_UPLOAD_KEY']),
-                              ('tag', ['TAG_KEY']), ('floor', ['KIT_UPLOAD_KEY'])):
+                         ['FLEET_READ', 'FLEET_READ', 'FLEET_READ', 'FLEET_READ', 'FLEET_READ', 'KIT_UPLOAD_KEY', 'KIT_UPLOAD_KEY', 'SIGN_KEY', 'SIGN_KEY', 'SIGN_KEY', 'TAG_KEY', 'TAG_KEY'])  # pins-plan and pins-sign (CV05c: FLEET_READ twice, SIGN_KEY once); gwsign (AF08) reads and signs; TAG_KEY: tag and untag (AF42, on purpose: the deploy key that makes a tag is the one that removes it)
+        for name, secrets in (('plan', ['FLEET_READ']), ('sign', ['SIGN_KEY']), ('gwsign', ['FLEET_READ', 'SIGN_KEY']),
+                              ('kit', ['FLEET_READ', 'KIT_UPLOAD_KEY']),
+                              ('tag', ['TAG_KEY']), ('floor', ['KIT_UPLOAD_KEY']), ('untag', ['TAG_KEY'])):
             self.assertEqual(re.findall(r'secrets\.(\w+)', self.JOBS[name]), secrets)
         self.assertNotIn('secrets.', self.JOBS['publish'])
-        for name in ('sign', 'tag'):
+        self.assertNotIn('secrets.', self.JOBS['smoke'])
+        self.assertNotIn('secrets.', self.JOBS['fixture'])
+        for name in ('untag-check', 'untag-approve'):
+            self.assertNotIn('secrets.', self.JOBS[name])
+        for name in ('sign', 'gwsign', 'tag', 'untag'):
             for bad in ('uses:', 'checkout', 'fleet-install-publish', 'python', 'RUNNER_WORKSPACE', 'GITHUB_WORKSPACE'):
                 self.assertNotIn(bad, self.JOBS[name], name)
         self.assertEqual(re.findall(r'vars\.(\w+)', self.TEXT), ['IMMUTABLE_RELEASES_CONFIRMED'])
@@ -2710,12 +2867,12 @@ class Workflow(unittest.TestCase):
     def test_the_actions_are_sha_pinned_the_same_as_disk_and_no_credential_stays_in_git(self):
         self.assertEqual(re.findall(r'uses: (actions/checkout@\S+)', self.TEXT)[0], re.findall(r'uses: (actions/checkout@\S+)', self.DISK)[0])
         for uses in re.findall(r'uses: (\S+)', self.TEXT):
-            self.assertRegex(uses, r'^actions/(?:checkout|upload-artifact|download-artifact)@[0-9a-f]{40}$')
+            self.assertRegex(uses, r'^actions/(?:checkout|setup-python|upload-artifact|download-artifact)@[0-9a-f]{40}$')
         self.assertEqual(self.TEXT.count('persist-credentials: false'), self.TEXT.count('actions/checkout@'))
 
     def test_the_key_fingerprint_series_and_host_key_are_constants_of_the_file(self):
         env = dict(re.findall(r'(?m)^  ([A-Z_0-9]+): (.*)$', self.TEXT.split('\njobs:\n', 1)[0].split('\nenv:\n', 1)[1]))
-        self.assertEqual(set(env), {'KEY_SHA256', 'SERIES', 'KIT_HOST', 'FLEET_REPO', 'GH_HOSTKEY'})
+        self.assertEqual(set(env), {'KEY_SHA256', 'KEY_PUB', 'SERIES', 'KIT_HOST', 'FLEET_REPO', 'GH_HOSTKEY'})
         self.assertIsNotNone(fp.FPR.fullmatch(env['KEY_SHA256']))
         test_key = 'SHA256:16jB0ih9afmAW7rFmgTJVtarDgEv4w/DHA8LKufWhKM'  # T, keygen run 38032458890
         # the test key signs only the test series and the test series only the test key, so a release-series serial is
@@ -2752,7 +2909,7 @@ class Workflow(unittest.TestCase):
             self.assertIn(need, step)
         self.assertEqual(self.declared_outputs('plan')['immutable'], ('immutable', 'immutable'))  # still handed to publish
         self.assertIn('IMMUTABLE_CONFIRMED: ${{ needs.plan.outputs.immutable }}', self.JOBS['publish'])
-        self.assertEqual(len(self.JOBS), 7)  # no job is added (AF08's gateway job is parked)
+        self.assertEqual(len(self.JOBS), 13)  # seven, the smoke and its fixture (AF34), the untag trio (AF42), the gateway-sign job (AF08)
         self.assertEqual(re.findall(r'vars\.(\w+)', self.TEXT), ['IMMUTABLE_RELEASES_CONFIRMED'])
 
     def test_the_plan_job_reads_the_fleet_over_ssh_with_the_pinned_host_key_and_the_tag_job_never_forces(self):
@@ -2773,7 +2930,7 @@ class Workflow(unittest.TestCase):
         self.assertNotIn('StrictHostKeyChecking=no', self.TEXT)
 
     def test_the_publish_job_gets_the_key_from_the_sign_job_and_the_fingerprint_from_the_constant(self):
-        for need in ('PUB: ${{ needs.sign.outputs.pub }}', 'OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}', 'needs: [plan, sign, kit, tag]',
+        for need in ('PUB: ${{ needs.sign.outputs.pub }}', 'OWNER_PIN_SHA256: ${{ env.KEY_SHA256 }}', 'needs: [plan, smoke, sign, kit, tag]',
                      'IMMUTABLE_CONFIRMED: ${{ needs.plan.outputs.immutable }}', '--owner-pub "$RUNNER_TEMP/owner.pub"'):
             self.assertIn(need, self.JOBS['publish'])
 
@@ -2797,8 +2954,11 @@ class Workflow(unittest.TestCase):
 
     def test_each_job_needs_exactly_the_jobs_before_it(self):
         needs = {name: re.findall(r'(?m)^    needs: (.*)$', job) for name, job in self.JOBS.items()}
-        self.assertEqual(needs, {'plan': [], 'sign': ['plan'], 'kit': ['[plan, sign]'], 'tag': ['[plan, sign, kit]'],
-                                 'publish': ['[plan, sign, kit, tag]'], 'floor-approve': [], 'floor': ['floor-approve']})
+        self.assertEqual(needs, {'plan': [], 'fixture': ['plan'], 'smoke': ['[plan, fixture]'], 'sign': ['[plan, smoke]'],
+                                 'gwsign': ['[plan, sign]'], 'kit': ['[plan, smoke, sign, gwsign]'],
+                                 'tag': ['[plan, smoke, sign, kit]'], 'publish': ['[plan, smoke, sign, kit, tag]'],
+                                 'floor-approve': [], 'floor': ['floor-approve'],
+                                 'untag-check': [], 'untag-approve': ['untag-check'], 'untag': ['[untag-check, untag-approve]']})
 
     def declared_outputs(self, name: str) -> dict[str, tuple[str, str]]:
         """{output: (step id, step output)} from the job's `outputs:` block."""
@@ -2815,6 +2975,8 @@ class Workflow(unittest.TestCase):
         """The output names the step with this id writes into $GITHUB_OUTPUT."""
         if (name, step_id) == ('plan', 'plan'):  # python writes them: the publisher's own list
             return {'serial', 'tag', 'tip'} | {f'{short}_{kind}' for short, _, _ in fp.SIGNED for kind in ('b64', 'sha')}
+        if (name, step_id) == ('untag-check', 'check'):  # python writes it too: the verb's one output
+            return {'sha'}
         text = self.step_text(name, step_id)
         self.assertIn('>> "$GITHUB_OUTPUT"', text)
         names = set(re.findall(r'echo (\w+)=', text)) | set(re.findall(r"printf '(\w+)=", text))
@@ -2832,7 +2994,7 @@ class Workflow(unittest.TestCase):
         self.assertGreater(len(used), 10)
         for job, out in sorted(used):
             self.assertIn(out, declared[job], f'needs.{job}.outputs.{out} is read but never declared')
-        for job in ('plan', 'sign'):  # and none is declared in vain
+        for job in ('plan', 'sign', 'gwsign'):  # and none is declared in vain
             self.assertEqual(declared[job], {out for j, out in used if j == job}, job)
 
     def test_the_publish_job_takes_its_serial_from_the_plan_and_runs_the_publisher_in_the_stage(self):
@@ -2842,7 +3004,7 @@ class Workflow(unittest.TestCase):
         self.assertIn('run: cd "$RUNNER_TEMP/stage" && python3 "$GITHUB_WORKSPACE/bin/fleet-install-publish.py" publish '
                       '"release/install-$SERIAL"', publish)  # the publisher wants the relative release/install-N
         upload = re.findall(r'(?m)^          name: (\S+)$', self.JOBS['plan'])
-        self.assertEqual((upload, re.findall(r'(?m)^          name: (\S+)$', publish)), (['install-stage'], ['install-stage']))
+        self.assertEqual((upload, re.findall(r'(?m)^          name: (\S+)$', publish)), (['loaders', 'install-stage'], ['install-stage']))
 
     # the kit job and the floor job
 
@@ -2853,10 +3015,11 @@ class Workflow(unittest.TestCase):
         return '\n'.join(line[10:] for line in body[1].splitlines())
 
     def test_tag_and_publish_both_need_kit_and_kit_needs_the_signatures_not_the_tag(self):
-        self.assertIn('    needs: [plan, sign]\n', self.JOBS['kit'])
-        self.assertIn('    needs: [plan, sign, kit]\n', self.JOBS['tag'])
-        self.assertIn('    needs: [plan, sign, kit, tag]\n', self.JOBS['publish'])
-        self.assertLess(self.TEXT.index('\n  sign:\n'), self.TEXT.index('\n  kit:\n'))
+        self.assertIn('    needs: [plan, smoke, sign, gwsign]\n', self.JOBS['kit'])
+        self.assertIn('    needs: [plan, smoke, sign, kit]\n', self.JOBS['tag'])
+        self.assertIn('    needs: [plan, smoke, sign, kit, tag]\n', self.JOBS['publish'])
+        self.assertLess(self.TEXT.index('\n  sign:\n'), self.TEXT.index('\n  gwsign:\n'))
+        self.assertLess(self.TEXT.index('\n  gwsign:\n'), self.TEXT.index('\n  kit:\n'))
         self.assertLess(self.TEXT.index('\n  kit:\n'), self.TEXT.index('\n  tag:\n'))
 
     def test_the_kit_job_holds_the_read_key_and_the_upload_key_and_nothing_else_and_leaves_nothing_behind(self):
@@ -2890,9 +3053,13 @@ class Workflow(unittest.TestCase):
     def test_the_kit_job_judges_the_gateway_pair_before_the_bundle_and_uploads_it_after(self):
         body = self.run_body('kit')
         calls = [line.strip() for line in body.splitlines() if line.strip().startswith('python3 bin/fleet-kit-upload.py ')]
-        self.assertEqual(calls, ['python3 bin/fleet-kit-upload.py gateway --check --owner-pub "$d/owner.pub"',
+        self.assertEqual(calls, ['python3 bin/fleet-kit-upload.py gateway --check --owner-pub "$d/owner.pub" ${args[@]+"${args[@]}"}',
                                  'python3 bin/fleet-kit-upload.py bundle "$d/install" --owner-pub "$d/owner.pub"',
-                                 'python3 bin/fleet-kit-upload.py gateway --owner-pub "$d/owner.pub"'])
+                                 'python3 bin/fleet-kit-upload.py gateway --owner-pub "$d/owner.pub" ${args[@]+"${args[@]}"}'])
+        # the signature gwsign made (AF08, TEST series only) is handed to both gateway calls, never to the bundle; none made, none passed
+        self.assertIn('args=()\nif [ -n "$GATEWAY_SIG" ]; then\n  printf \'%s\' "$GATEWAY_SIG" | base64 -d > "$d/gateway.sig"\n'
+                      '  args=(--sig "$d/gateway.sig")\nfi\n', body)
+        self.assertEqual(body.count('--sig '), 1)
         check, bundle, upload = (body.index(c) for c in calls)
         self.assertLess(check, bundle)
         self.assertLess(bundle, upload)
@@ -2902,16 +3069,28 @@ class Workflow(unittest.TestCase):
         self.assertEqual(body.count('set -eu'), 1)   # a refused check stops the job before the bundle is stored
         kit = self.JOBS['kit']
         self.assertEqual(re.findall(r'^          (\w+): ', kit, re.M),
-                         ['INSTALL_B64', 'INSTALL_SHA', 'INSTALL_SIG', 'PUB', 'OWNER_PIN_SHA256', 'KIT_HOST', 'FLEET_READ', 'KIT_UPLOAD_KEY'])
+                         ['INSTALL_B64', 'INSTALL_SHA', 'INSTALL_SIG', 'PUB', 'GATEWAY_SIG', 'OWNER_PIN_SHA256', 'KIT_HOST', 'FLEET_READ',
+                          'KIT_UPLOAD_KEY'])
+        self.assertIn('GATEWAY_SIG: ${{ needs.gwsign.outputs.gateway_sig }}', kit)
         self.assertEqual(re.findall(r'secrets\.(\w+)', kit), ['FLEET_READ', 'KIT_UPLOAD_KEY'])
-        self.assertIn('    needs: [plan, sign]\n    if: github.ref == \'refs/heads/release\'\n    environment: release\n', kit)
+        self.assertIn('    needs: [plan, smoke, sign, gwsign]\n    if: github.ref == \'refs/heads/release\'\n    environment: release\n', kit)
 
     def test_the_gateway_record_never_enters_the_folder_the_plan_publishes(self):
         for name in fp.FIXED + fp.KIT_FILES + fp.DATA:
             self.assertNotIn('gateway', name)
-        for job in ('plan', 'sign', 'tag', 'publish'):
+        for job in ('sign', 'tag', 'publish'):
             self.assertNotIn('gateway', self.JOBS[job], job)
+        # CV05d: the plan judges the record (its `gateway` step) and hands on a sha256 and nothing else; nothing else of the plan names it
+        plan = self.JOBS['plan'].replace('      - id: gateway\n' + self.step_text('plan', 'gateway'), '').replace('      gateway_sha: ${{ steps.gateway.outputs.gateway_sha }}\n', '').replace('      gateway_live: ${{ steps.gateway.outputs.gateway_live }}\n', '')
+        self.assertNotIn('gateway', plan)
+        self.assertEqual(self.declared_outputs('plan')['gateway_sha'], ('gateway', 'gateway_sha'))
+        self.assertEqual(self.declared_outputs('plan')['gateway_live'], ('gateway', 'gateway_live'))
+        self.assertEqual(self.written_outputs('plan', 'gateway'), {'gateway_sha', 'gateway_live'})
+        self.assertNotIn('"$RUNNER_TEMP/out', self.step_text('plan', 'gateway'))   # a byte of the record never reaches the published folder
+        self.assertNotIn('GITHUB_STEP_SUMMARY', self.step_text('plan', 'gateway'))
+        self.assertEqual(self.declared_outputs('gwsign'), {'gateway_sig': ('sign', 'gateway_sig')})  # the signature only, never a byte of the record
         self.assertIn('gateway --owner-pub', self.JOBS['kit'])   # the kit job reads the pair itself, at the release tip
+        self.assertEqual((self.written_outputs('gwsign', 'fetch'), self.written_outputs('gwsign', 'sign')), ({'live'}, {'gateway_sig'}))
 
     def test_the_floor_job_is_only_the_floor_mode_in_the_release_environment_with_the_upload_key(self):
         floor = self.JOBS['floor']
@@ -2933,9 +3112,263 @@ class Workflow(unittest.TestCase):
         self.assertNotIn('inputs.', self.run_body('floor'))
         for job in ('plan',):
             self.assertIn("inputs.mode == 'sign'", self.JOBS[job].split('steps:')[0])
-        self.assertIn("(inputs.mode == 'pubkey' || needs.plan.result == 'success')", self.JOBS['sign'])   # plan is skipped in floor mode, so is sign
+        # plan is skipped in floor mode, so is sign; a smoke that did not succeed stops a sign run (AF34), pubkey mode needs neither
+        self.assertIn("(inputs.mode == 'pubkey' || (needs.plan.result == 'success' && needs.smoke.result == 'success'))", self.JOBS['sign'])
         for bad in ('upload-artifact', 'GITHUB_STEP_SUMMARY', 'set -x', 'FLEET_READ', 'gh '):
             self.assertNotIn(bad, floor, bad)
+
+    # the gateway signature (AF08): CI signs gateway.json for the TEST series only (the owner's answer of 2026-10-21 to D311, option 5B)
+
+    def test_the_gwsign_job_is_two_steps_in_the_release_environment_with_no_token_no_checkout_and_no_action(self):
+        job = self.JOBS['gwsign']
+        head, body = job.split('    steps:\n', 1)
+        self.assertEqual(head, "    needs: [plan, sign]\n    if: github.ref == 'refs/heads/release' && inputs.mode == 'sign'\n"
+                               "    environment: release\n    runs-on: ubuntu-24.04\n    timeout-minutes: 10\n    permissions: {}\n"
+                               "    outputs:\n      gateway_sig: ${{ steps.sign.outputs.gateway_sig }}\n")
+        self.assertEqual([re.match(r'      - id: (\w+)\n', step)[1] for step in self.steps_of(job)], ['fetch', 'sign'])
+        for bad in ('uses:', 'checkout', 'github.token', 'GH_TOKEN', 'upload-artifact', 'download-artifact', 'actions/cache', 'GITHUB_STEP_SUMMARY',
+                    'GITHUB_ENV', 'set -x', '::add-mask', 'curl ', ' gh ', 'vars.', 'install-stage', 'fleet-install-publish'):
+            self.assertNotIn(bad, job, bad)
+        self.assertNotIn('inputs.', body)   # the dispatch inputs reach no step
+        self.assertEqual(re.findall(r'(?m)^        run: \|$', job), ['        run: |'] * 2)
+
+    def test_the_two_secrets_never_share_a_step_and_the_signing_step_holds_no_git_ssh_python_or_jq(self):
+        fetch, sign = self.step_text('gwsign', 'fetch'), self.step_text('gwsign', 'sign')
+        self.assertEqual(re.findall(r'(?m)^          (\w+): ', fetch), ['FLEET_READ', 'TIP', 'GATEWAY_SHA', 'GATEWAY_LIVE'])
+        self.assertEqual(re.findall(r'(?m)^          (\w+): ', sign), ['SIGN_KEY'])
+        self.assertEqual(re.findall(r'secrets\.(\w+)', fetch), ['FLEET_READ'])
+        self.assertEqual(re.findall(r'secrets\.(\w+)', sign), ['SIGN_KEY'])
+        self.assertNotIn('SIGN_KEY', fetch)
+        self.assertNotIn('FLEET_READ', sign)
+        self.assertNotIn('TIP', sign)
+        code = '\n'.join(l for l in sign.splitlines() if not l.lstrip().startswith('#'))
+        for tool in (r'git', r'ssh(?!-keygen)', r'scp', r'sftp', r'python3?', r'jq', r'curl', r'wget', r'nc', r'gh', r'openssl'):
+            self.assertNotRegex(code, rf'(?<![\w/-])(?:/usr/bin/)?{tool}(?![\w-])' if tool != r'ssh(?!-keygen)' else r'(?<![\w-])ssh(?![\w-])', tool)
+        self.assertNotIn('GIT_SSH_COMMAND', sign)
+        self.assertIn('/usr/bin/ssh-keygen -q -Y sign', sign)   # ssh-keygen is the one tool, and it never talks to a network
+
+    @staticmethod
+    def gateway_keys() -> tuple:
+        import importlib.util as iu
+        spec = iu.spec_from_file_location('fleet_kit_upload_keys', ROOT / 'bin/fleet-kit-upload.py')
+        mod = iu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.GATEWAY_KEYS   # the names the kit verb's own check holds a record to
+
+    def test_the_fetch_step_refuses_a_moved_tip_signs_only_the_bytes_the_plan_judged_and_never_reads_the_tips_own_signature(self):
+        fetch = self.step_text('gwsign', 'fetch')
+        self.assertIn('TIP: ${{ needs.plan.outputs.tip }}', fetch)
+        self.assertIn('GATEWAY_SHA: ${{ needs.plan.outputs.gateway_sha }}', fetch)   # CV05d: the plan's verdict on these very bytes
+        self.assertIn('GATEWAY_LIVE: ${{ needs.plan.outputs.gateway_live }}', fetch)   # and on the parsed record, never a grep over the bytes
+        self.assertNotIn('fleet/core/gateway.json.sig', self.JOBS['gwsign'])   # the tip's own signature (the control VM's, from CV05e) is never looked at
+        self.assertNotIn('SKIP gwsign series', self.JOBS['gwsign'])   # both series sign
+        self.assertEqual(self.declared_outputs('plan')['tip'], ('plan', 'tip'))   # the tip the plan judged, handed on
+        for need in ('/dev/shm/gwfetch.', 'umask 077', "trap 'shred -u", 'StrictHostKeyChecking=yes', 'IdentitiesOnly=yes', 'GlobalKnownHostsFile=/dev/null',
+                     "REFUSED tip-moved", "REFUSED gateway tip", "REFUSED gateway", "SKIP gwsign not-live", "REFUSED gateway unchecked",
+                     'ls-tree "$TIP" -- fleet/core/gateway.json', "'100644 blob '*", '-le 65536'):
+            self.assertIn(need, fetch, need)
+        order = ["trap 'shred -u", '"$FLEET_READ" > "$d/key"', 'fetch -q --no-tags --depth 1', 'REFUSED tip-moved',
+                 'case "$rec" in', 'cat-file blob "$TIP:fleet/core/gateway.json"', 'for k in ', 'if [ "$GATEWAY_LIVE" = no ]', '"$GATEWAY_SHA"', 'echo live=yes']
+        self.assertEqual([fetch.index(x) for x in order], sorted(fetch.index(x) for x in order))
+        # the body is shaped like a gateway record before it is called live (review of AF08, P1): the five names of GATEWAY_KEYS, fixed strings
+        self.assertIn('for k in ' + ' '.join(self.gateway_keys()) + '; do', fetch)
+        self.assertIn('grep -qF "\\"$k\\"" "$RUNNER_TEMP/gwsign/gateway.json"', fetch)
+        self.assertLess(fetch.index('for k in '), fetch.index('echo live=yes'))
+        self.assertNotIn('SERIES', fetch)   # CV05d: no series test in the fetch step
+        self.assertGreater(fetch.index('for k in '), fetch.index('cat-file blob'))
+        self.assertNotIn('--force', fetch)
+        self.assertNotIn('+refs/tags', fetch)
+        self.assertEqual(len(re.findall(r'cat-file blob', fetch)), 1)   # the record is read once, after every check; nothing prints it
+        self.assertNotRegex(fetch, r'(?m)^\s*(?:cat|head|tail|xxd|od|base64)\b')
+
+    def test_the_sign_step_runs_in_both_series_checks_the_key_and_prints_a_size_and_a_hash_at_most(self):
+        sign = self.step_text('gwsign', 'sign')
+        self.assertIn("        if: steps.fetch.outputs.live == 'yes'\n", sign)
+        for need in ('case "$SERIES" in test | release) ;; *) echo \'REFUSED series\'; exit 1;; esac', '/dev/shm/gwsign.', 'umask 077', 'set -euo pipefail', "trap 'shred -u",
+                     "grep -Eq '^SHA256:[A-Za-z0-9+/]{43}$'", '[ "$fp" = "$KEY_SHA256" ] ||', 'REFUSED key-not-set',
+                     f'-Y sign -f "$d/key" -n {fp.PIN_NS} "$d/gateway.json"', f'-Y verify -f "$d/allowed" -I owner -n {fp.PIN_NS}',
+                     f'namespaces="{fp.PIN_NS}"', 'REFUSED changed gateway.json', "printf 'gateway_sig=%s\\n' \"$(base64 -w0"):
+            self.assertIn(need, sign, need)
+        self.assertNotIn(fp.NS + '"', sign)   # the install namespace is never the gateway record's
+        order = ['case "$SERIES" in', '"$d/key"', '[ "$fp" = "$KEY_SHA256" ]', '-Y sign', '-Y verify', 'REFUSED changed', 'gateway_sig=']
+        self.assertEqual([sign.index(x) for x in order], sorted(sign.index(x) for x in order))
+        echoed = [l.strip() for l in sign.splitlines() if l.strip().startswith('echo ') and '$' in l]
+        self.assertEqual(echoed, ['echo "signed gateway.json: $n bytes, sha256 $h, key $fp"'])   # the one line with a value: a size, a hash, the key's fingerprint
+        self.assertNotRegex(sign, r'(?m)^\s*(?:cat|head|tail|xxd|od)\b')   # nothing prints the record
+        self.assertNotRegex(sign, r'-Y verify[^\n]*\|\|')   # a failed verify stops the step: no `|| true` after it (review of AF08, mutant X10)
+        self.assertIn('rm -rf "$d" "$RUNNER_TEMP/gwsign"', sign)   # the record's copy goes with the key
+
+    # the boot smoke before the signature (AF34)
+
+    SMOKE_ROWS = [('windows-2022', 'ps1', 'root-store', 'true'), ('windows-2025', 'ps1', 'root-store', 'true'),
+                  ('ubuntu-24.04', 'sh', 'ca-certificates', 'true'), ('ubuntu-22.04', 'sh', 'none', 'false'),
+                  ('macos-15', 'sh', 'curl-ca-bundle', 'true')]
+
+    def test_the_smoke_job_holds_nothing_and_runs_the_designed_rows_over_the_fixture_artifact(self):
+        smoke = self.JOBS['smoke']
+        head = smoke.split('steps:')[0]
+        self.assertIn("if: github.ref == 'refs/heads/release' && inputs.mode == 'sign'\n", head)
+        self.assertIn('    needs: [plan, fixture]\n', head)   # the fixture is built once, before the legs
+        self.assertIn('    runs-on: ${{ matrix.runner }}\n', head)
+        self.assertIn('    timeout-minutes: 25\n', head)   # a hung hosted leg must not hold the release for the 360 minute default
+        self.assertIn('    strategy:\n      fail-fast: false\n      matrix:\n        include:\n', head)   # one red leg must not cancel the others' per-OS evidence
+        self.assertIn('    permissions: {}\n', head)   # no token scope: the job reads nothing of this repository's but its public files
+        for bad in ('secrets.', 'vars.', 'environment', 'github.token', 'GH_TOKEN', 'needs.', 'outputs:', 'install-stage',
+                    'FLEET_READ', 'continue-on-error', 'self-hosted', 'actions/cache'):
+            self.assertNotIn(bad, smoke, bad)
+        self.assertNotIn('inputs.', smoke.split('steps:')[1])   # the dispatch inputs reach it through no step
+        rows = re.findall(r'(?m)^          - runner: ([\w.-]+)(?: +#.*)?\n            os: (\w+)\n            trust: ([\w-]+)\n            must_run: (true|false)\n',
+                          smoke)
+        self.assertEqual(rows, self.SMOKE_ROWS)   # block style, one key a line; the keychain row stays in boot-smoke.yml
+        self.assertEqual(smoke.count('          - runner:'), 5)
+        self.assertNotIn('keychain', smoke)
+        self.assertEqual(re.findall(r'uses: (\S+)', smoke),
+                         ['actions/checkout@11d5960a326750d5838078e36cf38b85af677262', 'actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065',
+                          'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093'])
+        self.assertIn('          name: fixture\n          path: fixture\n', smoke)   # it downloads the fixture; it builds none, and holds no loader
+        self.assertNotIn('make_fixture', smoke)
+        self.assertNotIn('loaders', smoke)
+        self.assertLess(smoke.index('name: fixture'), smoke.index('smoke_driver.py probe'))
+        for need in ('smoke_driver.py control --dir fixture --phase before', 'smoke_driver.py control --dir fixture --phase after',
+                     'smoke_driver.py fixture --dir fixture --os "$BOOT_OS" "${flag[@]}"', '[ "$BOOT_MUST" = true ] && flag=(--must-run)',
+                     'BOOT_OS: ${{ matrix.os }}', 'BOOT_MUST: ${{ matrix.must_run }}'):
+            self.assertIn(need, smoke)
+        self.assertEqual(smoke.count('persist-credentials: false'), 1)
+
+    # the fixture is built once on ubuntu and shipped to every leg, as boot-smoke.yml does (run 38633686710: built per leg it was
+    # REFUSED tool on macos-15 and REFUSED verify on windows-2022 and windows-2025; the dispatch shape ran 7/7 green, run 38514272677)
+
+    @staticmethod
+    def steps_of(job: str) -> list[str]:
+        """The text of each `      - ` step of a job, in order."""
+        return re.findall(r'(?ms)^      - .*?(?=^      - |\Z)', job.split('    steps:\n', 1)[1])
+
+    def test_the_fixture_job_builds_it_once_on_ubuntu_from_the_loaders_and_holds_nothing(self):
+        fixture = self.JOBS['fixture']
+        head, body = fixture.split('    steps:\n', 1)
+        self.assertEqual(head, "    needs: plan\n    if: github.ref == 'refs/heads/release' && inputs.mode == 'sign'\n"
+                                "    runs-on: ubuntu-24.04\n    timeout-minutes: 10\n    permissions: {}\n")   # no matrix, no environment, no token scope
+        for bad in ('secrets.', 'vars.', 'environment', 'github.token', 'GH_TOKEN', 'needs.', 'outputs:', 'install-stage',
+                    'FLEET_READ', 'continue-on-error', 'self-hosted', 'actions/cache', 'matrix', '--boot-dir'):
+            self.assertNotIn(bad, fixture, bad)
+        self.assertEqual(re.findall(r'uses: (\S+)', fixture),
+                         ['actions/checkout@11d5960a326750d5838078e36cf38b85af677262', 'actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065',
+                          'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093', 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02'])
+        self.assertIn('          name: loaders\n          path: loaders\n', fixture)
+        self.assertEqual(re.findall(r'(?m)^      - run: (.*)$', fixture),
+                         ['python3 tests/fixture/make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh'])
+        self.assertNotIn('inputs.', body)   # the dispatch inputs reach it through no step
+        self.assertEqual(fixture.count('persist-credentials: false'), 1)
+        self.assertLess(fixture.index('name: loaders'), fixture.index('make_fixture.py'))
+        self.assertLess(fixture.index('make_fixture.py'), fixture.index('name: fixture'))
+        self.assertLess(self.TEXT.index('\n  plan:\n'), self.TEXT.index('\n  fixture:\n'))
+        self.assertLess(self.TEXT.index('\n  fixture:\n'), self.TEXT.index('\n  smoke:\n'))
+
+    def test_a_red_smoke_stops_the_signature_and_every_job_after_it(self):
+        for name in ('sign', 'kit', 'tag', 'publish'):
+            self.assertRegex(self.JOBS[name], rf'(?m)^    needs: \[plan, smoke[,\]]', name)
+        sign = self.JOBS['sign']
+        self.assertIn("needs.smoke.result == 'success'", sign)   # the status check is not left to the default: sign runs with !cancelled()
+        self.assertLess(sign.index("needs.plan.result == 'success'"), sign.index("needs.smoke.result == 'success'"))
+        for name in ('floor-approve', 'floor'):   # the floor mode never waits for a smoke or its fixture
+            self.assertNotIn('smoke', self.JOBS[name])
+            self.assertNotIn('fixture', self.JOBS[name])
+        self.assertNotIn('fixture', sign.split('steps:')[0])   # sign reaches the fixture through smoke, which needs it
+        self.assertLess(self.TEXT.index('\n  plan:\n'), self.TEXT.index('\n  smoke:\n'))
+        self.assertLess(self.TEXT.index('\n  smoke:\n'), self.TEXT.index('\n  sign:\n'))
+
+    def test_the_plan_job_hands_only_the_two_loaders_to_the_fixture_job(self):
+        plan = self.JOBS['plan']
+        self.assertEqual(re.findall(r'(?m)^          name: (\S+)$', plan), ['loaders', 'install-stage'])
+        up = re.search(r'(?ms)^      - uses: actions/upload-artifact@\w+ +# v4\.6\.2\n        with:\n          name: loaders\n(.*?)(?=^      - |\Z)', plan)
+        self.assertIsNotNone(up)
+        self.assertEqual(up[1], '          path: ${{ runner.temp }}/loaders\n          retention-days: 1\n          if-no-files-found: error\n')
+        self.assertLess(plan.index('      - id: plan\n'), plan.index('      - id: loaders\n'))   # after every offline check
+        self.assertLess(plan.index('      - id: loaders\n'), plan.index('name: loaders\n'))
+        step = self.step_text('plan', 'loaders')
+        self.assertTrue(step.startswith('        env:\n'), step[:40])   # no `if:` before env: nothing may gate the step into a skip
+        self.assertNotIn('\n        if:', step)
+        self.assertIn('"$TIP:release/install-$SERIAL/$f"', self.run_loaders_body())   # the plan's own tip; HEAD is unborn in the real job
+        self.assertIn('SERIAL: ${{ steps.plan.outputs.serial }}', step)
+        self.assertIn('TIP: ${{ steps.plan.outputs.tip }}', step)
+        self.assertNotIn('secrets.', step)
+        self.assertNotIn('${{', self.run_loaders_body())
+
+    def run_loaders_body(self) -> str:
+        return '\n'.join(l[10:] for l in self.step_text('plan', 'loaders').split('        run: |\n', 1)[1].splitlines())
+
+    def loaders_repo(self, tmp: Path, files: dict[str, bytes], crlf_worktree: bool = True) -> tuple[Path, str]:
+        """A fleet repository standing in for the `release` branch (the ps1 checks out as CRLF, as .gitattributes says);
+        (the RUNNER_TEMP holding it as fleet/, its tip)."""
+        fleet = tmp / 'rt' / 'fleet'
+        fleet.mkdir(parents=True)
+        git = lambda *a: subprocess.run([fp.GIT, '-C', str(fleet), *a], env=GIT_ENV, check=True, capture_output=True, text=True).stdout.strip()
+        git('init', '-q', '-b', 'release')
+        (fleet / '.gitattributes').write_text('*.ps1 text eol=crlf\n')
+        folder = fleet / 'release' / 'install-7'
+        folder.mkdir(parents=True)
+        for name, data in files.items():
+            (folder / name).write_bytes(data)
+        git('add', '-A')
+        git('commit', '-q', '-m', 'x')
+        for name in files:   # what a checkout of the tip makes of them: the working tree copy is the smudged one
+            (folder / name).unlink()
+        git('checkout', '-q', 'HEAD', '--', '.')
+        return tmp / 'rt', git('rev-parse', 'HEAD')
+
+    def run_loaders(self, tmp: Path, rt: Path, serial: str = '7', tip: str = '') -> subprocess.CompletedProcess:
+        env = {'PATH': '/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin', 'HOME': str(tmp), 'GIT_CONFIG_NOSYSTEM': '1', 'RUNNER_TEMP': str(rt),
+               'SERIAL': serial, 'TIP': tip}
+        return subprocess.run(['/bin/bash', '--noprofile', '--norc', '-c', self.run_loaders_body()], env=env, capture_output=True, text=True, cwd=tmp)
+
+    SH, PS1 = b'#!/bin/sh\necho sh\n', b'# ps1\n$x = 1\n'
+
+    @unittest.skipUnless(os.path.exists(fp.GIT), 'git is missing')
+    def test_the_loaders_step_reads_the_lf_blobs_though_the_checked_out_ps1_is_crlf_and_uploads_only_those_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            rt, tip = self.loaders_repo(tmp, {'bootstrap.sh': self.SH, 'bootstrap.ps1': self.PS1, 'install.json': b'{}\n', 'kit.json': b'{}\n'})
+            folder = rt / 'fleet' / 'release' / 'install-7'
+            self.assertEqual((folder / 'bootstrap.ps1').read_bytes(), self.PS1.replace(b'\n', b'\r\n'))   # the premise: CRLF on disk
+            fleet = rt / 'fleet'   # a later commit on the branch: reading HEAD or the branch, not the tip, would hand on other bytes
+            (fleet / 'release' / 'install-7' / 'bootstrap.sh').write_bytes(b'#!/bin/sh\necho later\n')
+            for args in (('add', '-A'), ('commit', '-q', '-m', 'later')):
+                subprocess.run([fp.GIT, '-C', str(fleet), *args], env=GIT_ENV, check=True, capture_output=True, text=True)
+            done = self.run_loaders(tmp, rt, tip=tip)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            out = rt / 'loaders'
+            self.assertEqual(sorted(p.name for p in out.iterdir()), ['bootstrap.ps1', 'bootstrap.sh'])   # nothing else of the folder goes out
+            self.assertEqual((out / 'bootstrap.ps1').read_bytes(), self.PS1)   # the blob, not the working tree
+            self.assertNotIn(b'\r', (out / 'bootstrap.ps1').read_bytes())
+            self.assertEqual((out / 'bootstrap.sh').read_bytes(), self.SH)
+
+    @unittest.skipUnless(os.path.exists(fp.GIT), 'git is missing')
+    def test_the_loaders_step_fails_on_a_missing_or_empty_loader_a_bad_serial_or_a_bad_tip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            for what, files, want in (('no ps1', {'bootstrap.sh': self.SH}, 'REFUSED loader bootstrap.ps1'),
+                                      ('no sh', {'bootstrap.ps1': self.PS1}, 'REFUSED loader bootstrap.sh'),
+                                      ('an empty sh', {'bootstrap.sh': b'', 'bootstrap.ps1': self.PS1}, 'REFUSED loader bootstrap.sh'),
+                                      ('neither', {'install.json': b'{}\n'}, 'REFUSED loader bootstrap.sh')):
+                with self.subTest(what):
+                    (tmp / what.replace(' ', '-')).mkdir()
+                    rt, tip = self.loaders_repo(tmp / what.replace(' ', '-'), files)
+                    done = self.run_loaders(tmp, rt, tip=tip)
+                    self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                    self.assertIn(want, done.stdout)
+            (tmp / 'ok').mkdir()
+            rt, tip = self.loaders_repo(tmp / 'ok', {'bootstrap.sh': self.SH, 'bootstrap.ps1': self.PS1})
+            for what, serial, tip_in, want in (('a serial that is another folder', '8', tip, 'REFUSED loader bootstrap.sh'),
+                                               ('a serial with a path in it', '7/../7', tip, 'REFUSED loader serial'),
+                                               ('an empty serial', '', tip, 'REFUSED loader serial'),
+                                               ('a tip that is a name', '7', 'release', 'REFUSED loader tip'),
+                                               ('an empty tip', '7', '', 'REFUSED loader tip'),
+                                               ('a tip that is short', '7', tip[:12], 'REFUSED loader tip')):
+                with self.subTest(what):
+                    shutil.rmtree(rt / 'loaders', ignore_errors=True)
+                    done = self.run_loaders(tmp, rt, serial=serial, tip=tip_in)
+                    self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                    self.assertIn(want, done.stdout)
 
     # those two run blocks, for real, over a stand-in python3 that records what it is given
 
@@ -2954,6 +3387,7 @@ class Workflow(unittest.TestCase):
     echo "SIG=$(cat "$d/install/install.json.sig")"
     echo "PUBFILE=$(cat "$d/owner.pub")"
     echo "KNOWN=$(cat "$d/known_hosts")"
+    echo "GWSIG=$(cat "$d/gateway.sig" 2>/dev/null)"
   fi
 } >> "$STUB_LOG"
 [ "$3" = --check ] && [ -n "$STUB_FAIL_CHECK" ] && exit 1
@@ -2978,7 +3412,7 @@ class Workflow(unittest.TestCase):
     def kit_env(self, **over) -> dict:
         install = b'{"kind": "install"}\n'
         env = {'INSTALL_B64': base64.b64encode(install).decode(), 'INSTALL_SHA': sha(install), 'INSTALL_SIG': base64.b64encode(b'SIGBYTES').decode(),
-               'PUB': 'ssh-ed25519 PUBLINE', 'OWNER_PIN_SHA256': 'SHA256:x', 'KIT_HOST': 'kit.example.org',
+               'PUB': 'ssh-ed25519 PUBLINE', 'GATEWAY_SIG': '', 'OWNER_PIN_SHA256': 'SHA256:x', 'KIT_HOST': 'kit.example.org',
                'FLEET_READ': 'THROWAWAY-READ-KEY', 'KIT_UPLOAD_KEY': 'THROWAWAY-UPLOAD-KEY'}
         env.update(over)
         return env
@@ -2997,6 +3431,19 @@ class Workflow(unittest.TestCase):
                          'INSTALL={"kind": "install"}', 'SIG=SIGBYTES', 'PUBFILE=ssh-ed25519 PUBLINE', 'KNOWN=github.com ssh-ed25519 AAAA'):
                 self.assertEqual(log.count(want + '\n'), 3, want)
             self.assertEqual(list(shm.iterdir()), [])   # the key and the files are gone on exit
+            self.assertEqual(log.count('GWSIG=\n'), 3)   # no signature handed on: no file, and no --sig on either gateway call
+
+    def test_the_kit_step_passes_the_gateway_signature_to_both_gateway_calls_and_to_nothing_else(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            done, log, shm = self.run_block(Path(tmp), 'kit', self.kit_env(GATEWAY_SIG=base64.b64encode(b'GWSIGBYTES').decode()))
+            self.assertEqual((done.returncode, done.stdout + done.stderr), (0, ''), done.stderr)
+            calls = [l for l in log.splitlines() if l.startswith('ARGS ')]
+            self.assertEqual(len(calls), 3)
+            self.assertRegex(calls[0], r'^ARGS bin/fleet-kit-upload\.py gateway --check --owner-pub \S+/owner\.pub --sig \S+/gateway\.sig$')
+            self.assertRegex(calls[1], r'^ARGS bin/fleet-kit-upload\.py bundle \S+/install --owner-pub \S+/owner\.pub$')   # never the bundle
+            self.assertRegex(calls[2], r'^ARGS bin/fleet-kit-upload\.py gateway --owner-pub \S+/owner\.pub --sig \S+/gateway\.sig$')
+            self.assertEqual(log.count('GWSIG=GWSIGBYTES\n'), 3)   # the file holds the decoded signature, as the job made it
+            self.assertEqual(list(shm.iterdir()), [])
 
     def test_the_kit_step_stops_and_cleans_up_when_the_bundle_is_refused_or_the_manifest_is_not_the_planned_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3167,6 +3614,171 @@ class Workflow(unittest.TestCase):
                 self.assertIn('UNKNOWN:', text)
                 self.assertIn('review EVERY commit', text)
                 self.assertIn(heads[0], text)  # the whole list stands in for the one that could not be computed
+
+
+    # the untag mode (AF42): three jobs, the only way a release-less tag leaves
+
+    def untag_body(self, name: str) -> str:
+        return self.run_body(name)
+
+    def test_the_untag_jobs_are_only_the_untag_mode_in_the_install_group_and_wired_in_a_line(self):
+        for name in ('untag-check', 'untag-approve', 'untag'):
+            self.assertIn("if: github.ref == 'refs/heads/release' && inputs.mode == 'untag'\n", self.JOBS[name].split('steps:')[0], name)
+            self.assertNotIn('timeout-minutes: 60', self.JOBS[name])
+        self.assertIn("group: ${{ inputs.mode == 'floor' && 'install-floor' || 'install' }}", self.TEXT)  # untag stays in `install`
+        for name in ('plan', 'fixture', 'smoke', 'sign', 'gwsign', 'kit', 'tag', 'publish', 'floor-approve', 'floor'):
+            self.assertNotIn("inputs.mode == 'untag'", self.JOBS[name], name)  # no other mode's job runs in an untag run
+        self.assertLess(self.TEXT.index('\n  floor:\n'), self.TEXT.index('\n  untag-check:\n'))
+        self.assertLess(self.TEXT.index('\n  untag-check:\n'), self.TEXT.index('\n  untag-approve:\n'))
+        self.assertLess(self.TEXT.index('\n  untag-approve:\n'), self.TEXT.index('\n  untag:\n'))
+
+    def test_the_untag_check_job_holds_no_secret_no_environment_and_only_a_read_token(self):
+        check = self.JOBS['untag-check']
+        self.assertIn('    permissions:\n      contents: read\n', check)
+        for bad in ('secrets.', 'vars.', 'environment', 'upload-artifact', 'download-artifact', 'actions/cache', 'FLEET_READ', 'TAG_KEY',
+                    'GITHUB_ENV', 'set -x', 'write'):
+            self.assertNotIn(bad, check, bad)
+        self.assertEqual(re.findall(r'uses: (\S+)', check), ['actions/checkout@11d5960a326750d5838078e36cf38b85af677262'])
+        self.assertEqual(check.count('persist-credentials: false'), 1)
+        self.assertEqual(self.declared_outputs('untag-check'), {'sha': ('check', 'sha')})
+        step = self.step_text('untag-check', 'check')
+        for need in ('SERIAL: ${{ inputs.serial }}', 'GH_TOKEN: ${{ github.token }}'):
+            self.assertIn(need, step)
+        self.assertEqual(self.untag_body('untag-check').splitlines()[-1], 'python3 bin/fleet-install-publish.py untag-check --serial "$SERIAL"')
+        self.assertNotIn('inputs.', self.untag_body('untag-check'))  # only through env:
+
+    def test_the_untag_approve_job_waits_in_kit_floor_holds_nothing_and_prints_the_value_it_approves(self):
+        approve = self.JOBS['untag-approve']
+        head = approve.split('steps:')[0]
+        self.assertIn('    needs: untag-check\n', head)
+        self.assertIn('    environment: kit-floor\n', head)
+        self.assertIn('    permissions: {}\n', head)
+        for bad in ('secrets.', 'github.token', 'GH_TOKEN', 'uses:', 'checkout', 'python', 'upload-artifact'):
+            self.assertNotIn(bad, approve, bad)
+        for need in ('SERIAL: ${{ inputs.serial }}', 'TAG_SHA: ${{ needs.untag-check.outputs.sha }}'):
+            self.assertIn(need, approve)
+        self.assertNotIn('inputs.', self.untag_body('untag-approve'))
+        sha40 = 'ab' * 20
+        with tempfile.TemporaryDirectory() as tmp:
+            done, log, _ = self.run_block(Path(tmp), 'untag-approve', {'SERIAL': '7', 'TAG_SHA': sha40})
+            self.assertEqual((done.returncode, done.stdout, log), (0, f'approved: delete tag install-7 at {sha40}\n', ''))
+        for what, env in (('no serial', {'SERIAL': '', 'TAG_SHA': sha40}), ('a serial with a path', {'SERIAL': '7/..', 'TAG_SHA': sha40}),
+                          ('no sha', {'SERIAL': '7', 'TAG_SHA': ''}), ('a short sha', {'SERIAL': '7', 'TAG_SHA': sha40[:39]}),
+                          ('an upper-case sha', {'SERIAL': '7', 'TAG_SHA': sha40.upper()}), ('a ref name', {'SERIAL': '7', 'TAG_SHA': 'refs/heads/release'})):
+            with self.subTest(what), tempfile.TemporaryDirectory() as tmp:
+                done, _, _ = self.run_block(Path(tmp), 'untag-approve', env)
+                self.assertEqual(done.returncode, 1)
+                self.assertNotIn('approved', done.stdout)  # nothing is approved that the delete would not take
+
+    def test_the_untag_job_needs_both_reads_only_the_tag_key_and_runs_no_code_no_token_and_no_force_but_the_lease(self):
+        untag = self.JOBS['untag']
+        head = untag.split('steps:')[0]
+        self.assertIn('    needs: [untag-check, untag-approve]\n', head)
+        self.assertIn('    environment: release\n', head)
+        self.assertIn('    permissions: {}\n', head)
+        self.assertEqual(re.findall(r'secrets\.(\w+)', untag), ['TAG_KEY'])
+        for bad in ('uses:', 'checkout', 'python', 'RUNNER_WORKSPACE', 'GITHUB_WORKSPACE', 'github.token', 'GH_TOKEN', 'fleet-install-publish',
+                    'vars.', 'upload-artifact', 'download-artifact', 'actions/cache', 'StrictHostKeyChecking=no', ' gh '):
+            self.assertNotIn(bad, untag, bad)
+        for need in ('StrictHostKeyChecking=yes', 'IdentitiesOnly=yes', 'GlobalKnownHostsFile=/dev/null', '/dev/shm/untag.', "trap 'shred -u",
+                     'umask 077', 'SERIAL: ${{ inputs.serial }}', 'TAG_SHA: ${{ needs.untag-check.outputs.sha }}'):
+            self.assertIn(need, untag)
+        body = self.untag_body('untag')
+        ssh = [l.strip() for l in body.splitlines() if l.strip().startswith('export GIT_SSH_COMMAND=')]
+        self.assertEqual(len(ssh), 1)
+        for need in ('-o BatchMode=yes', '-o HostKeyAlgorithms=ssh-ed25519'):  # BatchMode: an auth failure fails, it never waits on a prompt
+            self.assertIn(need, ssh[0], need)
+        for other in ('plan', 'tag', 'kit'):  # the same ssh options as every other deploy-key job
+            others = [l.strip() for l in self.JOBS[other].splitlines() if l.strip().startswith('export GIT_SSH_COMMAND=')]
+            self.assertEqual(others, ssh, other)
+        self.assertLess(body.index("trap 'shred"), body.index('"$TAG_KEY" > "$d/key"'))
+        self.assertNotIn('inputs.', body)
+        self.assertEqual(re.findall(r'--force\S*', untag), ['--force-with-lease="refs/tags/install-$SERIAL:$TAG_SHA"'])  # the lease is the one force
+        pushes = [l.strip() for l in body.splitlines() if ' push ' in l]
+        self.assertEqual(pushes, ['git -C "$d/repo" push -q --force-with-lease="refs/tags/install-$SERIAL:$TAG_SHA" '
+                                  '"git@github.com:$GITHUB_REPOSITORY.git" ":refs/tags/install-$SERIAL"'])  # one push, a delete of one tag
+        self.assertNotRegex(untag, r'(?m)\bpush\b.*\s-\w*f')  # no -f
+        self.assertNotRegex(untag, r'(?m)\bpush\b.*[ "]\+')  # no +refspec, no --mirror, no --prune
+        for bad in ('--mirror', '--prune', '--all', '--tags', 'refs/heads', 'git fetch', 'git clone'):
+            self.assertNotIn(bad, body, bad)
+
+    SCRATCH_GIT = {'PATH': '/usr/bin:/bin', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_TERMINAL_PROMPT': '0', 'GIT_AUTHOR_NAME': 'n', 'GIT_AUTHOR_EMAIL': 'n@example.org',
+                   'GIT_COMMITTER_NAME': 'n', 'GIT_COMMITTER_EMAIL': 'n@example.org'}
+
+    def untag_remote(self, tmp: Path) -> tuple[Path, str, str]:
+        """A bare repository standing in for GitHub, with the tag install-7 on the first of two commits: (path, first, second)."""
+        git = lambda *a, cwd=tmp: subprocess.run([fp.GIT, *a], cwd=cwd, env={**self.SCRATCH_GIT, 'HOME': str(tmp)}, check=True, capture_output=True, text=True).stdout.strip()
+        git('init', '-q', '-b', 'release', 'work')
+        work = tmp / 'work'
+        (work / 'f').write_text('1')
+        git('add', 'f', cwd=work)
+        git('commit', '-q', '-m', 'one', cwd=work)
+        first = git('rev-parse', 'HEAD', cwd=work)
+        (work / 'f').write_text('2')
+        git('commit', '-q', '-am', 'two', cwd=work)
+        second = git('rev-parse', 'HEAD', cwd=work)
+        git('tag', 'install-7', first, cwd=work)
+        git('init', '-q', '--bare', 'remote.git')
+        git('push', '-q', str(tmp / 'remote.git'), 'release', 'refs/tags/install-7', cwd=work)
+        return tmp / 'remote.git', first, second
+
+    def run_untag(self, tmp: Path, remote: Path, env: dict):
+        """The `untag` run: block under bash for real, tmpfs stood in by a temp dir and GitHub by the local bare repository."""
+        shm = tmp / 'shm'
+        shm.mkdir(exist_ok=True)
+        body = self.untag_body('untag').replace('/dev/shm/', f'{shm}/').replace('git@github.com:$GITHUB_REPOSITORY.git', str(remote))
+        self.assertIn(str(remote), body)
+        full = {**self.SCRATCH_GIT, 'HOME': str(tmp), 'GH_HOSTKEY': 'github.com ssh-ed25519 AAAA', 'TAG_KEY': 'THROWAWAY-TAG-KEY', **env}
+        done = subprocess.run(['/bin/bash', '-c', body], env=full, capture_output=True, text=True, cwd=tmp)
+        return done, shm
+
+    def remote_tags(self, remote: Path) -> list[str]:
+        return subprocess.run([fp.GIT, '-C', str(remote), 'tag', '-l'], env=self.SCRATCH_GIT, check=True, capture_output=True, text=True).stdout.split()
+
+    @unittest.skipUnless(os.path.exists(fp.GIT), 'git is missing')
+    def test_the_untag_step_deletes_the_tag_only_while_it_is_on_the_checked_commit_and_leaves_no_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            remote, first, second = self.untag_remote(tmp)
+            self.assertEqual(self.remote_tags(remote), ['install-7'])
+            done, shm = self.run_untag(tmp, remote, {'SERIAL': '7', 'TAG_SHA': second})  # the tag moved since the check: the lease refuses
+            self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertEqual(self.remote_tags(remote), ['install-7'])  # still there
+            self.assertEqual(list(shm.iterdir()), [])  # the key is gone on the failure path too
+            self.assertNotIn('THROWAWAY-TAG-KEY', done.stdout + done.stderr)
+            done, shm = self.run_untag(tmp, remote, {'SERIAL': '7', 'TAG_SHA': first})  # control: the checked commit
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertEqual(self.remote_tags(remote), [])
+            self.assertEqual(done.stdout.strip().splitlines()[-1], f'deleted tag install-7 at {first}')
+            self.assertEqual(list(shm.iterdir()), [])
+            self.assertNotIn('THROWAWAY-TAG-KEY', done.stdout + done.stderr)
+
+    @unittest.skipUnless(os.path.exists(fp.GIT), 'git is missing')
+    def test_the_untag_step_removes_exactly_the_named_tag_and_nothing_else(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            remote, first, _ = self.untag_remote(tmp)
+            subprocess.run([fp.GIT, '-C', str(remote), 'tag', 'install-70', first], env=self.SCRATCH_GIT, check=True)
+            heads = subprocess.run([fp.GIT, '-C', str(remote), 'rev-parse', 'release'], env=self.SCRATCH_GIT, check=True, capture_output=True, text=True).stdout
+            done, _ = self.run_untag(tmp, remote, {'SERIAL': '7', 'TAG_SHA': first})
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertEqual(self.remote_tags(remote), ['install-70'])  # a longer name is another tag
+            self.assertEqual(subprocess.run([fp.GIT, '-C', str(remote), 'rev-parse', 'release'], env=self.SCRATCH_GIT, check=True,
+                                            capture_output=True, text=True).stdout, heads)  # the branch is untouched
+
+    @unittest.skipUnless(os.path.exists(fp.GIT), 'git is missing')
+    def test_the_untag_step_takes_digits_and_a_full_lower_case_sha_only_and_touches_nothing_otherwise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            remote, first, _ = self.untag_remote(tmp)
+            for what, env in (('no serial', {'SERIAL': '', 'TAG_SHA': first}), ('a serial with a path', {'SERIAL': '7/../7', 'TAG_SHA': first}),
+                              ('no sha', {'SERIAL': '7', 'TAG_SHA': ''}), ('a short sha', {'SERIAL': '7', 'TAG_SHA': first[:12]}),
+                              ('a ref name', {'SERIAL': '7', 'TAG_SHA': 'release'}), ('a sha with a space', {'SERIAL': '7', 'TAG_SHA': first + ' x'})):
+                with self.subTest(what):
+                    done, shm = self.run_untag(tmp, remote, env)
+                    self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                    self.assertEqual(self.remote_tags(remote), ['install-7'])
+                    self.assertEqual(list(shm.iterdir()), [])  # it stopped before a key was written
 
 
 if __name__ == '__main__':

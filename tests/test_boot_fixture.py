@@ -109,8 +109,8 @@ class Rewrite(unittest.TestCase):
                                     ('sh', SH, b'download  # the one', b'download/x  # the one')):
             with self.subTest(old=old), self.assertRaises(mf.Refused):
                 mf.prepare(name, raw.replace(old, new), '127.0.0.1', 1, KEY, EXPIRES)
-        with self.assertRaises(mf.Refused):  # the curl line twice matches twice
-            mf.prepare('ps1', PS1.replace(PS1_CURL.encode(), PS1_CURL.encode() + b'\n' + PS1_CURL.encode()), '127.0.0.1', 1, KEY, EXPIRES)
+        with self.assertRaises(mf.Refused):  # the curl line three times is more elevated re-fetch sites than the loaders carry
+            mf.prepare('ps1', PS1.replace(PS1_CURL.encode(), (PS1_CURL.encode() + b'\n') * 2 + PS1_CURL.encode()), '127.0.0.1', 1, KEY, EXPIRES)
 
     def test_crlf_becomes_lf_and_a_lone_cr_refuses(self):
         crlf = PS1.replace(b'\n', b'\r\n')
@@ -120,6 +120,87 @@ class Rewrite(unittest.TestCase):
             mf.lf(PS1.replace(b'Write-Host', b'Write\rHost'))
         with self.assertRaises(mf.Refused):
             mf.rewrite('ps1', crlf, '127.0.0.1', 1)
+
+
+PINNED = ROOT / 'tests' / 'fixture' / 'pinned'  # mirrorstack-fleet origin/main d7902653 (when pinned) fleet/install/boot/bootstrap.{ps1,sh}, byte for byte
+REFETCH_AT = ' https://127.0.0.1:18443/releases/download/install-{0}/bootstrap.ps1\')'
+
+
+def live_lines(data: bytes):
+    """The lines that are not comments and name a host the builder must keep out of the copies."""
+    return [x for x in data.decode('ascii').split('\n')
+            if not x.lstrip().startswith('#') and any(h in x.lower() for h in mf.HOSTS)]
+
+
+class TwoRefetchSites(unittest.TestCase):
+    """G-PC-16: since AF36 the ps1 loader names the elevated re-fetch twice (the uninstall loader and $RemoveLoader); the builder
+    rewrites every such site, up to REFETCH_MAX, and still refuses everything else."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ps1 = (PINNED / 'bootstrap.ps1').read_bytes()
+        cls.sh = (PINNED / 'bootstrap.sh').read_bytes()
+
+    def test_the_pinned_loader_really_has_two_sites(self):  # else the tests below prove nothing about two
+        self.assertEqual(len(re.findall(mf.REFETCH, self.ps1.decode(), flags=re.M)), 2)
+
+    def test_the_pinned_current_loaders_build_with_both_sites_on_the_fake_host(self):
+        ps1 = mf.prepare('ps1', self.ps1, '127.0.0.1', 18443, KEY, EXPIRES)
+        sh = mf.prepare('sh', self.sh, '127.0.0.1', 18443, KEY, EXPIRES)
+        self.assertEqual(ps1.decode().count(REFETCH_AT), 2)
+        self.assertEqual(sum(a != b for a, b in zip(self.ps1.split(b'\n'), ps1.split(b'\n'))), 6)  # base, python, 2 sites, key, expiry
+        self.assertEqual(sum(a != b for a, b in zip(self.sh.split(b'\n'), sh.split(b'\n'))), 4)
+        self.assertEqual(live_lines(ps1), [])  # nothing live in the copy names github.com, githubusercontent.com or python.org
+        self.assertEqual(live_lines(sh), [mf.DENY['sh']])  # but the excused deny line
+        self.assertNotIn(b'github.com/mirrorstack-ai', ps1)
+        self.assertNotIn(b'python.org/ftp', ps1)
+
+    def test_the_one_site_loader_still_builds_and_each_loader_counts_its_sites(self):  # install-1's loader has one
+        _, sites = mf.rewrite_counted('ps1', PS1, '127.0.0.1', 1)
+        self.assertEqual(sites, 3)
+        self.assertEqual(mf.rewrite_counted('ps1', self.ps1, '127.0.0.1', 1)[1], 4)
+        self.assertEqual(mf.rewrite_counted('sh', self.sh, '127.0.0.1', 1)[1], 2)
+
+    def test_an_extra_live_github_line_refuses_rewrite_on_the_pinned_loaders(self):
+        for name, raw in (('ps1', self.ps1), ('sh', self.sh)):
+            for line in (b'curl https://github.com/x\n', b'curl https://raw.githubusercontent.com/x\n',
+                         b"$u = 'https://www.python.org/x'\n"):
+                with self.subTest(name=name, line=line), self.assertRaises(mf.Refused) as why:
+                    mf.prepare(name, raw + line, '127.0.0.1', 1, KEY, EXPIRES)
+                self.assertEqual(str(why.exception), 'rewrite')
+
+    def test_three_sites_refuse_and_zero_sites_refuse(self):
+        site = next(x for x in self.ps1.split(b'\n') if b'install-{0}/bootstrap.ps1' in x)
+        three = self.ps1 + site + b'\n'
+        with self.assertRaises(mf.Refused) as why:
+            mf.prepare('ps1', three, '127.0.0.1', 1, KEY, EXPIRES)
+        self.assertEqual(str(why.exception), 'rewrite')
+        zero = self.ps1.replace(b'/install-{0}/bootstrap.ps1', b'/install-{0}/boot.ps1')
+        with self.assertRaises(mf.Refused) as why:  # the rewrite itself, before the live-line check would catch the leftover
+            mf.rewrite('ps1', zero, '127.0.0.1', 1)
+        self.assertEqual(str(why.exception), 'rewrite')
+        with self.assertRaises(mf.Refused) as why:
+            mf.rewrite('ps1', three, '127.0.0.1', 1)
+        self.assertEqual(str(why.exception), 'rewrite')
+        with self.assertRaises(mf.Refused):
+            mf.prepare('ps1', zero, '127.0.0.1', 1, KEY, EXPIRES)
+
+    def test_a_site_the_rewrite_skipped_is_caught_by_the_changed_line_count(self):
+        copy = mf.prepare('ps1', self.ps1, '127.0.0.1', 1, KEY, EXPIRES)
+        mf.check_copy('ps1', self.ps1, copy, 6)
+        for wrong in (5, 7):
+            with self.subTest(changed=wrong), self.assertRaises(mf.Refused):
+                mf.check_copy('ps1', self.ps1, copy, wrong)
+
+    @unittest.skipUnless(TOOLS, 'ssh-keygen or openssl is missing')
+    def test_the_whole_fixture_builds_from_the_pinned_loaders(self):  # what the hosted smoke does, with the publisher's own verify
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / 'z.zip').write_bytes(b'PKfake')
+        meta = mf.build(tmp / 'fx', PINNED / 'bootstrap.ps1', PINNED / 'bootstrap.sh', zip_path=tmp / 'z.zip')
+        self.assertTrue(meta['cases'])
+        for p in (tmp / 'fx').rglob('bootstrap.ps1'):
+            self.assertEqual(live_lines(p.read_bytes()), [], str(p))
 
 
 @unittest.skipUnless(TOOLS, 'ssh-keygen or openssl is missing')

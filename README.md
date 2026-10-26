@@ -42,6 +42,40 @@ A wrong pin fails closed (`image-pin-mismatch` / `vfkit-mismatch`): the evidence
 key at build time) and the bytes upstream serves, and a pin that does not match them stops the build. The printed `vfkit` lock entry must get `cdhash` and `entitlements` added from a Mac before the owner signs it, because a Linux runner
 has no `codesign`.
 
+## Pinning a disk release
+
+`bin/fleet-disk.py pin [amd64|arm64] <serial>` is the one way to get the lock entries for a PR, in place of copying them from a
+run's log. It is read-only (every call is a plain GET through `gh api`, nothing is created, changed or deleted), needs no token
+beyond the login `gh` already has (`GH_TOKEN`, `HOME`, `GH_CONFIG_DIR` and `XDG_CONFIG_HOME` are passed on when set; the repository
+is `GITHUB_REPOSITORY` or this one), and runs where the build's tools are (`gh`, `gpgv` with the Ubuntu cloud-image keyring, and
+`zstd` for arm64, at the same paths). It reads the published release of `disk-noble-<serial>` (or `disk-noble-arm64-<serial>`),
+takes the commit the release names (`target_commitish`, which must be a 40-hex sha, the `--target` the build passed), and asks
+`compare/main...<sha>`: only `behind` or `identical` (the commit is on `main`) goes on. It then reads the run record of
+`disk.yml` (`actions/workflows/disk.yml/runs?head_sha=<sha>&event=workflow_dispatch&status=success`) and goes on only if a
+completed, successful `workflow_dispatch` run on branch `main` at exactly that sha exists, the release's author and every asset's
+uploader are `github-actions[bot]` (a person's `gh release create` carries their own login), and the release's publication and every
+asset's upload fall inside that run's `created_at` to `updated_at` (30 seconds of slack; the release's own `created_at` is its commit's
+date, so it is not compared). It then prints the same entries, in the
+same form, as the build: the signed upstream sum is re-read through the build's own `gpgv` check, the asset digests and sizes
+come from a second read of the release that must equal the first, and for arm64 the asset's bytes are downloaded and must hash
+to GitHub's digest, are expanded with `zstd`, and the expanded disk's sha256 and size are measured here (vfkit's upstream bytes are
+re-checked too). Nothing is printed that was not read in that run. The words it refuses with, on stderr, with no stdout and exit 1:
+
+- `pin-not-main`: the compare says `ahead` or `diverged`, or any answer that is not `behind` or `identical`; or there is no such
+  run (a dispatch of a branch, a push, a failed or other-commit run, or one whose window does not hold the release), or the
+  release or an asset was made by someone other than the bot.
+- `pin-unread`: any read fails (a nonzero exit, a timeout, not JSON, a tool missing), the release is not exactly one published
+  release with the expected assets and a `sha256:` digest and size each, `target_commitish` is not a 40-hex sha (a branch name
+  is never compared), the compare answer has no `status`, the run list is not a list, or the release has no author, publication
+  time, or an asset with an uploader and creation time.
+- `pin-mismatch`: two reads of the release disagree, an asset's bytes are not the digest GitHub lists, or the signed arm64 image is
+  not `ARM64_IMAGE_SHA256`.
+
+What it proves is that the release names a commit that is on `main`, that a successful `disk.yml` dispatch on `main` ran at that
+commit, and that the bot published the release and uploaded its assets while that run was going. It cannot tell the run's own
+release from one that another job of the same bot made at that commit in that window (and a person with a token for the bot is
+beyond it), so the owner's signature over the lock and the ruleset on `refs/tags/disk-*` remain the other two walls.
+
 ## How an install set is released and verified
 
 The release inputs are committed in the fleet repository under `release/install-<serial>/` and reach this repo only through
@@ -53,7 +87,7 @@ refused as unlisted.
 
 Actions, then `install`, then Run workflow on the `release` branch (the only ref the jobs accept) with `serial` and
 `min_serial` (the lowest serial this publish may carry, normally the previous release's); `mode` pubkey only prints the
-signing key's public line and fingerprint, and `mode` floor runs only the floor job (below). Five jobs run in order:
+signing key's public line and fingerprint, `mode` floor runs only the floor job, `mode` untag only the three untag jobs and `mode` pins only the four pins jobs (all below). Seven jobs run in order:
 
 - **plan** (Environment `release`, read-only deploy key `FLEET_READ` on the fleet repository, held in `/dev/shm` and wiped
   by a trap on every path) reads the folder from the fleet `release` tip as git blobs, never a checkout. It refuses unless the folder is exactly the files above as plain files, the
@@ -64,6 +98,16 @@ signing key's public line and fingerprint, and `mode` floor runs only the floor 
   and a `diff --stat` of `.github`, `bin` and `vendor` since the last `install-*` tag (hashes and public files only: these
   logs are public). When the previous release's `source_head` cannot be read or its range cannot be listed the summary says
   `UNKNOWN` and lists the newest 200 fleet commits, never an empty list. The three files to sign leave as base64 outputs with their sha256, the folder as an artifact.
+- **fixture** (no Environment, no secret, `permissions: {}`, `ubuntu-24.04`) downloads the artifact `loaders` and runs
+  `tests/fixture/make_fixture.py` once, on ubuntu, as the fixture job of `boot-smoke.yml` does, then uploads the tree as the
+  artifact `fixture`. The plan's `loaders` step reads `bootstrap.sh` and `bootstrap.ps1` from the tip with `git show` (the LF
+  blobs; the checked-out ps1 is CRLF) and uploads only those two as the artifact `loaders` (they become public release assets
+  anyway; ledger D317). A missing or empty loader fails the plan. Building the fixture on every leg was refused on `macos-15`
+  (`REFUSED tool`) and on both Windows legs (`REFUSED verify`), run 38633686710, so no leg builds it.
+- **smoke** (needs plan and fixture; no Environment, no secret, `permissions: {}`, hosted runners) downloads the artifact `fixture` and
+  runs the boot smoke (below) over the release tip's two loaders on `windows-2022`, `windows-2025`, `ubuntu-24.04`, `ubuntu-22.04`
+  and `macos-15`, before anything is signed: `sign` and every job after it need it, so a red smoke (or a failed fixture, which skips
+  it) stops the release.
 - **sign** (Environment `release`, secret `SIGN_KEY`) runs no repository code and no third-party action. It keeps the key in
   `/dev/shm`, refuses unless `ssh-keygen -lf` of it equals the constant `KEY_SHA256` in `install.yml` (so it refuses while
   that is a placeholder), re-hashes the bytes against the plan's sha256, signs `install.json` (namespace
@@ -71,10 +115,17 @@ signing key's public line and fingerprint, and `mode` floor runs only the floor 
 - **kit** (Environment `release`, secrets `FLEET_READ` and `KIT_UPLOAD_KEY` and nothing else) runs `bin/fleet-kit-upload.py`
   three times: `gateway --check` judges the gateway pair at the fleet `release` tip before anything is stored (no upload, so a
   bad pair leaves no bundle behind on the write-once host), `bundle` rebuilds the tar from the fleet commit `install.json`
-  names and uploads it, `gateway` reads the gateway record and its signature from the tip again, checks the owner's signature
-  and uploads the pair, or, while no gateway is live (the placeholder record: serial 0, address null, and no `.sig` beside it),
+  names and uploads it, `gateway` reads the gateway record from the tip again, takes the signature from `--sig` (the one the job
+  `gwsign` made, in both series; the tip's own `gateway.json.sig` is never read, CV05d), checks the owner's signature
+  and uploads the pair, or, while no gateway is live (the placeholder record: serial 0, address null, and no `--sig`),
   prints `SKIP gateway not-live` and uploads nothing (ledger D309), so a first test release can be published before a gateway
-  exists. Any other state without a good signed pair is still `REFUSED gateway` or `REFUSED sig`. The install.json it works
+  exists. Any other state without a good signed pair is still `REFUSED gateway` or `REFUSED sig` (a live record with no `--sig`
+  is `REFUSED sig`). Before anything is signed the `plan` job's step `gateway` runs the pins planner (`bin/fleet-pins-plan.py plan
+  --only fleet/core/gateway.json`: exact key set, and a serial above every earlier signed body's) over the tip's record and hands
+  its sha256 and a live/not-live word (read off the parsed record, never a grep over its bytes) to `gwsign`, which
+  signs only those bytes (ledger G-CV05-M10). The planner's serial rule reads the previous signed body from the history of the tip's
+  `gateway.json.sig`, which nothing commits until CV05e: until then only the shape check, the size and the live/serial gate bite, and a
+  lower serial is not refused. The install.json it works
   from is the plan's output re-hashed against the plan's sha256, with the sign job's signature, so nothing here is downloaded.
   The job uploads no artifact, uses no cache and writes no step summary; the log shows a size and a sha256 only. The gateway pair
   is never in the plan's folder, which becomes a public artifact and public release assets.
@@ -174,7 +225,7 @@ stderr (`first refusal <word>`).
 | `draft-left` | a draft of an install tag exists (a run's upload was killed before it was public) | a repo writer runs `gh release delete install-<n> --yes` (the tag stays), then re-runs |
 | `release-left` | a release of the tag exists and the publisher could not read, judge or remove it | read the release page; if it is immutable and right, the serial is used: take the next one; a draft or mutable one: `gh release delete install-<n> --yes`, then re-run |
 | `tag-exists` | a published release of the tag exists | read the release page; if it is immutable and right, the serial is used |
-| `tag-moved` | the tag is on another commit, or not a lightweight commit tag, and has no release | the deploy key deletes the tag by hand (no workflow mode removes a release-less tag until AF42) |
+| `tag-moved` | the tag is on another commit, or not a lightweight commit tag, and has no release | a tag on another commit: `mode` untag with this `serial` removes it (see **Untag**); an annotated or other tag object, which untag refuses, the deploy key deletes by hand |
 | `not-newer` | a release of this or a higher serial exists | dispatch the next serial |
 | `pin-mismatch` | the pin's serial is below the newest release's, or that pin cannot be read | fix the pin or the serial in the release folder |
 | `immutable-off`, `immutable-unreadable` | the Immutable releases setting is off, or the token cannot read it and `IMMUTABLE_RELEASES_CONFIRMED` is not `yes` | turn it on, or record the confirmation |
@@ -219,6 +270,20 @@ then a dispatch on `release` runs unattended, and the `release` Environment itse
 would otherwise each wait for one). A floor run shares no concurrency group with the release runs, so it never waits behind one;
 the dashboard variable `KIT_FLOOR` stays the fastest break-glass.
 
+**Untag.** `mode` untag with `serial` set to N removes the tag `install-N` of a run that stopped after the tag job and before the release was made (a
+failed publish leaves such a tag; the serial is otherwise usually lost, only a re-run of all jobs with unchanged bundle bytes recovers it), and only a tag that has no release. It is three jobs, in the same concurrency group as a release run. `untag-check` has no
+Environment and no secret, only the job token with `contents: read`: it runs the read-only verb `untag-check --serial N` of the publisher, which refuses
+`tag-missing` (no such tag), `tag-moved` (the tag is not a lightweight commit tag), `tag-exists` or `draft-left` (any release of the tag, published or draft,
+exists: it has a release, so it is not removed; a read-only token may not see a draft, so `draft-left` is only certain once a writer has checked the
+releases page) and otherwise prints `tag install-N sha <sha>, no release` and hands the commit id on. `untag-approve` waits in the Environment `kit-floor`
+(the owner is its required reviewer, it holds no secret and no token) and prints `approved: delete tag install-N at <sha>`. `untag` needs both, runs in the
+Environment `release`, reads only `TAG_KEY` (the deploy key that makes the tag, the one bypass of the `install-*` tag ruleset) and runs no repository code and
+holds no token: it deletes with `git push --force-with-lease=refs/tags/install-N:<sha>` of the empty source, so only a tag still on the checked commit goes (a tag that
+moved after the check is left). The release check is made once, in `untag-check`: `untag` does not read the releases again after the approval wait, so a release
+made by hand between the check and the approval is not seen (the `install` concurrency group stops another install run, not a repository writer). Turn the `kit-floor` required reviewer on first (One-time repo settings): without it nothing stops an untag run. Not yet
+measured (the first dispatch shows both): that the ruleset's bypass covers a deletion, and that GitHub refuses to delete a tag an immutable release holds (the
+check already refuses such a tag); the first real dispatch should also confirm that GitHub refuses the tag delete when a release holds the tag.
+
 `.gitattributes` marks the vendored files `-text` so no checkout rewrites their line endings.
 A change to the verifier ships as the same two files in both repositories, in the same step: the fleet
 repository's `bin/fleet-install.py vendor-sync <this checkout>` says `OK vendor-sync` when the copy and both pins agree.
@@ -242,18 +307,17 @@ never inherit it. `OWNER_PIN_SHA256` is required for both verbs (`REFUSED key` w
   (`{"sha256", "size"}`, as R2 holds them) to equal what it sent. An identical re-run is a 200; different bytes for the same serial
   are a 409 `conflict`. The other 409s keep their own word (`REFUSED replay`, `rollback`, `revoked`), and another known error
   word of the host follows the status (`REFUSED upload 401 stale`).
-- `fleet-kit-upload.py gateway [--check] --owner-pub P` reads `fleet/core/gateway.json` and `.sig` from the tip of the fleet `release`
-  branch, checks the owner's signature under namespace `mirrorstack-fleet-pin` and that the record has the gateway record's keys
+- `fleet-kit-upload.py gateway [--check] --owner-pub P [--sig FILE]` reads `fleet/core/gateway.json` from the tip of the fleet `release`
+  branch and the signature from FILE (gwsign's; the tip's `gateway.json.sig` is never read, CV05d), checks the owner's signature under namespace `mirrorstack-fleet-pin` and that the record has the gateway record's keys
   (`serial`, `address`, `cert_sha256`, `manifest_key`, `session_key`: the other files signed under the same namespace do not),
   and `PUT /_k/gateway/<serial>` (one to nine digits) with both files in one request, so the host flips to the pair whole or
   not at all. The answer must carry `gserial` and the `{sha256, size}` of both files. These two files never enter the release folder.
   Not live is the one state that is not a refusal: `gateway.json` is a regular file (mode 100644) that is exactly the placeholder
   the fleet repository holds (`serial` the integer 0 written as a plain `0`, `address`, `cert_sha256`, `manifest_key`,
-  `session_key` and `next` null, `r9_closed` false, no other key), and the tip has no `gateway.json.sig` at all. Then the verb
+  `session_key` and `next` null, `r9_closed` false, no other key), and no `--sig` is given. Then the verb
   prints `SKIP gateway not-live`, makes no request and exits 0. A half-edited record (any field filled in) is not the placeholder.
-  A signature beside a placeholder, a serial 0 with an address, an unsigned record with a null address and a serial of 1 or more,
-  a live-looking record without a signature, and every malformed record stay `REFUSED gateway` (or `REFUSED sig` for a bad
-  signature). A signed record with a null address and a serial of 1 or more is judged live, as before: the address is not read.
+  A `--sig` beside a placeholder, a serial 0 with an address, and every malformed record stay `REFUSED gateway`; a live-looking
+  record with no `--sig`, however the tip's own `.sig` looks, is `REFUSED sig` (as is a bad signature). A signed record with a null address and a serial of 1 or more is judged live, as before: the address is not read.
   `--check` is the same read and the same verdict with no upload and no upload key: `OK gateway-check serial=N`, the SKIP line, or
   the refusal. The kit job runs it first, so a refusal comes before the bundle is stored.
 - This repository is public, so nothing a build holds is printed: git's stderr and the build's output go to a file in
@@ -270,6 +334,61 @@ repositories, in the same step; nothing on the fleet side checks `vendor/bundle.
 comments still carry the fleet's internal plan ids: they go upstream first and the file is re-vendored (comments only, so the
 tar bytes do not change) before this repository is merged, or the owner accepts them. `tests/test_kit_upload.py` freezes the packer's output against a golden sha256 on every Python
 the tests run on.
+
+## The control VM's pins plan (CV05b, D342)
+
+`bin/fleet-pins-plan.py plan --repo DIR --pub FILE [--release origin/release] [--main origin/main] [--tip SHA] [--run-id ID]`
+judges the five root pin files (`fleet/hosts.json`, `fleet/core/{gateway,work-pin,deploy-pin,proven}.json`) at the fleet `release` tip
+before CI signs them under namespace `mirrorstack-fleet-ctl`. It reads the fleet tree with git only (never imports fleet code).
+stdout is the manifest, one `key value` line each: `tip <sha>`, `run <id>`, then per file `path sha256 serial action`, the keys the
+land tool reads (`action` is `keep` when the tip's `.sig` verifies for the exact bytes, else `sign`). Review lines go to stderr
+behind `# `: per signed file its sha256, old and new serial and the names of the keys that changed, and per new or changed host its
+two key fingerprints; never a value, since this repository is public. A refusal prints `REFUSED <word> <path>` on stderr and exits
+1 with no manifest: `shape` (also a hosts line `vendor/pin-summary.py` refuses), `size` (over 1 MiB), `serial` (not above every earlier
+signed body's, read unverified at each commit that added or changed the `.sig`, unless the bytes are the previous body's; a `keep`
+whose serial is below any of them is refused too), `head` (a deploy
+head outside main's first 300 first parents, not an ancestor of the release tip, not a descendant of the last signed non-null head, or
+whose `fleet/slot/model.py` has no module-level `SIG_NS` literal mapping `ctl` to the ctl namespace), `tree`, `blob` (a work-pin blob that is not the release tree's
+`.github/workflows/work.yml`), `tip-moved`, `unread`, `vendor`, `pub`, `fetch`. `fleet-pins-plan.py clone URL DIR` takes a
+`--filter=blob:none` clone and falls back to a full clone when that fails (not measured here: it needs the FLEET_READ key); a DIR that already holds files is
+refused (`fetch`) and never touched.
+`vendor/pin-summary.py` is the fleet's `bin/pin-summary.py` byte for byte at fleet main 754265e0, pinned by
+`vendor/pin-summary.sha256`; `tests/test_pins_plan.py` holds the fleet's own digest as a literal (so a change to the vendored copy needs a visible edit there)
+and compares its tables with the fleet's copy when `FLEET_REPO` names a clone.
+
+## The control VM's pin files: mode pins (CV05c, D342)
+
+`mode` pins signs the five files the control VM's root reads from the fleet's `main` (`fleet/hosts.json` and
+`fleet/core/{gateway,work-pin,deploy-pin,proven}.json`), taken from the fleet `release` tip, with the key `KEY_SHA256` names, under the
+namespace `mirrorstack-fleet-ctl`. It needs no `serial` and no other job runs in it (a test reads `if:` and `needs:` of every job and fails
+if one could). A carrier's `deploy-pin.json` is public and signed under `mirrorstack-fleet-pin`; with one namespace for both, a copy of
+that pair would pass as root's own pin, so root verifies `ctl` (CV05e) and the carrier files stay on `pin`. Run it on the `release` branch,
+after the fleet's main to release merge and before the land PR (fleet repository, CV05f):
+
+- **pins-plan** (Environment `release`, `FLEET_READ` only; the signing key is not in this job): clones the fleet repository, runs
+  `bin/fleet-pins-plan.py` (the plan above) over the `release` tip, prints the tip, and hands on the tip, the deploy head, the series and
+  the five lines `path sha256 serial action`. `KEY_PUB`, the public line of the signing key, is a constant of the workflow beside
+  `KEY_SHA256`: the plan refuses `key-pub` unless its fingerprint is `KEY_SHA256` (it only judges the signatures already at the tip, so
+  a change of key changes both in one reviewed edit).
+- **pins-approve** (Environment `kit-floor`, no secret): runs only when `SERIES` is `release` (read from the plan, so the test series has no owner step),
+  prints the tip, each file's serial, sha256 and action and the deploy head, and waits for the owner. `pins-sign` needs it in the release series
+  (attack M4: the main to release PR of some 400 commits shows no per-pin diff). While `kit-floor` has no required reviewer nothing stops
+  it: do not rely on it.
+- **pins-sign** (Environment `release`; two steps like `gwsign`; no checkout, no action, no repository code, no job token): `fetch` (`FLEET_READ`
+  only) refuses `tip-moved` unless the `release` tip is still the planned one, reads each `sign` file as a git blob of that tip (a regular file
+  of 1 to 1 MiB) and refuses on a sha256 that differs from the plan's; for `deploy-pin.json` it also refuses unless the head is `null` or an
+  ancestor of the tip (attack M2, a second look at what the plan judged). `sign` (`SIGN_KEY` only, no git, ssh or network child) refuses
+  `key` unless the key's fingerprint is `KEY_SHA256`, allows the namespace `mirrorstack-fleet-ctl` and no other, signs each file, verifies and
+  re-hashes it, and outputs the signatures (base64) and `pub=`. Every output is written after the last file is signed: a refusal hands on nothing.
+- **pins-publish** (no secret, `contents: read`): writes `pins-sigs.json` and uploads it as the artifact `pins-sigs`, kept one day:
+  `{tip, run, fingerprint, pub, entries[{path, sha256, serial, sig_b64}]}`, one entry per file this run signed (a `keep` file has none; its signature is
+  at the tip already). The run id is there for the land PR's body (attack minor 3).
+
+Nothing printed is a value (this repository is public): paths, serials, sha256 sums, the tip and a head. The signatures reach root through
+the fleet's `main` only: its ruleset lets CI write nothing, and a write credential into the fleet would be worth more than this key, so an admin
+session downloads `pins-sigs` and lands the `.sig` files in a PR (CV05f), which writes only `.sig` files and never a body. The proof of a first
+run is the line `signed with key SHA256:16jB0ih9afmAW7rFmgTJVtarDgEv4w/DHA8LKufWhKM` in `pins-sign` and an artifact that
+`ssh-keygen -Y verify -n mirrorstack-fleet-ctl` accepts over the file at the tip.
 
 ## Trust model
 
@@ -292,8 +411,9 @@ ref's workflow file). The real boundary is set in the repo, not in code:
   (restricted to `main`), so nothing about `release` gates or reaches it. `disk` holds no secret or variable, so it is not a
   boundary: it only restricts the dispatch to `main`, and the job's write power is the workflow file's `contents: write`.
   No ruleset covers the `disk-*` tags yet, so anyone with push access can take a `disk-noble-<serial>` name. The ruleset
-  (creation, update, deletion, with a deploy key stored in `disk` as its only bypass) is the owner's step; until then the
-  entries to pin come only from the log of a run on `main`. A read-only probe, run by hand with an admin token, prints
+  (creation, update, deletion, with a deploy key stored in `disk` as its only bypass) is the owner's step; until then
+  use `pin`, not the log: `bin/fleet-disk.py pin [amd64|arm64] <serial>` (see "Pinning a disk release") prints the entries only for
+  a release whose commit is on `main`. A read-only probe, run by hand with an admin token, prints
   FAIL until both exist:
 
   ```sh
@@ -306,7 +426,7 @@ ref's workflow file). The real boundary is set in the repo, not in code:
   ```
 - Create the Environment `kit-floor`, restricted to the `release` branch, with the owner (or the team `security`) as required
   reviewer and admins unable to bypass, and no secret. It is the only gate on a floor run (`floor-approve`); `release` has no
-  reviewer, so a release run is unattended during the test phase.
+  reviewer, so a release run is unattended during the test phase. In the release series `pins-approve` waits here too (mode pins, below).
 - Rulesets: `release` takes pull requests from `main` only; the tags `install-*` only the `TAG_KEY` deploy key may create.
 - A ruleset on `main` that requires pull requests.
 - Settings, Releases, **Immutable releases** on.
@@ -360,6 +480,13 @@ changed; hosted runners are VMs, so this proves the pipeline, not hardware. `pyt
 --boot-dir release/install-<serial>` builds the tree by hand (it needs `ssh-keygen`, `openssl` and, on the Windows side,
 network access to python.org for the ZIP, or `--python-zip PATH`).
 
+The gate that matters is the `smoke` job of `install.yml` (above): the release folder is committed only in the fleet repository,
+so the plan fetches the loaders from the fleet `release` tip, the `fixture` job builds one fixture from them on ubuntu with
+`make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh`, and every runner downloads it and runs the same steps and rows as this
+workflow, minus the experimental `keychain` and `ubuntu-26.04` rows (the latter is a hosted image that moves weekly, so it only reports here). `boot-smoke.yml` stays as a dispatch and as a PR-path trigger (`release/install-*/bootstrap.*`, which now rarely fires, and edits of the builder and the
+driver); a dispatch that finds no complete pair fails. The smoke ends the good run in `kvm` on a hosted runner (no `/dev/kvm`),
+and never runs the install itself.
+
 The cases also cover each size cap (the signature, `install.json` with and without a `Content-Length`, `kit.json`, a kit file, the
 ZIP), a wrong `kind`, a missing field, a six-file kit, and bad command lines (below the floor, a repeated or missing flag, an
 abbreviated flag). Every runner but `ubuntu-22.04` (which refuses `os` by design) is run with `--must-run`, so a machine
@@ -370,3 +497,49 @@ Fork pull requests run this workflow's code (from the PR) on hosted runners, inc
 Windows and macOS ones. It holds no secret and a read-only token, so the worst a hostile fork can do is spend runner minutes.
 Keep that true in the repository settings: Actions > General > Fork pull request workflows, set "Require approval for all
 outside collaborators", and leave "Send write tokens to workflows from pull requests" off.
+
+## Real smoke (a published release)
+
+`.github/workflows/smoke-real.yml` (`workflow_dispatch` only, from `main` only, input `serial` digits only, `contents: read`, no
+secret, no Environment) runs the REAL one-liner of a published release `install-<serial>` on the same five runners:
+`smoke_driver.py real --serial N` reads the release's notes with `gh release view`, takes the OS's check line (the fence under
+`<os> (bootstrap sha256 <hex>):`, the text `release_notes` writes), and runs it with no invite on a throwaway `HOME`/`TEMP`,
+stripped of the runner's token. The check must end as a fixture case does (the same `expect`: the machine's own refusal,
+`kvm` on a Linux runner without `/dev/kvm`, else exit 0 with the code line), make no file outside the throwaway home (the real
+home and temp folder are listed before and after, and so are the places an install would write) and leave nothing in the
+throwaway temp folder.
+
+Two values it holds the release against come from `main`, never from the release under test: the owner key's fingerprint is
+the `KEY_SHA256` constant of `install.yml`, and the bootstrap digests are `.github/smoke-real-pins.json`
+(`{"<serial>": {"ps1": <sha256>, "sh": <sha256>}}`). The release's notes, its downloaded asset and the line must all carry
+main's digest (`digest-mismatch` otherwise, even when the notes and the asset agree with each other) and the notes must name
+main's key (`key-mismatch`); the run's own `bootstrap sha256` and `key` lines must be main's too. A serial with no pin stops
+at `no-main-pin` before anything is read: add the pin (from the signed `install.json` of the fleet release folder) by a reviewed
+change first.
+Checking a release therefore takes a second, reviewed step per serial: a pin PR that copies the bootstrap sha256 from the signed
+`install.json` into `smoke-real-pins.json` (the plan said to stop and report when no main-side digest source exists; this file is
+that source, so the plan's rule is waived for it only if the coordinator agrees), then one dispatch from `main`. The line the
+release's notes carry must also equal, byte for byte, what `main`'s `bin/fleet-install-publish.py` `check_line` renders for that
+serial, OS, repository, digest and min serial, so a line with anything added is never run. A dispatch from any other branch fails
+in the `guard` job (red), it never skips green. The leg costs hosted-runner minutes on every dispatch (the macOS leg at the macOS multiplier), so dispatch it
+once per published release.
+
+## Descriptor probe (fd-probe)
+
+`.github/workflows/fd-probe.yml` (pull request on its own four files, `workflow_dispatch`, a weekly `schedule`; `contents: read`, only
+the scheduled `report` job holds `issues: write` and opens one issue) runs `tests/fixture/fd_probe.py` on `ubuntu-24.04`,
+`ubuntu-24.04-arm` (the controls) and `ubuntu-26.04`, `ubuntu-26.04-arm`. It starts `/usr/bin/python3 -I -S`, runs `import ctypes`
+and prints every descriptor beyond 0-2 (its `readlink`, `fstat` type, mode, uid, device and inode, `F_GETFL`, `F_GETFD`, the
+`/proc/self/maps` lines with the same path and whether their device and inode agree with `fstat`, the filesystem type of its
+directory), plus `dpkg-query -W libffi8`, `sys.version`, the interpreter's real path and `dpkg -S` of it and of `/usr/bin/python3`. The child also
+opens `/dev/null` after the import and must find it in its own listing (a positive control that the enumeration reads descriptors at
+all), and a descriptor it could not read fails the leg instead of vanishing from the count. The verdict is the shape the key
+holder's rule needs: no extra descriptor on 24.04; on 26.04 exactly one, a root-owned regular file without setuid, setgid, sticky,
+group or other write, `O_RDONLY`, directly in `/usr/lib/<this leg's architecture>-linux-gnu/` as `libffi.so.N...`, with a maps line
+for the same path. `F_GETFD` and the device/inode agreement are printed, not judged. Anything else fails, as does an
+`/usr/bin/python3` no dpkg package owns or a label that moved to another release. `tests/fixture/fd_golden.json` holds the
+vectors, meant to be byte for byte the copy the fleet repository's key holder slice (PZ01) carries once it exists (a row is
+`name`, `type`, `uid`, `mode` as octal text, `flags`, `target`, `maps_has_path`, `expect`, and `maps_over_cap` on one row; its sha256 is
+the constant in the test); `tests/test_fd_probe.py` runs the verdict over every row of it and checks that sha256. Caveats: the hosted kernel is Azure's and its root filesystem may differ from a production host's, so
+the probe prints `stat -f` of the library directory; and the image ships GNU sudo and coreutils, so nothing here speaks for
+sudo-rs or uutils. It measures the descriptor; it does not run the private key holder.

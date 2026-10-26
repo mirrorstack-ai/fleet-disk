@@ -1,0 +1,2 @@
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @sandbox

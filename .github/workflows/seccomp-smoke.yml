@@ -1,0 +1,95 @@
+# Starts QEMU under the L1 unit's SystemCallFilter on a hosted ubuntu-24.04 runner (systemd 255, the release the loader admits),
+# with a positive control that must die by SIGSYS and be attributed by a kernel record seen during that leg (PW04,
+# G-AUD-LINUX-RUN-4 / G-AUD-LINUX-INSTALL-4). The legs, the rules and the twin files are described in tests/fixture/seccomp_smoke.py
+# (its `-sandbox off` twins are informational: QEMU 8.2.2 calls seccomp(2) there too, run 39247567865). The filter text is
+# tests/fixture/l1_unit_filter.txt (the twin of the unit in the fleet repository, each repo pins its own copy). Nothing here is
+# secret, signed or published: the only token is the run's own, and only the `report` job (weekly runs) holds a write scope, issues alone.
+# `-machine none -S` makes none of the calls a guest does: this speaks for QEMU's start-up call only. Every run prints the
+# systemd-analyze dump of @system-service and @sandbox (colors off, ANSI stripped) and fails DUMP-DIFFERS against the committed
+# fixture of its release (24.04 pinned from run 39247567865), so an image bump that moves the tables is seen the day it happens.
+# Also, from PZ03c, on a hosted ubuntu-26.04 runner too (systemd 259): its dump is what a move in the 259 tables looks like before the
+# PC, and G-PC-19's input (QEMU's sandbox on a carrier host). The 26.04 leg is `continue-on-error` for its first week (until
+# 2026-10-29: a QEMU reason may fail it, legs B, C, A) and still prints and uploads the dump; it fails DUMP-UNPINNED until the dump
+# it printed is committed as tests/fixture/ubuntu2604-filter-dump.txt. The dump says whether the sets @system-service expands to
+# moved; it is NOT the exposure of our units (that is the per-directive table, Z-S03). Drop `experimental` after the first week.
+name: seccomp-smoke
+on:
+  pull_request:
+    paths:
+      - .github/workflows/seccomp-smoke.yml
+      - tests/fixture/seccomp_smoke.py
+      - tests/fixture/l1_unit_filter.txt
+      - tests/fixture/ubuntu2404-filter-dump.txt
+      - tests/fixture/ubuntu2604-filter-dump.txt
+      - tests/test_seccomp_smoke.py
+  workflow_dispatch:
+  schedule:
+    - cron: '23 5 * * 1'
+permissions:
+  contents: read
+concurrency:
+  group: seccomp-smoke-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+jobs:
+  smoke:
+    name: smoke (${{ matrix.release }})
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            release: '24.04'
+            experimental: false
+          - runner: ubuntu-26.04
+            release: '26.04'
+            experimental: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
+        with:
+          persist-credentials: false
+      - if: matrix.release == '24.04'   # the control leg is exactly as before; the 26.04 image ships its own python3 and the driver is stdlib only
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+      - name: Install QEMU from the Ubuntu archive
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends qemu-system-x86
+      - name: Smoke
+        env:
+          RELEASE: ${{ matrix.release }}
+        run: python3 -I -B tests/fixture/seccomp_smoke.py --release "$RELEASE" --dump-out "seccomp-dump/ubuntu${RELEASE//./}-filter-dump.txt"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: seccomp-dump-${{ matrix.release }}
+          path: seccomp-dump
+          retention-days: 14
+          if-no-files-found: ignore
+  report:
+    needs: smoke
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open one issue naming the run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title='seccomp-smoke: the weekly run failed'
+          body="The weekly seccomp-smoke run failed: $RUN_URL
+
+          Read the log for the leg that ended red (B, C, A), for INSTRUMENT-BLIND and for DUMP-DIFFERS. A moved dump or a failed leg means the runner image changed under the L1 unit's SystemCallFilter; see tests/fixture/seccomp_smoke.py."
+          open=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "Failed again: $RUN_URL"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

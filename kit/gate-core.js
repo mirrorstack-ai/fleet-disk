@@ -4,7 +4,7 @@
 // Node over node:sqlite (see fake-storage.js). It only needs the part of the
 // Durable Object storage API that both provide:
 //
-//   storage.sql.exec(query, ...bindings) -> cursor with toArray(), rowsWritten
+//   storage.sql.exec(query, ...bindings) -> cursor with toArray(), rowsWritten, rowsRead
 //   storage.transactionSync(fn)          -> runs fn (sync) as one transaction
 //   storage.sync()                       -> Promise, resolves once writes are durable
 //
@@ -74,8 +74,40 @@ export class GateCore {
     this.#migrate();
   }
 
+  // The rows-read counter (G-AUD-KIT-WORKER-1b): the sum of every statement's
+  // cursor.rowsRead over the decision path (decide, release, reject), read only
+  // by the admin `health` answer. It lives in this object's memory and is NEVER
+  // stored: a decision writes no extra row for it (a reject flood is the very
+  // path it measures, and the Free plan meters rows written too), so an evicted
+  // Gate starts again at 0 (the replay prints `rows_read=reset` when it sees
+  // the number fall). Admin calls and the migration are outside it, so the
+  // replay's own reads of the number never move it.
+  #rowsRead = 0;
+  #measuring = false;
+
+  // Like rowsWritten, rowsRead is "so far" until the cursor is consumed, so it is
+  // read after toArray(). A cursor that reports none (or garbage) adds 0.
+  #count(cursor) {
+    if (!this.#measuring) return;
+    const n = cursor.rowsRead;
+    if (Number.isSafeInteger(n) && n > 0) this.#rowsRead += n;
+  }
+
+  // One transaction of the decision path, counted.
+  #measured(fn) {
+    this.#measuring = true;
+    try {
+      this.storage.transactionSync(fn);
+    } finally {
+      this.#measuring = false;
+    }
+  }
+
   #rows(query, ...bindings) {
-    return this.sql.exec(query, ...bindings).toArray();
+    const cursor = this.sql.exec(query, ...bindings);
+    const rows = cursor.toArray();
+    this.#count(cursor);
+    return rows;
   }
 
   // rowsWritten is "so far" until the cursor is consumed (Cloudflare docs), so
@@ -83,6 +115,7 @@ export class GateCore {
   #run(query, ...bindings) {
     const cursor = this.sql.exec(query, ...bindings);
     cursor.toArray();
+    this.#count(cursor);
     return cursor.rowsWritten;
   }
 
@@ -193,7 +226,7 @@ export class GateCore {
     if (!NAMES.includes(name)) throw new TypeError('gate: bad name');
     const now = this.now();
     let out;
-    this.storage.transactionSync(() => {
+    this.#measured(() => {
       out = this.#decideSync(src, tag, serial, name, now);
     });
     if (out.status === 200 && out.rid !== null) await this.storage.sync();
@@ -259,7 +292,7 @@ export class GateCore {
   async release({ rid }) {
     if (!isInt(rid, 1, Number.MAX_SAFE_INTEGER)) throw new TypeError('gate: bad rid');
     let released = false;
-    this.storage.transactionSync(() => {
+    this.#measured(() => {
       released = this.#releaseSync(rid, true);
     });
     if (released) await this.storage.sync();
@@ -276,7 +309,7 @@ export class GateCore {
     if (typeof src !== 'string' || !SRC.test(src)) throw new TypeError('gate: bad src');
     if (rid !== null && !isInt(rid, 1, Number.MAX_SAFE_INTEGER)) throw new TypeError('gate: bad rid');
     const now = this.now();
-    this.storage.transactionSync(() => {
+    this.#measured(() => {
       if (rid !== null) this.#releaseSync(rid, false);
       this.#recordFailure(src, now);
     });
@@ -434,6 +467,7 @@ export class GateCore {
       openInvites: this.#rows('SELECT COUNT(*) AS n FROM invites WHERE revoked = 0 AND exp > ?', now)[0].n,
       bundles: this.#rows('SELECT COUNT(*) AS n FROM files')[0].n,
       failuresLastHour: this.#rows('SELECT COALESCE(SUM(n), 0) AS n FROM allfails WHERE bucket >= ?', min)[0].n,
+      rowsRead: this.#rowsRead, // a count, since this Gate woke (see #rowsRead)
     };
   }
 }

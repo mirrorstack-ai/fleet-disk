@@ -47,6 +47,17 @@ test('Gate end to end over the fake storage, KIT_FLOOR read from env at each cal
   assert.deepEqual(await g.reject({ src: SRC, rid: b.rid }), { status: 404 });
 });
 
+test('the Gate class reports rowsRead through admin health: decisions count, the call itself does not', async () => {
+  const g = new Gate(ctxOf(fakeStorage()), {});
+  const t = Date.now();
+  const health = async (ts) => (await g.admin('gateway', ts, 'health', {})).rowsRead;
+  assert.equal(await health(t), 0);
+  assert.deepEqual(await g.decide({ src: SRC, tag: TAG, serial: 5, name: 'bundle.tar' }), { status: 404 });
+  const n = await health(t + 1);
+  assert.ok(Number.isInteger(n) && n > 0);
+  assert.equal(await health(t + 2), n);
+});
+
 test('no console.* anywhere in the shipped kit source (the deploy gate greps for it)', () => {
   const files = readdirSync(new URL('.', import.meta.url)).filter((f) => f.endsWith('.js') && !f.includes('test'));
   assert.ok(files.includes('gate.js') && files.includes('gate-core.js'));
