@@ -25,9 +25,10 @@
 #            namespace `pin`, and nothing but this job signs gateway.json under it, so a live pair signed by anybody else ends `REFUSED sig` there.
 #            Two steps, no checkout, no action, no python, no output but the signature: `fetch` (FLEET_READ only) reads the record from the
 #            release tip, refuses `tip-moved` unless it is the tip the plan judged, and keeps the bytes in a file of this job's runner; the
-#            placeholder is not live (`SKIP gwsign not-live`, nothing is signed, the kit job keeps `SKIP gateway not-live`); a missing record, one
-#            that is not a regular file or one over 65536 bytes is `REFUSED gateway`; a body whose sha256 is not the plan's `gateway_sha` is
-#            `REFUSED gateway unchecked`. `sign` (SIGN_KEY only, no git, ssh or network child) signs that
+#            placeholder is not live (the plan said `gateway_live=no`: `SKIP gwsign not-live`, nothing is signed, the kit job keeps `SKIP gateway
+#            not-live`); a missing record, one that is not a regular file or one over 65536 bytes is `REFUSED gateway`; anything but a plan that
+#            said `gateway_live=yes` with a `gateway_sha` that is the sha256 of these bytes is `REFUSED gateway unchecked`. Live or not is never
+#            read off the bytes with a grep (a tab or a newline between key, colon and null escapes a regex): only the plan's parsed verdict. `sign` (SIGN_KEY only, no git, ssh or network child) signs that
 #            file under the namespace mirrorstack-fleet-pin and verifies it (a failed verify stops the step). Before `live=yes` the
 #            fetch step checks the bytes name the five keys of a gateway record (serial, address, cert_sha256, manifest_key, session_key;
 #            a fixed-string grep, no python or jq, a shape check and not a schema check): the pin namespace is shared with kit.json and
@@ -39,7 +40,13 @@
 #            anything is signed: the exact key set and types of a gateway record (`REFUSED shape`), at most 1 MiB, and a serial above the
 #            serial of every body that ever had a signature at the tip (`REFUSED serial`; the same bytes again are allowed). A refusal stops
 #            the whole run in `plan`, before the loaders, the boot smoke or any signature. A live body is output as `gateway_sha` (its sha256); the
-#            placeholder as an empty one; a body with address null and a serial above 0 is `REFUSED gateway` (a withdrawn record is not for the kit host).
+#            placeholder as an empty one, and the step outputs `gateway_live` (`yes`, or `no` for the placeholder), read off the parsed record, not a
+#            grep; a body with address null and a serial above 0 is `REFUSED gateway` (a withdrawn record is not for the kit host), as is a live one
+#            whose serial is not one to nine digits; a missing record is the planner's `REFUSED shape fleet/core/gateway.json` (gwsign's own
+#            `REFUSED gateway` for it is unreachable once the plan has refused).
+#            The serial rule has teeth only once a `gateway.json.sig` is committed (open until CV05e): the planner takes "the previous signed" body
+#            from the history of the tip's own `.sig`, and the signature this job makes for the kit host is never committed, so until the control
+#            VM's signature lands there (CV05e) that history is empty and any serial, a rollback included, passes; the shape check is not affected.
 #   kit      puts the bundle and the gateway record on the kit host. It holds only FLEET_READ and KIT_UPLOAD_KEY (the Ed25519
 #            key whose signature the host takes; it has no Cloudflare power at all). It rebuilds the bundle from the fleet
 #            commit install.json names, with the vendored packer, refuses unless size, sha256, head and tree equal the signed
@@ -141,6 +148,7 @@ jobs:
       pin_sha: ${{ steps.plan.outputs.pin_sha }}
       tip: ${{ steps.plan.outputs.tip }}
       gateway_sha: ${{ steps.gateway.outputs.gateway_sha }}
+      gateway_live: ${{ steps.gateway.outputs.gateway_live }}
       immutable: ${{ steps.immutable.outputs.immutable }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
@@ -200,13 +208,20 @@ jobs:
           [ "$p" = fleet/core/gateway.json ] && [ -z "$x" ] && [[ "$h" =~ ^[0-9a-f]{64}$ ]] && [[ "$s" =~ ^(0|[1-9][0-9]{0,18})$ ]] && { [ "$a" = sign ] || [ "$a" = keep ]; } || { echo 'REFUSED manifest'; exit 1; }
           git -C "$RUNNER_TEMP/fleet" show "$TIP:fleet/core/gateway.json" > "$d/body"
           [ "$(sha256sum "$d/body" | cut -d ' ' -f 1)" = "$h" ] || { echo 'REFUSED gateway'; exit 1; }
-          if grep -qE '"address" *: *null' "$d/body"; then
+          # live or not is read off the PARSED record (the planner above already parsed these very bytes strictly and judged the shape: the
+          # four endpoint fields are all null or all set), never off a grep over the bytes: a tab or a newline between key, colon and null
+          # escapes a regex and the record would be planned, and signed, as a live one (review of CV05d)
+          v=$(python3 -I -c 'import json, sys; print("null" if json.load(open(sys.argv[1], "rb"))["address"] is None else "set")' "$d/body") || { echo 'REFUSED gateway'; exit 1; }
+          if [ "$v" = null ]; then
             [ "$s" = 0 ] || { echo 'REFUSED gateway'; exit 1; }
             echo 'SKIP gateway-plan not-live'
             echo gateway_sha= >> "$GITHUB_OUTPUT"
+            echo gateway_live=no >> "$GITHUB_OUTPUT"
           else
+            [ "$v" = set ] || { echo 'REFUSED gateway'; exit 1; }
             [[ "$s" =~ ^[1-9][0-9]{0,8}$ ]] || { echo 'REFUSED gateway'; exit 1; }
             echo "gateway_sha=$h" >> "$GITHUB_OUTPUT"
+            echo gateway_live=yes >> "$GITHUB_OUTPUT"
             cat "$d/review"
             echo "gateway planned: serial $s, sha256 $h, $a"
           fi
@@ -415,6 +430,7 @@ jobs:
           FLEET_READ: ${{ secrets.FLEET_READ }}
           TIP: ${{ needs.plan.outputs.tip }}
           GATEWAY_SHA: ${{ needs.plan.outputs.gateway_sha }}
+          GATEWAY_LIVE: ${{ needs.plan.outputs.gateway_live }}
         run: |
           set -eu
           umask 077
@@ -438,13 +454,15 @@ jobs:
           for k in serial address cert_sha256 manifest_key session_key; do
             grep -qF "\"$k\"" "$RUNNER_TEMP/gwsign/gateway.json" || { rm -rf "$RUNNER_TEMP/gwsign"; echo 'REFUSED gateway'; exit 1; }
           done
-          if grep -qE '"address" *: *null' "$RUNNER_TEMP/gwsign/gateway.json"; then
+          # not live is what the plan said about the parsed record (`no`: the placeholder), not a grep over these bytes (a tab or a newline
+          # between key, colon and null escapes one). Anything but a plan that said `yes` for exactly these bytes signs nothing.
+          if [ "$GATEWAY_LIVE" = no ]; then
             rm -rf "$RUNNER_TEMP/gwsign"
             echo 'SKIP gwsign not-live'
             echo live=no >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          [ -n "$GATEWAY_SHA" ] && [ "$(sha256sum "$RUNNER_TEMP/gwsign/gateway.json" | cut -d ' ' -f 1)" = "$GATEWAY_SHA" ] || { rm -rf "$RUNNER_TEMP/gwsign"; echo 'REFUSED gateway unchecked'; exit 1; }
+          [ "$GATEWAY_LIVE" = yes ] && [ -n "$GATEWAY_SHA" ] && [ "$(sha256sum "$RUNNER_TEMP/gwsign/gateway.json" | cut -d ' ' -f 1)" = "$GATEWAY_SHA" ] || { rm -rf "$RUNNER_TEMP/gwsign"; echo 'REFUSED gateway unchecked'; exit 1; }
           echo live=yes >> "$GITHUB_OUTPUT"
           echo "gateway record: $n bytes"
       - id: sign

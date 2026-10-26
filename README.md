@@ -122,7 +122,10 @@ signing key's public line and fingerprint, `mode` floor runs only the floor job,
   exists. Any other state without a good signed pair is still `REFUSED gateway` or `REFUSED sig` (a live record with no `--sig`
   is `REFUSED sig`). Before anything is signed the `plan` job's step `gateway` runs the pins planner (`bin/fleet-pins-plan.py plan
   --only fleet/core/gateway.json`: exact key set, and a serial above every earlier signed body's) over the tip's record and hands
-  its sha256 to `gwsign`, which signs only those bytes (ledger G-CV05-M10). The install.json it works
+  its sha256 and a live/not-live word (read off the parsed record, never a grep over its bytes) to `gwsign`, which
+  signs only those bytes (ledger G-CV05-M10). The planner's serial rule reads the previous signed body from the history of the tip's
+  `gateway.json.sig`, which nothing commits until CV05e: until then only the shape check, the size and the live/serial gate bite, and a
+  lower serial is not refused. The install.json it works
   from is the plan's output re-hashed against the plan's sha256, with the sign job's signature, so nothing here is downloaded.
   The job uploads no artifact, uses no cache and writes no step summary; the log shows a size and a sha256 only. The gateway pair
   is never in the plan's folder, which becomes a public artifact and public release assets.

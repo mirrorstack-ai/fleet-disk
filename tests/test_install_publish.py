@@ -3081,10 +3081,11 @@ class Workflow(unittest.TestCase):
         for job in ('sign', 'tag', 'publish'):
             self.assertNotIn('gateway', self.JOBS[job], job)
         # CV05d: the plan judges the record (its `gateway` step) and hands on a sha256 and nothing else; nothing else of the plan names it
-        plan = self.JOBS['plan'].replace('      - id: gateway\n' + self.step_text('plan', 'gateway'), '').replace('      gateway_sha: ${{ steps.gateway.outputs.gateway_sha }}\n', '')
+        plan = self.JOBS['plan'].replace('      - id: gateway\n' + self.step_text('plan', 'gateway'), '').replace('      gateway_sha: ${{ steps.gateway.outputs.gateway_sha }}\n', '').replace('      gateway_live: ${{ steps.gateway.outputs.gateway_live }}\n', '')
         self.assertNotIn('gateway', plan)
         self.assertEqual(self.declared_outputs('plan')['gateway_sha'], ('gateway', 'gateway_sha'))
-        self.assertEqual(self.written_outputs('plan', 'gateway'), {'gateway_sha'})
+        self.assertEqual(self.declared_outputs('plan')['gateway_live'], ('gateway', 'gateway_live'))
+        self.assertEqual(self.written_outputs('plan', 'gateway'), {'gateway_sha', 'gateway_live'})
         self.assertNotIn('"$RUNNER_TEMP/out', self.step_text('plan', 'gateway'))   # a byte of the record never reaches the published folder
         self.assertNotIn('GITHUB_STEP_SUMMARY', self.step_text('plan', 'gateway'))
         self.assertEqual(self.declared_outputs('gwsign'), {'gateway_sig': ('sign', 'gateway_sig')})  # the signature only, never a byte of the record
@@ -3133,7 +3134,7 @@ class Workflow(unittest.TestCase):
 
     def test_the_two_secrets_never_share_a_step_and_the_signing_step_holds_no_git_ssh_python_or_jq(self):
         fetch, sign = self.step_text('gwsign', 'fetch'), self.step_text('gwsign', 'sign')
-        self.assertEqual(re.findall(r'(?m)^          (\w+): ', fetch), ['FLEET_READ', 'TIP', 'GATEWAY_SHA'])
+        self.assertEqual(re.findall(r'(?m)^          (\w+): ', fetch), ['FLEET_READ', 'TIP', 'GATEWAY_SHA', 'GATEWAY_LIVE'])
         self.assertEqual(re.findall(r'(?m)^          (\w+): ', sign), ['SIGN_KEY'])
         self.assertEqual(re.findall(r'secrets\.(\w+)', fetch), ['FLEET_READ'])
         self.assertEqual(re.findall(r'secrets\.(\w+)', sign), ['SIGN_KEY'])
@@ -3158,6 +3159,7 @@ class Workflow(unittest.TestCase):
         fetch = self.step_text('gwsign', 'fetch')
         self.assertIn('TIP: ${{ needs.plan.outputs.tip }}', fetch)
         self.assertIn('GATEWAY_SHA: ${{ needs.plan.outputs.gateway_sha }}', fetch)   # CV05d: the plan's verdict on these very bytes
+        self.assertIn('GATEWAY_LIVE: ${{ needs.plan.outputs.gateway_live }}', fetch)   # and on the parsed record, never a grep over the bytes
         self.assertNotIn('fleet/core/gateway.json.sig', self.JOBS['gwsign'])   # the tip's own signature (the control VM's, from CV05e) is never looked at
         self.assertNotIn('SKIP gwsign series', self.JOBS['gwsign'])   # both series sign
         self.assertEqual(self.declared_outputs('plan')['tip'], ('plan', 'tip'))   # the tip the plan judged, handed on
@@ -3166,7 +3168,7 @@ class Workflow(unittest.TestCase):
                      'ls-tree "$TIP" -- fleet/core/gateway.json', "'100644 blob '*", '-le 65536'):
             self.assertIn(need, fetch, need)
         order = ["trap 'shred -u", '"$FLEET_READ" > "$d/key"', 'fetch -q --no-tags --depth 1', 'REFUSED tip-moved',
-                 'case "$rec" in', 'cat-file blob "$TIP:fleet/core/gateway.json"', 'for k in ', '"address\" *: *null', '"$GATEWAY_SHA"', 'echo live=yes']
+                 'case "$rec" in', 'cat-file blob "$TIP:fleet/core/gateway.json"', 'for k in ', 'if [ "$GATEWAY_LIVE" = no ]', '"$GATEWAY_SHA"', 'echo live=yes']
         self.assertEqual([fetch.index(x) for x in order], sorted(fetch.index(x) for x in order))
         # the body is shaped like a gateway record before it is called live (review of AF08, P1): the five names of GATEWAY_KEYS, fixed strings
         self.assertIn('for k in ' + ' '.join(self.gateway_keys()) + '; do', fetch)
