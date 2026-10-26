@@ -57,15 +57,34 @@
 # `release`, reads only TAG_KEY and deletes the tag with the deploy key's ssh options, a lease on exactly the checked commit
 # (`--force-with-lease=<ref>:<sha>`): a tag that moved since the check is not deleted. It runs no repository code and holds no token.
 # While `kit-floor` has no required reviewer (README, One-time repo settings) nothing stops an untag run: do not rely on it.
+# The mode `pins` signs the control VM's five pin files (CV05c, D342; fleet/hosts.json and fleet/core/{gateway,work-pin,deploy-pin,proven}.json)
+# with the same key, in their own namespace `mirrorstack-fleet-ctl` (a carrier's deploy-pin.json is public and signed in `mirrorstack-fleet-pin`: one
+# namespace for both would let a copy of it pass as root's pin). No other job runs in this mode, and it runs on `release` only. Four jobs, all in
+# the group `install`:
+#   pins-plan     (Environment `release`, FLEET_READ only, no signing key) clones the fleet repository, runs `bin/fleet-pins-plan.py` (stdlib,
+#                 fleet code is never imported) over the `release` tip and prints that tip. Its output is the lines `path sha256 serial
+#                 action` (action keep: a signature at the tip already verifies; sign: this run signs it), the tip, and the series.
+#   pins-approve  (Environment `kit-floor`, no secret) runs in a release-series run only (SERIES=release): it prints per file the serial,
+#                 sha256 and action and the deploy head, and `pins-sign` needs it, so the owner's approval is the gate (the test series has no
+#                 owner step). While `kit-floor` has no required reviewer (README, One-time repo settings) nothing stops a pins run: do not rely on it.
+#   pins-sign     (Environment `release`) two steps like `gwsign`, no checkout, no action, no repository code: `fetch` (FLEET_READ only) refuses
+#                 `tip-moved` unless the `release` tip is still the planned one, reads each planned `sign` file as a git blob of that tip and refuses on any
+#                 sha256 that differs from the plan's (a deploy head that is not an ancestor of the tip is refused too); `sign` (SIGN_KEY only,
+#                 no git, ssh or network child) refuses unless the key's fingerprint is KEY_SHA256, allows the namespace `mirrorstack-fleet-ctl`
+#                 and no other, signs each file, verifies and re-hashes it, and outputs the signatures (base64) and `pub=`.
+#   pins-publish  (no secret, `contents: read`) writes `pins-sigs.json` (tip, run, fingerprint, pub, entries of path, sha256, serial and sig_b64)
+#                 and uploads it as the artifact `pins-sigs` (one day). The signature reaches root only through a land PR on the fleet main
+#                 (an admin session writes the `.sig` files: CI holds no write credential into the fleet, and a write credential there would
+#                 be worth more than this key). Nothing printed is a value: this repository is public.
 # Inputs reach the scripts only through env:. Which key signs is the constant KEY_SHA256, a reviewed change to this file.
 name: install
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: sign (plan, sign, kit, tag, publish), pubkey (only print the signing key's public line and fingerprint), floor (set the kit host's floor) or untag (remove the tag install-<serial> that has no release)
+        description: sign (plan, sign, kit, tag, publish), pubkey (only print the signing key's public line and fingerprint), floor (set the kit host's floor), untag (remove the tag install-<serial> that has no release) or pins (sign the control VM's pin files; no serial)
         type: choice
-        options: [sign, pubkey, floor, untag]
+        options: [sign, pubkey, floor, untag, pins]
         default: sign
       serial:
         description: the install serial, the folder release/install-<serial> of the fleet repository (mode untag - the serial whose release-less tag is removed)
@@ -85,6 +104,9 @@ env:
   # The `ssh-keygen -lf` fingerprint of the key in SIGN_KEY: the test key T, made inside GitHub by the keygen run
   # 38032458890 (2026-10-10, its line KEYGEN-FINGERPRINT SIGN_KEY). The release key replaces it by a reviewed change.
   KEY_SHA256: SHA256:16jB0ih9afmAW7rFmgTJVtarDgEv4w/DHA8LKufWhKM
+  # The public line of that key (the `pub` of a `mode` pubkey run). Only `pins-plan` reads it, to judge the signatures already at the fleet tip, and
+  # it refuses `key-pub` unless this line's fingerprint is KEY_SHA256; a change of KEY_SHA256 changes this line in the same reviewed edit.
+  KEY_PUB: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE+5MqONUoRXkjct3UeFr+xffINGAYa4ZytdHK//67CE
   # test: serials below 1000 (the test key); release: serials 1000 and up (the release key)
   SERIES: test
   # The one host install.json's signed bundle.url may name (the bootstrap sends a helper's invite code to it): the production
@@ -617,3 +639,263 @@ jobs:
           git init -q "$d/repo"
           git -C "$d/repo" push -q --force-with-lease="refs/tags/install-$SERIAL:$TAG_SHA" "git@github.com:$GITHUB_REPOSITORY.git" ":refs/tags/install-$SERIAL"
           echo "deleted tag install-$SERIAL at $TAG_SHA"
+  pins-plan:
+    if: github.ref == 'refs/heads/release' && inputs.mode == 'pins'
+    environment: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      tip: ${{ steps.plan.outputs.tip }}
+      manifest: ${{ steps.plan.outputs.manifest }}
+      deploy_head: ${{ steps.plan.outputs.deploy_head }}
+      series: ${{ steps.plan.outputs.series }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262      # v4
+        with:
+          persist-credentials: false
+      - id: plan
+        env:
+          FLEET_READ: ${{ secrets.FLEET_READ }}
+        run: |
+          set -euo pipefail
+          umask 077
+          case "$SERIES" in test | release) ;; *) echo 'REFUSED series'; exit 1;; esac
+          d=$(mktemp -d /dev/shm/pinsplan.XXXXXX)
+          trap 'shred -u "$d/key" 2>/dev/null || true; rm -rf "$d"' EXIT
+          printf '%s\n' "$KEY_PUB" > "$d/pub"
+          [ "$(/usr/bin/ssh-keygen -l -f "$d/pub" | cut -d ' ' -f 2)" = "$KEY_SHA256" ] || { echo 'REFUSED key-pub'; exit 1; }
+          printf '%s\n' "$FLEET_READ" > "$d/key"
+          printf '%s\n' "$GH_HOSTKEY" > "$d/known_hosts"
+          export GIT_SSH_COMMAND="/usr/bin/ssh -i $d/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$d/known_hosts -o GlobalKnownHostsFile=/dev/null -o HostKeyAlgorithms=ssh-ed25519"
+          python3 bin/fleet-pins-plan.py clone "$FLEET_REPO" "$RUNNER_TEMP/fleet"
+          if ! python3 bin/fleet-pins-plan.py plan --repo "$RUNNER_TEMP/fleet" --pub "$d/pub" --run-id "$GITHUB_RUN_ID" > "$d/manifest" 2> "$d/review"; then
+            cat "$d/review"
+            exit 1
+          fi
+          tip=$(sed -n 's/^tip \([0-9a-f]\{40\}\)$/\1/p' "$d/manifest")
+          [ "$(grep -c . "$d/manifest")" = 7 ] && [ "$(printf '%s' "$tip" | wc -c | tr -d ' ')" = 40 ] || { echo 'REFUSED manifest'; exit 1; }
+          sed -n '3,7p' "$d/manifest" > "$d/rows"
+          set -- fleet/hosts.json fleet/core/gateway.json fleet/core/work-pin.json fleet/core/deploy-pin.json fleet/core/proven.json
+          n=0
+          while IFS=' ' read -r p h s a x; do
+            n=$((n + 1))
+            [ "$n" -le 5 ] && [ "$p" = "${!n}" ] && [ -z "$x" ] && [[ "$h" =~ ^[0-9a-f]{64}$ ]] && [[ "$s" =~ ^(0|[1-9][0-9]{0,18})$ ]] && { [ "$a" = sign ] || [ "$a" = keep ]; } || { echo 'REFUSED manifest'; exit 1; }
+          done < "$d/rows"
+          [ "$n" = 5 ] || { echo 'REFUSED manifest'; exit 1; }
+          head=$(git -C "$RUNNER_TEMP/fleet" show "$tip:fleet/core/deploy-pin.json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["head"] or "null")')
+          [[ "$head" =~ ^([0-9a-f]{40}|null)$ ]] || { echo 'REFUSED head'; exit 1; }
+          {
+            echo "tip=$tip"
+            echo "series=$SERIES"
+            echo "deploy_head=$head"
+            echo 'manifest<<PINS_MANIFEST_EOF'
+            cat "$d/rows"
+            echo 'PINS_MANIFEST_EOF'
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo '## Control VM pins plan'
+            echo "fleet release tip $tip, deploy head $head, series $SERIES"
+            echo '```'; cat "$d/rows"; sed 's/^# //' "$d/review"; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "tip $tip"
+          cat "$d/rows"
+          cat "$d/review"
+  pins-approve:
+    needs: pins-plan
+    if: github.ref == 'refs/heads/release' && inputs.mode == 'pins' && needs.pins-plan.outputs.series == 'release'
+    environment: kit-floor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - id: approve
+        env:
+          TIP: ${{ needs.pins-plan.outputs.tip }}
+          MANIFEST: ${{ needs.pins-plan.outputs.manifest }}
+          DEPLOY_HEAD: ${{ needs.pins-plan.outputs.deploy_head }}
+        run: |
+          set -euo pipefail
+          [[ "$TIP" =~ ^[0-9a-f]{40}$ ]] || { echo 'REFUSED tip'; exit 1; }
+          [[ "$DEPLOY_HEAD" =~ ^([0-9a-f]{40}|null)$ ]] || { echo 'REFUSED head'; exit 1; }
+          set -- fleet/hosts.json fleet/core/gateway.json fleet/core/work-pin.json fleet/core/deploy-pin.json fleet/core/proven.json
+          n=0
+          while IFS=' ' read -r p h s a x; do
+            n=$((n + 1))
+            [ "$n" -le 5 ] && [ "$p" = "${!n}" ] && [ -z "$x" ] && [[ "$h" =~ ^[0-9a-f]{64}$ ]] && [[ "$s" =~ ^(0|[1-9][0-9]{0,18})$ ]] && { [ "$a" = sign ] || [ "$a" = keep ]; } || { echo 'REFUSED manifest'; exit 1; }
+          done <<< "$MANIFEST"
+          [ "$n" = 5 ] || { echo 'REFUSED manifest'; exit 1; }
+          echo "plan for approval in kit-floor (nothing is approved by this line): sign the control VM pins at fleet release tip $TIP"
+          printf '%s\n' "$MANIFEST"
+          echo "deploy-pin head: $DEPLOY_HEAD"
+  pins-sign:
+    needs: [pins-plan, pins-approve]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/release' && inputs.mode == 'pins' && needs.pins-plan.result == 'success' && (needs.pins-approve.result == 'success' || (needs.pins-approve.result == 'skipped' && needs.pins-plan.outputs.series == 'test')) }}
+    environment: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions: {}
+    outputs:
+      hosts_sig: ${{ steps.sign.outputs.hosts_sig }}
+      gateway_sig: ${{ steps.sign.outputs.gateway_sig }}
+      work_pin_sig: ${{ steps.sign.outputs.work_pin_sig }}
+      deploy_pin_sig: ${{ steps.sign.outputs.deploy_pin_sig }}
+      proven_sig: ${{ steps.sign.outputs.proven_sig }}
+      pub: ${{ steps.sign.outputs.pub }}
+      fp: ${{ steps.sign.outputs.fp }}
+    steps:
+      - id: fetch
+        env:
+          FLEET_READ: ${{ secrets.FLEET_READ }}
+          TIP: ${{ needs.pins-plan.outputs.tip }}
+          MANIFEST: ${{ needs.pins-plan.outputs.manifest }}
+        run: |
+          set -eu
+          umask 077
+          [[ "$TIP" =~ ^[0-9a-f]{40}$ ]] || { echo 'REFUSED pins tip'; exit 1; }
+          set -- fleet/hosts.json fleet/core/gateway.json fleet/core/work-pin.json fleet/core/deploy-pin.json fleet/core/proven.json
+          n=0
+          while IFS=' ' read -r p h s a x; do
+            n=$((n + 1))
+            [ "$n" -le 5 ] && [ "$p" = "${!n}" ] && [ -z "$x" ] && [[ "$h" =~ ^[0-9a-f]{64}$ ]] && [[ "$s" =~ ^(0|[1-9][0-9]{0,18})$ ]] && { [ "$a" = sign ] || [ "$a" = keep ]; } || { echo 'REFUSED manifest'; exit 1; }
+          done <<< "$MANIFEST"
+          [ "$n" = 5 ] || { echo 'REFUSED manifest'; exit 1; }
+          d=$(mktemp -d /dev/shm/pinsfetch.XXXXXX)
+          ok=no
+          trap 'shred -u "$d/key" 2>/dev/null || true; rm -rf "$d"; [ "$ok" = yes ] || rm -rf "$RUNNER_TEMP/pinsign"' EXIT
+          printf '%s\n' "$FLEET_READ" > "$d/key"
+          printf '%s\n' "$GH_HOSTKEY" > "$d/known_hosts"
+          export GIT_SSH_COMMAND="/usr/bin/ssh -i $d/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$d/known_hosts -o GlobalKnownHostsFile=/dev/null -o HostKeyAlgorithms=ssh-ed25519"
+          git init -q "$d/repo"
+          git -C "$d/repo" remote add origin "$FLEET_REPO"
+          git -C "$d/repo" fetch -q --no-tags --filter=blob:none origin '+refs/heads/release:refs/remotes/origin/release' || git -C "$d/repo" fetch -q --no-tags origin '+refs/heads/release:refs/remotes/origin/release'
+          [ "$(git -C "$d/repo" rev-parse refs/remotes/origin/release)" = "$TIP" ] || { echo 'REFUSED tip-moved'; exit 1; }
+          mkdir "$RUNNER_TEMP/pinsign"
+          set -- fleet/hosts.json fleet/core/gateway.json fleet/core/work-pin.json fleet/core/deploy-pin.json fleet/core/proven.json
+          n=0
+          while IFS=' ' read -r p h s a x; do
+            n=$((n + 1))
+            [ "$a" = sign ] || continue
+            mode=$(git -C "$d/repo" ls-tree "$TIP" -- "$p" | cut -f 1)
+            case "$mode" in '100644 blob '*) ;; *) echo "REFUSED pins $p"; exit 1;; esac
+            size=$(git -C "$d/repo" cat-file -s "$TIP:$p")
+            case "$size" in '' | *[!0-9]*) echo "REFUSED pins $p"; exit 1;; esac
+            [ "$size" -gt 0 ] && [ "$size" -le 1048576 ] || { echo "REFUSED pins $p"; exit 1; }
+            git -C "$d/repo" cat-file blob "$TIP:$p" > "$RUNNER_TEMP/pinsign/$n"
+            [ "$(sha256sum "$RUNNER_TEMP/pinsign/$n" | cut -d ' ' -f 1)" = "$h" ] || { echo "REFUSED hash $p"; exit 1; }
+            if [ "$p" = fleet/core/deploy-pin.json ]; then
+              [ "$(grep -o '"head"' "$RUNNER_TEMP/pinsign/$n" | wc -l | tr -d ' ')" = 1 ] || { echo 'REFUSED head'; exit 1; }
+              if ! grep -qE '"head": *null' "$RUNNER_TEMP/pinsign/$n"; then
+                head=$(sed -n 's/.*"head": *"\([0-9a-f]\{40\}\)".*/\1/p' "$RUNNER_TEMP/pinsign/$n")
+                [[ "$head" =~ ^[0-9a-f]{40}$ ]] && git -C "$d/repo" merge-base --is-ancestor "$head" "$TIP" || { echo 'REFUSED head'; exit 1; }
+              fi
+            fi
+            echo "planned $p: $size bytes, sha256 $h"
+          done <<< "$MANIFEST"
+          ok=yes
+      - id: sign
+        env:
+          SIGN_KEY: ${{ secrets.SIGN_KEY }}
+          MANIFEST: ${{ needs.pins-plan.outputs.manifest }}
+        run: |
+          set -euo pipefail
+          umask 077
+          set -- fleet/hosts.json fleet/core/gateway.json fleet/core/work-pin.json fleet/core/deploy-pin.json fleet/core/proven.json
+          n=0
+          while IFS=' ' read -r p h s a x; do
+            n=$((n + 1))
+            [ "$n" -le 5 ] && [ "$p" = "${!n}" ] && [ -z "$x" ] && [[ "$h" =~ ^[0-9a-f]{64}$ ]] && [[ "$s" =~ ^(0|[1-9][0-9]{0,18})$ ]] && { [ "$a" = sign ] || [ "$a" = keep ]; } || { echo 'REFUSED manifest'; exit 1; }
+          done <<< "$MANIFEST"
+          [ "$n" = 5 ] || { echo 'REFUSED manifest'; exit 1; }
+          d=$(mktemp -d /dev/shm/pinsign.XXXXXX)
+          trap 'shred -u "$d/key" 2>/dev/null || true; rm -rf "$d" "$RUNNER_TEMP/pinsign"' EXIT
+          printf '%s\n' "$SIGN_KEY" > "$d/key"
+          fp=$(/usr/bin/ssh-keygen -l -f "$d/key" | cut -d ' ' -f 2)
+          pub=$(/usr/bin/ssh-keygen -y -f "$d/key" | cut -d ' ' -f 1,2)
+          [ -n "$fp" ] && [ -n "$pub" ] || { echo 'REFUSED no-key'; exit 1; }
+          printf '%s\n' "$KEY_SHA256" | grep -Eq '^SHA256:[A-Za-z0-9+/]{43}$' || { echo 'REFUSED key-not-set'; exit 1; }
+          [ "$fp" = "$KEY_SHA256" ] || { echo 'REFUSED key'; exit 1; }
+          printf 'owner namespaces="mirrorstack-fleet-ctl" %s\n' "$pub" > "$d/allowed"
+          names=(hosts gateway work_pin deploy_pin proven)
+          : > "$d/outputs"
+          n=0
+          while IFS=' ' read -r p h s a x; do
+            n=$((n + 1))
+            [ "$a" = sign ] || continue
+            f="$RUNNER_TEMP/pinsign/$n"
+            [ -f "$f" ] && [ ! -L "$f" ] || { echo "REFUSED pins $p"; exit 1; }
+            cp "$f" "$d/body"
+            [ "$(sha256sum "$d/body" | cut -d ' ' -f 1)" = "$h" ] || { echo "REFUSED hash $p"; exit 1; }
+            /usr/bin/ssh-keygen -q -Y sign -f "$d/key" -n mirrorstack-fleet-ctl "$d/body"
+            /usr/bin/ssh-keygen -Y verify -f "$d/allowed" -I owner -n mirrorstack-fleet-ctl -s "$d/body.sig" < "$d/body" > /dev/null
+            [ "$(sha256sum "$d/body" | cut -d ' ' -f 1)" = "$h" ] || { echo "REFUSED changed $p"; exit 1; }
+            printf '%s_sig=%s\n' "${names[$((n - 1))]}" "$(base64 -w0 < "$d/body.sig")" >> "$d/outputs"
+            rm -f "$d/body" "$d/body.sig"
+            echo "signed $p: sha256 $h"
+          done <<< "$MANIFEST"
+          printf 'pub=%s\nfp=%s\n' "$pub" "$fp" >> "$d/outputs"
+          cat "$d/outputs" >> "$GITHUB_OUTPUT"
+          echo "signed with key $fp"
+  pins-publish:
+    needs: [pins-plan, pins-sign]
+    if: github.ref == 'refs/heads/release' && inputs.mode == 'pins'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - id: publish
+        env:
+          TIP: ${{ needs.pins-plan.outputs.tip }}
+          MANIFEST: ${{ needs.pins-plan.outputs.manifest }}
+          PUB: ${{ needs.pins-sign.outputs.pub }}
+          FP: ${{ needs.pins-sign.outputs.fp }}
+          SIG_1: ${{ needs.pins-sign.outputs.hosts_sig }}
+          SIG_2: ${{ needs.pins-sign.outputs.gateway_sig }}
+          SIG_3: ${{ needs.pins-sign.outputs.work_pin_sig }}
+          SIG_4: ${{ needs.pins-sign.outputs.deploy_pin_sig }}
+          SIG_5: ${{ needs.pins-sign.outputs.proven_sig }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [ "$FP" = "$KEY_SHA256" ] || { echo 'REFUSED key'; exit 1; }
+          mkdir "$RUNNER_TEMP/pins"
+          printf '%s\n' "$PUB" > "$RUNNER_TEMP/pins/pub"
+          [ "$(/usr/bin/ssh-keygen -l -f "$RUNNER_TEMP/pins/pub" | cut -d ' ' -f 2)" = "$FP" ] || { echo 'REFUSED pub'; exit 1; }
+          rm -f "$RUNNER_TEMP/pins/pub"
+          python3 - <<'PY'
+          import base64, binascii, json, os, re, sys
+          env = os.environ
+          rows = [line.split(' ') for line in env['MANIFEST'].split('\n')]
+          paths = ('fleet/hosts.json', 'fleet/core/gateway.json', 'fleet/core/work-pin.json', 'fleet/core/deploy-pin.json', 'fleet/core/proven.json')
+          if len(rows) != 5 or [r[0] for r in rows] != list(paths) or any(len(r) != 4 or not re.fullmatch('[0-9a-f]{64}', r[1]) or r[3] not in ('sign', 'keep')
+                                                                           or not re.fullmatch('0|[1-9][0-9]{0,18}', r[2]) for r in rows):
+              sys.exit('REFUSED manifest')
+          if not re.fullmatch('[0-9a-f]{40}', env['TIP']) or not re.fullmatch('ssh-ed25519 [A-Za-z0-9+/]{68}', env['PUB']):
+              sys.exit('REFUSED pins')
+          entries = []
+          for i, (path, sha, serial, action) in enumerate(rows, 1):
+              sig = env[f'SIG_{i}']
+              if action == 'keep':
+                  if sig:
+                      sys.exit(f'REFUSED sig {path}')
+                  continue
+              try:
+                  raw = base64.b64decode(sig, validate=True)
+              except (binascii.Error, ValueError):
+                  sys.exit(f'REFUSED sig {path}')
+              if not 0 < len(raw) <= 4096 or not raw.startswith(b'-----BEGIN SSH SIGNATURE-----'):
+                  sys.exit(f'REFUSED sig {path}')
+              entries.append({'path': path, 'sha256': sha, 'serial': int(serial), 'sig_b64': sig})
+          doc = {'tip': env['TIP'], 'run': env['GITHUB_RUN_ID'], 'fingerprint': env['FP'], 'pub': env['PUB'], 'entries': entries}
+          with open(os.path.join(env['RUNNER_TEMP'], 'pins', 'pins-sigs.json'), 'w', encoding='utf-8') as f:
+              f.write(json.dumps(doc, indent=2) + '\n')
+          print(f'pins-sigs.json: {len(entries)} signature(s) at fleet release tip {env["TIP"]}, key {env["FP"]}')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: pins-sigs
+          path: ${{ runner.temp }}/pins/pins-sigs.json
+          retention-days: 1
+          if-no-files-found: error

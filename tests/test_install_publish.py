@@ -2824,16 +2824,17 @@ class Workflow(unittest.TestCase):
         self.assertRegex(self.TEXT, r'(?m)^on:\n  workflow_dispatch:\n    inputs:\n      mode:\n')
         self.assertEqual(re.findall(r'(?m)^      (\w+):\n        (?:description|required)', self.TEXT),
                          ['mode', 'serial', 'min_serial', 'floor'])
-        self.assertRegex(self.TEXT, r'(?m)^        options: \[sign, pubkey, floor, untag\]\n        default: sign\n')
+        self.assertRegex(self.TEXT, r'(?m)^        options: \[sign, pubkey, floor, untag, pins\]\n        default: sign\n')
         self.assertEqual(list(self.JOBS), ['plan', 'fixture', 'smoke', 'sign', 'gwsign', 'kit', 'tag', 'publish', 'floor-approve',
                                                  'floor', 'untag-check', 'untag-approve', 'untag'])
-        self.assertEqual(re.findall(r'(?m)^  ([\w-]+):$', self.TEXT.split('\njobs:\n', 1)[1]), list(self.JOBS))  # and no other job
+        self.assertEqual(re.findall(r'(?m)^  ([\w-]+):$', self.TEXT.split('\njobs:\n', 1)[1]),
+                         list(self.JOBS) + ['pins-plan', 'pins-approve', 'pins-sign', 'pins-publish'])  # and no other job; the four of mode pins (CV05c) are tested in test_install_workflow.py
         for bad in ('pull_request', 'push:', 'self-hosted', 'refs/heads/main', 'actions/cache'):
             self.assertNotIn(bad, self.TEXT)
         for name, job in self.JOBS.items():
             self.assertIn("github.ref == 'refs/heads/release'", job.split('steps:')[0], name)
         self.assertEqual(re.findall(r'runs-on: (.+)', self.TEXT),
-                         ['ubuntu-24.04', 'ubuntu-24.04', '${{ matrix.runner }}'] + ['ubuntu-24.04'] * 10)  # the smoke job is the only hosted-matrix one; the fixture is built once on ubuntu
+                         ['ubuntu-24.04', 'ubuntu-24.04', '${{ matrix.runner }}'] + ['ubuntu-24.04'] * 14)  # the smoke job is the only hosted-matrix one; the fixture is built once on ubuntu
         self.assertEqual([re.findall(r'(?m)^    environment: (\S+)$', j) for j in self.JOBS.values()],
                          [['release'], [], [], ['release'], ['release'], ['release'], ['release'], [], ['kit-floor'], ['release'], [], ['kit-floor'], ['release']])  # fixture, smoke and publish have none: no secret, no variable of release
 
@@ -2847,7 +2848,7 @@ class Workflow(unittest.TestCase):
 
     def test_each_secret_is_read_by_one_job_and_the_sign_and_tag_jobs_run_no_action_and_no_repository_code(self):
         self.assertEqual(sorted(re.findall(r'secrets\.(\w+)', self.TEXT)),
-                         ['FLEET_READ', 'FLEET_READ', 'FLEET_READ', 'KIT_UPLOAD_KEY', 'KIT_UPLOAD_KEY', 'SIGN_KEY', 'SIGN_KEY', 'TAG_KEY', 'TAG_KEY'])  # gwsign (AF08) reads and signs; TAG_KEY: tag and untag (AF42, on purpose: the deploy key that makes a tag is the one that removes it)
+                         ['FLEET_READ', 'FLEET_READ', 'FLEET_READ', 'FLEET_READ', 'FLEET_READ', 'KIT_UPLOAD_KEY', 'KIT_UPLOAD_KEY', 'SIGN_KEY', 'SIGN_KEY', 'SIGN_KEY', 'TAG_KEY', 'TAG_KEY'])  # pins-plan and pins-sign (CV05c: FLEET_READ twice, SIGN_KEY once); gwsign (AF08) reads and signs; TAG_KEY: tag and untag (AF42, on purpose: the deploy key that makes a tag is the one that removes it)
         for name, secrets in (('plan', ['FLEET_READ']), ('sign', ['SIGN_KEY']), ('gwsign', ['FLEET_READ', 'SIGN_KEY']),
                               ('kit', ['FLEET_READ', 'KIT_UPLOAD_KEY']),
                               ('tag', ['TAG_KEY']), ('floor', ['KIT_UPLOAD_KEY']), ('untag', ['TAG_KEY'])):
@@ -2871,7 +2872,7 @@ class Workflow(unittest.TestCase):
 
     def test_the_key_fingerprint_series_and_host_key_are_constants_of_the_file(self):
         env = dict(re.findall(r'(?m)^  ([A-Z_0-9]+): (.*)$', self.TEXT.split('\njobs:\n', 1)[0].split('\nenv:\n', 1)[1]))
-        self.assertEqual(set(env), {'KEY_SHA256', 'SERIES', 'KIT_HOST', 'FLEET_REPO', 'GH_HOSTKEY'})
+        self.assertEqual(set(env), {'KEY_SHA256', 'KEY_PUB', 'SERIES', 'KIT_HOST', 'FLEET_REPO', 'GH_HOSTKEY'})
         self.assertIsNotNone(fp.FPR.fullmatch(env['KEY_SHA256']))
         test_key = 'SHA256:16jB0ih9afmAW7rFmgTJVtarDgEv4w/DHA8LKufWhKM'  # T, keygen run 38032458890
         # the test key signs only the test series and the test series only the test key, so a release-series serial is
