@@ -87,7 +87,7 @@ refused as unlisted.
 
 Actions, then `install`, then Run workflow on the `release` branch (the only ref the jobs accept) with `serial` and
 `min_serial` (the lowest serial this publish may carry, normally the previous release's); `mode` pubkey only prints the
-signing key's public line and fingerprint, `mode` floor runs only the floor job and `mode` untag only the three untag jobs (both below). Seven jobs run in order:
+signing key's public line and fingerprint, `mode` floor runs only the floor job, `mode` untag only the three untag jobs and `mode` pins only the four pins jobs (all below). Seven jobs run in order:
 
 - **plan** (Environment `release`, read-only deploy key `FLEET_READ` on the fleet repository, held in `/dev/shm` and wiped
   by a trap on every path) reads the folder from the fleet `release` tip as git blobs, never a checkout. It refuses unless the folder is exactly the files above as plain files, the
@@ -350,6 +350,40 @@ refused (`fetch`) and never touched.
 `vendor/pin-summary.sha256`; `tests/test_pins_plan.py` holds the fleet's own digest as a literal (so a change to the vendored copy needs a visible edit there)
 and compares its tables with the fleet's copy when `FLEET_REPO` names a clone.
 
+## The control VM's pin files: mode pins (CV05c, D342)
+
+`mode` pins signs the five files the control VM's root reads from the fleet's `main` (`fleet/hosts.json` and
+`fleet/core/{gateway,work-pin,deploy-pin,proven}.json`), taken from the fleet `release` tip, with the key `KEY_SHA256` names, under the
+namespace `mirrorstack-fleet-ctl`. It needs no `serial` and no other job runs in it (a test reads `if:` and `needs:` of every job and fails
+if one could). A carrier's `deploy-pin.json` is public and signed under `mirrorstack-fleet-pin`; with one namespace for both, a copy of
+that pair would pass as root's own pin, so root verifies `ctl` (CV05e) and the carrier files stay on `pin`. Run it on the `release` branch,
+after the fleet's main to release merge and before the land PR (fleet repository, CV05f):
+
+- **pins-plan** (Environment `release`, `FLEET_READ` only; the signing key is not in this job): clones the fleet repository, runs
+  `bin/fleet-pins-plan.py` (the plan above) over the `release` tip, prints the tip, and hands on the tip, the deploy head, the series and
+  the five lines `path sha256 serial action`. `KEY_PUB`, the public line of the signing key, is a constant of the workflow beside
+  `KEY_SHA256`: the plan refuses `key-pub` unless its fingerprint is `KEY_SHA256` (it only judges the signatures already at the tip, so
+  a change of key changes both in one reviewed edit).
+- **pins-approve** (Environment `kit-floor`, no secret): runs only when `SERIES` is `release` (read from the plan, so the test series has no owner step),
+  prints the tip, each file's serial, sha256 and action and the deploy head, and waits for the owner. `pins-sign` needs it in the release series
+  (attack M4: the main to release PR of some 400 commits shows no per-pin diff). While `kit-floor` has no required reviewer nothing stops
+  it: do not rely on it.
+- **pins-sign** (Environment `release`; two steps like `gwsign`; no checkout, no action, no repository code, no job token): `fetch` (`FLEET_READ`
+  only) refuses `tip-moved` unless the `release` tip is still the planned one, reads each `sign` file as a git blob of that tip (a regular file
+  of 1 to 1 MiB) and refuses on a sha256 that differs from the plan's; for `deploy-pin.json` it also refuses unless the head is `null` or an
+  ancestor of the tip (attack M2, a second look at what the plan judged). `sign` (`SIGN_KEY` only, no git, ssh or network child) refuses
+  `key` unless the key's fingerprint is `KEY_SHA256`, allows the namespace `mirrorstack-fleet-ctl` and no other, signs each file, verifies and
+  re-hashes it, and outputs the signatures (base64) and `pub=`. Every output is written after the last file is signed: a refusal hands on nothing.
+- **pins-publish** (no secret, `contents: read`): writes `pins-sigs.json` and uploads it as the artifact `pins-sigs`, kept one day:
+  `{tip, run, fingerprint, pub, entries[{path, sha256, serial, sig_b64}]}`, one entry per file this run signed (a `keep` file has none; its signature is
+  at the tip already). The run id is there for the land PR's body (attack minor 3).
+
+Nothing printed is a value (this repository is public): paths, serials, sha256 sums, the tip and a head. The signatures reach root through
+the fleet's `main` only: its ruleset lets CI write nothing, and a write credential into the fleet would be worth more than this key, so an admin
+session downloads `pins-sigs` and lands the `.sig` files in a PR (CV05f), which writes only `.sig` files and never a body. The proof of a first
+run is the line `signed with key SHA256:16jB0ih9afmAW7rFmgTJVtarDgEv4w/DHA8LKufWhKM` in `pins-sign` and an artifact that
+`ssh-keygen -Y verify -n mirrorstack-fleet-ctl` accepts over the file at the tip.
+
 ## Trust model
 
 - The script trusts only Ubuntu's signature on `SHA256SUMS`, made by the Ubuntu cloud-image signing key pinned in the
@@ -386,7 +420,7 @@ ref's workflow file). The real boundary is set in the repo, not in code:
   ```
 - Create the Environment `kit-floor`, restricted to the `release` branch, with the owner (or the team `security`) as required
   reviewer and admins unable to bypass, and no secret. It is the only gate on a floor run (`floor-approve`); `release` has no
-  reviewer, so a release run is unattended during the test phase.
+  reviewer, so a release run is unattended during the test phase. In the release series `pins-approve` waits here too (mode pins, below).
 - Rulesets: `release` takes pull requests from `main` only; the tags `install-*` only the `TAG_KEY` deploy key may create.
 - A ruleset on `main` that requires pull requests.
 - Settings, Releases, **Immutable releases** on.

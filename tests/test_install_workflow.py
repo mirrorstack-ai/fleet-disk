@@ -3,7 +3,9 @@ the baked key is signed by some job of the same workflow (the gap G-AUD-KIT-PIPE
 and signed by nobody), and that the `gwsign` job's two run: blocks do what they say, run for real under bash over a throwaway key
 and a local git repository, with tmpfs stood in by a temp dir and base64 -w0 and sha256sum by stand-ins where this machine lacks them.
 Its output is then handed to `fleet-kit-upload.py gateway --sig`, the verb the kit job runs. The signature tests are skipped
-when ssh-keygen or git is missing. Plain unittest, stdlib only."""
+when ssh-keygen or git is missing. The mode `pins` (CV05c, D342) is tested the same two ways: PinsStatic reads the four jobs off the text (who
+holds which secret, what runs in which mode, the ctl namespace only) and PinsRuns runs their run: blocks for real, plan to publish, over a
+local git repository standing in for the fleet and throwaway keys. Plain unittest, stdlib only."""
 from __future__ import annotations
 
 import base64
@@ -346,6 +348,596 @@ class GwsignRuns(unittest.TestCase):
         sig = self.tmp / 'gateway.json.sig'
         sig.write_bytes(base64.b64decode(out['gateway_sig']))
         self.assertEqual(self.kit_check(sig, record=RECORD), (0, 'OK gateway-check serial=3\n'))
+
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# mode pins (CV05c, D342): plan, approve, sign, publish
+
+CTL = 'mirrorstack-fleet-ctl'  # a literal on purpose: a changed namespace in the workflow must fail here
+PINS_JOBS = ['pins-plan', 'pins-approve', 'pins-sign', 'pins-publish']
+PIN_PATHS = ('fleet/hosts.json', 'fleet/core/gateway.json', 'fleet/core/work-pin.json', 'fleet/core/deploy-pin.json', 'fleet/core/proven.json')
+PINS_PLACE = {
+    'fleet/hosts.json': b'{"serial": 0, "hosts": []}\n',
+    'fleet/core/gateway.json': PLACEHOLDER,
+    'fleet/core/work-pin.json': b'{"serial": 0, "pins": [], "sub": null}\n',
+    'fleet/core/deploy-pin.json': b'{"serial": 0, "head": null}\n',
+    'fleet/core/proven.json': b'{"serial": 0, "digests": {}}\n'}
+
+
+def job_header(name: str) -> str:
+    return JOBS[name].split('    steps:')[0]
+
+
+def reachable(mode: str) -> set[str]:
+    """The jobs that can run in a dispatch of `mode`, from each job's `if:` and `needs:` read off the text. A tiny evaluator: the
+    ref is taken as release, a needed job that can run is taken as succeeded, a series output as unknown (true), and any other token
+    in an `if:` fails the test, so an expression this does not understand is never read as false."""
+    memo: dict[str, bool] = {}
+
+    def run(name: str) -> bool:
+        if name not in memo:
+            memo[name] = False
+            text = JOBS[name]
+            needs = re.search(r'(?m)^    needs: \[?([\w, -]+?)\]?$', text)
+            needs = [n.strip() for n in needs[1].split(',')] if needs else []
+            cond = re.search(r'(?m)^    if: (.*)$', text)[1].strip()
+            cond = cond[3:-2].strip() if cond.startswith('${{') else cond
+            status = any(w in cond for w in ('always()', '!cancelled()', 'failure()'))
+            if needs and not status and not all(run(n) for n in needs):
+                return False
+            py = re.sub(r"inputs\.mode == '(\w+)'", lambda m: str(m[1] == mode), cond)
+            py = re.sub(r"github\.ref == '[^']*'", 'True', py)
+            py = re.sub(r"needs\.([\w-]+)\.result == '(\w+)'", lambda m: str(run(m[1]) if m[2] == 'success' else not run(m[1])), py)
+            py = re.sub(r"needs\.[\w-]+\.outputs\.series == '\w+'", 'True', py)
+            py = py.replace('!cancelled()', 'True').replace('&&', ' and ').replace('||', ' or ')
+            assert re.fullmatch(r'[TrueFalsndo() ]+', py), f'{name}: the evaluator does not understand {cond!r} ({py!r})'
+            memo[name] = bool(eval(py))  # noqa: S307 - only True, False, and, or and brackets got through the check above
+        return memo[name]
+
+    return {name for name in JOBS if run(name)}
+
+
+class PinsStatic(unittest.TestCase):
+    """The four jobs of mode pins, read off the workflow text."""
+
+    def test_pins_is_a_choice_and_the_four_jobs_follow_the_old_ones_each_guarded_by_ref_and_mode(self):
+        self.assertRegex(TEXT, r'(?m)^        options: \[sign, pubkey, floor, untag, pins\]\n        default: sign\n')
+        self.assertEqual(list(JOBS)[-4:], PINS_JOBS)
+        for name in PINS_JOBS:
+            cond = re.search(r'(?m)^    if: (.*)$', job_header(name))[1]
+            self.assertIn("github.ref == 'refs/heads/release'", cond, name)
+            self.assertIn("inputs.mode == 'pins'", cond, name)
+        self.assertEqual({n: re.findall(r'(?m)^    environment: (\S+)$', JOBS[n]) for n in PINS_JOBS},
+                         {'pins-plan': ['release'], 'pins-approve': ['kit-floor'], 'pins-sign': ['release'], 'pins-publish': []})
+
+    def test_no_job_but_the_pins_jobs_is_reachable_in_mode_pins_and_no_pins_job_in_another_mode(self):
+        self.assertEqual(reachable('pins'), set(PINS_JOBS))
+        for mode in ('sign', 'pubkey', 'floor', 'untag'):
+            self.assertEqual(reachable(mode) & set(PINS_JOBS), set(), mode)
+        # the controls: the evaluator can say yes, and the old modes still reach their old jobs
+        self.assertEqual(reachable('pubkey'), {'sign'})
+        self.assertEqual(reachable('floor'), {'floor-approve', 'floor'})
+        self.assertEqual(reachable('untag'), {'untag-check', 'untag-approve', 'untag'})
+        self.assertEqual(reachable('sign'), set(JOBS) - set(PINS_JOBS) - {'floor-approve', 'floor', 'untag-check', 'untag-approve', 'untag'})
+
+    def test_pins_sign_waits_for_the_approval_in_a_release_series_run_and_skips_it_only_in_the_test_series(self):
+        cond = re.search(r'(?m)^    if: (.*)$', job_header('pins-sign'))[1]
+        self.assertIn("needs.pins-plan.result == 'success'", cond)
+        self.assertIn("(needs.pins-approve.result == 'success' || (needs.pins-approve.result == 'skipped' && needs.pins-plan.outputs.series == 'test'))", cond)
+        self.assertRegex(job_header('pins-sign'), r'(?m)^    needs: \[pins-plan, pins-approve\]$')
+        approve = re.search(r'(?m)^    if: (.*)$', job_header('pins-approve'))[1]
+        self.assertIn("needs.pins-plan.outputs.series == 'release'", approve)
+        self.assertRegex(job_header('pins-publish'), r'(?m)^    needs: \[pins-plan, pins-sign\]$')
+        self.assertNotIn('!cancelled()', re.search(r'(?m)^    if: (.*)$', job_header('pins-publish'))[1])  # a failed signer never reaches the upload
+
+    def test_pins_sign_runs_no_action_no_checkout_no_repository_code_and_holds_a_job_token_of_nothing(self):
+        job = JOBS['pins-sign']
+        for bad in ('uses:', 'checkout', 'python', 'RUNNER_WORKSPACE', 'GITHUB_WORKSPACE', 'github.token', 'bin/fleet', 'vendor/', '/tmp'):
+            self.assertNotIn(bad, job)
+        self.assertIn('    permissions: {}\n', job)
+        self.assertEqual(re.findall(r'secrets\.(\w+)', step('pins-sign', 'fetch')), ['FLEET_READ'])  # the fetch step reads the fleet, signs nothing
+        self.assertEqual(re.findall(r'secrets\.(\w+)', step('pins-sign', 'sign')), ['SIGN_KEY'])  # the sign step holds the key and no fleet access
+        for bad in ('git ', 'ssh ', 'curl', 'FLEET_READ', 'GIT_SSH_COMMAND'):
+            self.assertNotIn(bad, body('pins-sign', 'sign'), bad)
+
+    def test_pins_sign_signs_in_the_ctl_namespace_only_after_the_fingerprint_check(self):
+        sign = body('pins-sign', 'sign')
+        for need in ('/dev/shm/pinsign.', 'umask 077', 'shred -u', 'REFUSED key-not-set', 'set -euo pipefail', '[ "$fp" = "$KEY_SHA256" ] ||'):
+            self.assertIn(need, sign)
+        self.assertEqual(re.findall(r'namespaces="([^"]*)"', JOBS['pins-sign']), [CTL])
+        calls = [line for line in sign.splitlines() if '-Y ' in line]
+        self.assertEqual(len(calls), 2)   # the one -Y sign and the one -Y verify
+        for line in calls:
+            self.assertIn(f' -n {CTL} ', line)
+        self.assertEqual(sign.count('-Y sign'), 1)
+        self.assertEqual(sign.count('-Y verify'), 1)
+        self.assertNotIn('mirrorstack-fleet-pin', JOBS['pins-sign'])
+        self.assertNotIn('mirrorstack-fleet-install', JOBS['pins-sign'])
+        self.assertLess(sign.index('[ "$fp" = "$KEY_SHA256" ]'), sign.index('-Y sign'))
+        self.assertLess(sign.index('printf \'%s\\n\' "$SIGN_KEY"'), sign.index('-Y sign'))
+        self.assertIn('sha256sum "$d/body"', sign)
+
+    def test_pins_plan_holds_the_read_key_and_never_the_signing_key_and_the_others_hold_no_secret(self):
+        self.assertEqual(re.findall(r'secrets\.(\w+)', JOBS['pins-plan']), ['FLEET_READ'])
+        self.assertNotIn('SIGN_KEY', JOBS['pins-plan'])
+        for name in ('pins-approve', 'pins-publish'):
+            self.assertNotIn('secrets.', JOBS[name], name)
+            self.assertNotIn('SIGN_KEY', JOBS[name], name)
+        self.assertIn('    permissions: {}\n', JOBS['pins-approve'])
+        self.assertIn('    permissions:\n      contents: read\n', JOBS['pins-publish'])
+        self.assertIn('    permissions:\n      contents: read\n', JOBS['pins-plan'])
+        self.assertIn('/dev/shm/pinsplan.', body('pins-plan', 'plan'))
+        self.assertLess(body('pins-plan', 'plan').index("trap 'shred"), body('pins-plan', 'plan').index('"$FLEET_READ"'))  # trap before key
+        self.assertIn('"$d/pub"', body('pins-plan', 'plan'))  # the planner is given the public line only
+
+    def test_pins_publish_uploads_one_artifact_named_pins_sigs_for_a_day_with_the_pinned_action(self):
+        job = JOBS['pins-publish']
+        self.assertEqual(re.findall(r'uses: (\S+)', job), ['actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02'])
+        for need in ('name: pins-sigs', 'retention-days: 1', 'if-no-files-found: error', 'pins/pins-sigs.json'):
+            self.assertIn(need, job)
+        self.assertNotIn('checkout', job)
+
+    def test_the_readme_names_the_mode_its_four_jobs_the_artifact_and_the_namespace(self):
+        readme = (ROOT / 'README.md').read_text(encoding='utf-8')
+        section = readme.split("## The control VM's pin files: mode pins", 1)[1].split('\n## ', 1)[0]
+        for need in ('`mode` pins', '**pins-plan**', '**pins-approve**', '**pins-sign**', '**pins-publish**', CTL,
+                     '`pins-sigs`', '`KEY_PUB`', '`kit-floor`', 'land PR', 'CV05f', 'ssh-keygen -Y verify -n mirrorstack-fleet-ctl'):
+            self.assertIn(need, section)
+        self.assertIn('`mode` pins', readme.split('Seven jobs run in order', 1)[0])   # named where the modes are listed
+
+    def test_the_key_pub_constant_is_the_line_of_the_key_fingerprint(self):
+        env = dict(re.findall(r'(?m)^  ([A-Z_0-9]+): (.*)$', TEXT.split('\njobs:\n', 1)[0].split('\nenv:\n', 1)[1]))
+        self.assertEqual(env['KEY_SHA256'], 'SHA256:16jB0ih9afmAW7rFmgTJVtarDgEv4w/DHA8LKufWhKM')
+        if not HAVE_TOOLS:
+            self.skipTest('ssh-keygen is missing')
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, 'pub').write_text(env['KEY_PUB'] + '\n')
+            line = subprocess.run([fp.SSH_KEYGEN, '-l', '-f', f'{tmp}/pub'], capture_output=True, text=True, check=True).stdout.split()
+        self.assertEqual(line[1], env['KEY_SHA256'])
+
+
+def fake_output(path: Path) -> dict[str, str]:
+    """A GITHUB_OUTPUT file: `k=v` lines and `k<<DELIM` blocks."""
+    out, lines = {}, path.read_text().split('\n') if path.exists() else []
+    i = 0
+    while i < len(lines):
+        if '<<' in lines[i] and '=' not in lines[i].split('<<')[0]:
+            key, delim = lines[i].split('<<', 1)
+            j = lines.index(delim, i + 1)
+            out[key] = '\n'.join(lines[i + 1:j])
+            i = j
+        elif lines[i]:
+            k, v = lines[i].split('=', 1)
+            out[k] = v
+        i += 1
+    return out
+
+
+@unittest.skipUnless(HAVE_TOOLS, 'ssh-keygen or git is missing')
+class PinsRuns(unittest.TestCase):
+    """The run: blocks of the four pins jobs, run for real under bash over a local git repository standing in for the fleet."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.keys = Path(tempfile.mkdtemp(prefix='pins-test-keys-'))
+        cls.baked, cls.stranger = keygen(cls.keys, 'baked'), keygen(cls.keys, 'stranger')
+        cls.pin = fingerprint(cls.baked)
+        cls.pub = ' '.join((cls.keys / 'baked.pub').read_text().split()[:2])
+        cls.stranger_pub = ' '.join((cls.keys / 'stranger.pub').read_text().split()[:2])
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.keys, ignore_errors=True)
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='pins-test-'))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.shm, self.runner, self.bin, self.origin = (self.tmp / n for n in ('shm', 'runner', 'bin', 'origin'))
+        for folder in (self.shm, self.runner, self.bin, self.origin):
+            folder.mkdir()
+        (self.bin / 'base64').write_text('#!/bin/sh\nif [ "$1" = -w0 ]; then /usr/bin/base64 | tr -d "\\n"; else exec /usr/bin/base64 "$@"; fi\n')
+        sum_tool = '/usr/bin/shasum -a 256' if os.path.exists('/usr/bin/shasum') else '/usr/bin/sha256sum'
+        (self.bin / 'sha256sum').write_text(f'#!/bin/sh\nexec {sum_tool} "$@"\n')
+        (self.bin / 'python3').symlink_to(__import__('sys').executable)
+        for tool in ('base64', 'sha256sum'):
+            (self.bin / tool).chmod(0o755)
+        git(self.origin, 'init', '-q', '-b', 'main')
+        self.out, self.summary = self.runner / 'out', self.runner / 'summary'
+
+    # --- a fleet repository: main and release, the five files
+
+    def commit(self, files: dict[str, bytes | None] | None = None, branch: str = 'release', mode: str = 'file') -> str:
+        """Writes `files` (None removes) on top of the placeholders, commits on `branch`, returns its sha."""
+        git(self.origin, 'checkout', '-q', '-B', branch)
+        for path, data in {**PINS_PLACE, **(files or {})}.items():
+            target = self.origin / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.unlink(missing_ok=True)
+            if data is None:
+                continue
+            if mode == 'symlink' and path.endswith('gateway.json'):
+                target.symlink_to('elsewhere')
+            else:
+                target.write_bytes(data)
+                if mode == 'exec' and path.endswith('gateway.json'):
+                    target.chmod(0o755)
+        git(self.origin, 'add', '-A')
+        git(self.origin, 'commit', '-q', '--allow-empty', '-m', 'tip')
+        return git(self.origin, 'rev-parse', 'HEAD')
+
+    @staticmethod
+    def manifest(files: dict[str, bytes] | None = None, actions: dict[str, str] | None = None, serial: int = 0) -> str:
+        bodies = {**PINS_PLACE, **(files or {})}
+        return '\n'.join(f'{p} {sha(bodies[p])} {serial} {(actions or {}).get(p, "sign")}' for p in PIN_PATHS)
+
+    def run_step(self, job: str, step_id: str, env: dict[str, str], **kw):
+        script = body(job, step_id).replace('/dev/shm/', f'{self.shm}/')
+        base = {'PATH': f'{self.bin}:/usr/bin:/bin', 'HOME': str(self.tmp), 'RUNNER_TEMP': str(self.runner), 'GITHUB_OUTPUT': str(self.out),
+                'GITHUB_STEP_SUMMARY': str(self.summary), 'GITHUB_RUN_ID': '4242', 'SERIES': 'test', 'KEY_SHA256': self.pin, 'KEY_PUB': self.pub,
+                'GH_HOSTKEY': 'github.com ssh-ed25519 AAAA', 'FLEET_REPO': str(self.origin), **{k: v for k, v in GIT_ENV.items() if k.startswith('GIT_')}}
+        base.update(env)
+        done = subprocess.run(['/bin/bash', '-c', script], env=base, capture_output=True, text=True, cwd=kw.get('cwd', self.tmp))
+        self.assertEqual(list(self.shm.iterdir()), [], 'the key is gone on every path')
+        return done, fake_output(self.out)
+
+    def clear(self):
+        self.out.unlink(missing_ok=True)
+
+    # --- pins-plan, over the real planner
+
+    def plan(self, **over):
+        env = {'FLEET_READ': 'THROWAWAY-READ-KEY'}
+        env.update(over)
+        done, out = self.run_step('pins-plan', 'plan', env, cwd=ROOT)
+        self.assertNotIn('THROWAWAY-READ-KEY', done.stdout + done.stderr)
+        return done, out
+
+    def test_the_plan_step_runs_the_planner_and_outputs_the_tip_the_series_the_head_and_five_rows(self):
+        self.commit(branch='main')
+        tip = self.commit()
+        done, out = self.plan()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(set(out), {'tip', 'series', 'deploy_head', 'manifest'})
+        self.assertEqual((out['tip'], out['series'], out['deploy_head']), (tip, 'test', 'null'))
+        self.assertEqual(out['manifest'], self.manifest())   # all placeholders: nothing signed before, so all five sign at serial 0
+        self.assertIn(f'tip {tip}\n', done.stdout)   # the tip is printed
+        self.assertIn('## Control VM pins plan', self.summary.read_text())
+
+    def test_the_plan_step_refuses_a_key_line_of_another_key_a_series_that_is_neither_and_a_planner_refusal(self):
+        self.commit(branch='main')
+        self.commit()
+        for want, over in (('REFUSED key-pub', {'KEY_PUB': self.stranger_pub}), ('REFUSED series', {'SERIES': ''}), ('REFUSED series', {'SERIES': 'Release'})):
+            self.clear()
+            done, out = self.plan(**over)
+            self.assertEqual((done.returncode, out, done.stdout), (1, {}, want + '\n'), over)
+        self.commit({'fleet/hosts.json': b'{"serial": "x", "hosts": []}\n'})
+        done, out = self.plan()
+        self.assertEqual((done.returncode, out), (1, {}))
+        self.assertIn('REFUSED shape fleet/hosts.json', done.stdout + done.stderr)   # the planner's word reaches the log; nothing is output
+        self.assertNotIn('REFUSED manifest', done.stdout + done.stderr)   # and it is the planner's refusal that stops the step, not a later check
+
+    def test_the_plan_step_refuses_a_manifest_that_is_not_the_five_rows_in_order_whatever_the_planner_says(self):
+        """The step re-reads what the planner printed before it hands it on (a stand-in planner here, a real git clone for the head)."""
+        self.commit(branch='main')
+        tip = self.commit()
+        stub = self.tmp / 'stub'
+        (stub / 'bin').mkdir(parents=True)
+        (stub / 'bin/fleet-pins-plan.py').write_text(
+            'import os, subprocess, sys\n'
+            'if sys.argv[1] == "clone":\n    subprocess.run(["git", "clone", "-q", sys.argv[2], sys.argv[3]], check=True)\n'
+            'else:\n    sys.stdout.write(open(os.environ["STUB_MANIFEST"]).read())\n')
+        rows = self.manifest().split('\n')
+        head = f'tip {tip}\nrun 4242\n'
+        cases = {'rows swapped': [rows[1], rows[0], *rows[2:]], 'a sixth row': rows + [rows[0]], 'four rows': rows[:4],
+                 'a path of another file': [rows[0].replace('hosts', 'other'), *rows[1:]], 'a short sha': [rows[0].replace(sha(PINS_PLACE[PIN_PATHS[0]]), 'ab'), *rows[1:]],
+                 'an unknown action': [rows[0].replace(' sign', ' maybe'), *rows[1:]], 'a field more': [rows[0] + ' x', *rows[1:]]}
+        for what, lines in [('control: the five rows', rows), *cases.items()]:
+            with self.subTest(what):
+                self.clear()
+                shutil.rmtree(self.runner / 'fleet', ignore_errors=True)
+                (self.tmp / 'm').write_text(head + '\n'.join(lines) + '\n')
+                script = body('pins-plan', 'plan').replace('/dev/shm/', f'{self.shm}/')
+                env = {'PATH': f'{self.bin}:/usr/bin:/bin', 'HOME': str(self.tmp), 'RUNNER_TEMP': str(self.runner), 'GITHUB_OUTPUT': str(self.out),
+                       'GITHUB_STEP_SUMMARY': str(self.summary), 'GITHUB_RUN_ID': '4242', 'SERIES': 'test', 'KEY_SHA256': self.pin, 'KEY_PUB': self.pub,
+                       'GH_HOSTKEY': 'x', 'FLEET_REPO': str(self.origin), 'FLEET_READ': 'K', 'STUB_MANIFEST': str(self.tmp / 'm'),
+                       **{k: v for k, v in GIT_ENV.items() if k.startswith('GIT_')}}
+                done = subprocess.run(['/bin/bash', '-c', script], env=env, capture_output=True, text=True, cwd=stub)
+                if what.startswith('control'):
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                else:
+                    self.assertEqual((done.returncode, fake_output(self.out), done.stdout), (1, {}, 'REFUSED manifest\n'))
+
+    # --- pins-approve
+
+    def approve(self, **over):
+        env = {'TIP': 'a' * 40, 'MANIFEST': self.manifest(), 'DEPLOY_HEAD': 'null'}
+        env.update(over)
+        return self.run_step('pins-approve', 'approve', env)[0]
+
+    def test_the_approve_step_prints_each_file_with_serial_sha256_action_and_the_deploy_head(self):
+        done = self.approve(DEPLOY_HEAD='b' * 40)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, f'approved: sign the control VM pins at fleet release tip {"a" * 40}\n{self.manifest()}\ndeploy-pin head: {"b" * 40}\n')
+
+    def test_the_approve_step_refuses_a_manifest_tip_or_head_that_is_not_what_the_plan_prints(self):
+        good = self.manifest().split('\n')
+        bad = {'a missing row': '\n'.join(good[:4]), 'an extra row': '\n'.join(good + [good[0]]), 'rows out of order': '\n'.join([good[1], good[0], *good[2:]]),
+               'a short sha': good[0].replace(sha(PINS_PLACE[PIN_PATHS[0]]), 'ab') + '\n' + '\n'.join(good[1:]),
+               'a field more': good[0] + ' x\n' + '\n'.join(good[1:]), 'an unknown action': good[0].replace(' sign', ' maybe') + '\n' + '\n'.join(good[1:]),
+               'an empty one': '', 'a workflow command': '::add-mask::x\n' + '\n'.join(good[1:]), 'a leading zero serial': good[0].replace(' 0 ', ' 01 ') + '\n' + '\n'.join(good[1:])}
+        for what, text in bad.items():
+            with self.subTest(what):
+                done = self.approve(MANIFEST=text)
+                self.assertEqual((done.returncode, done.stdout), (1, 'REFUSED manifest\n'))
+        for over, want in (({'TIP': 'a' * 12}, 'REFUSED tip'), ({'TIP': 'A' * 40}, 'REFUSED tip'), ({'DEPLOY_HEAD': 'main'}, 'REFUSED head'), ({'DEPLOY_HEAD': ''}, 'REFUSED head')):
+            done = self.approve(**over)
+            self.assertEqual((done.returncode, done.stdout), (1, want + '\n'), over)
+
+    # --- pins-sign, fetch
+
+    @property
+    def signdir(self) -> Path:
+        return self.runner / 'pinsign'
+
+    def fetch(self, tip: str, manifest: str | None = None, **over):
+        shutil.rmtree(self.signdir, ignore_errors=True)   # a runner starts without the folder; one that is there is refused (mkdir)
+        env = {'FLEET_READ': 'THROWAWAY-READ-KEY', 'TIP': tip, 'MANIFEST': self.manifest() if manifest is None else manifest}
+        env.update(over)
+        done, out = self.run_step('pins-sign', 'fetch', env)
+        self.assertNotIn('THROWAWAY-READ-KEY', done.stdout + done.stderr)
+        return done
+
+    def test_the_fetch_step_keeps_the_planned_files_by_row_number_and_prints_no_value(self):
+        hosts = b'{"serial": 4, "hosts": [{"id": "HOST-ID-WORD", "owner": "OWNER-WORD"}]}\n'
+        tip = self.commit({'fleet/hosts.json': hosts})
+        done = self.fetch(tip, self.manifest({'fleet/hosts.json': hosts}, {'fleet/core/proven.json': 'keep'}, serial=4))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(sorted(p.name for p in self.signdir.iterdir()), ['1', '2', '3', '4'])   # the keep row (proven.json, row 5) is not read
+        self.assertEqual((self.signdir / '1').read_bytes(), hosts)
+        for word in ('HOST-ID-WORD', 'OWNER-WORD'):
+            self.assertNotIn(word, done.stdout + done.stderr)
+        self.assertEqual(done.stdout.count('planned fleet/'), 4)
+
+    def test_the_fetch_step_refuses_a_tip_that_moved_and_a_body_that_is_not_the_planned_one_and_keeps_nothing(self):
+        old = self.commit()
+        new = self.commit({'fleet/core/work-pin.json': b'{"serial": 1, "pins": [], "sub": null}\n'})
+        done = self.fetch(old)
+        self.assertEqual((done.returncode, done.stdout), (1, 'REFUSED tip-moved\n'))
+        self.assertFalse(self.signdir.exists())
+        done = self.fetch(new)   # the plan judged the placeholder work-pin; the tip holds another body
+        self.assertEqual(done.returncode, 1)
+        self.assertTrue(done.stdout.endswith('REFUSED hash fleet/core/work-pin.json\n'), done.stdout)
+        self.assertFalse(self.signdir.exists())   # a refused run leaves no file behind
+
+    def test_the_fetch_step_refuses_a_file_that_is_missing_empty_over_the_cap_a_link_or_executable(self):
+        for what, files, mode in (('missing', {'fleet/core/gateway.json': None}, 'file'), ('empty', {'fleet/core/gateway.json': b''}, 'file'),
+                                  ('over the cap', {'fleet/core/gateway.json': b'x' * (1 << 20 | 1)}, 'file'), ('a symlink', {}, 'symlink'), ('executable', {}, 'exec')):
+            with self.subTest(what):
+                tip = self.commit(files, mode=mode)
+                done = self.fetch(tip, self.manifest(files and {k: v for k, v in files.items() if v is not None}))
+                self.assertEqual((done.returncode, done.stdout.splitlines()[-1]), (1, 'REFUSED pins fleet/core/gateway.json'))
+                self.assertFalse(self.signdir.exists())
+
+    def test_the_fetch_step_refuses_a_tip_or_a_manifest_that_is_malformed_before_it_reads_anything(self):
+        tip = self.commit()
+        for bad in ('', tip[:12], tip.upper(), 'release', '$(id)'):
+            done = self.fetch(bad)
+            self.assertEqual((done.returncode, done.stdout), (1, 'REFUSED pins tip\n'), bad)
+        good = self.manifest().split('\n')
+        for what, text in (('four rows', '\n'.join(good[:4])), ('a path swapped', good[0].replace('hosts', 'other') + '\n' + '\n'.join(good[1:])),
+                           ('a traversal', good[0].replace('fleet/hosts.json', '../x') + '\n' + '\n'.join(good[1:]))):
+            done = self.fetch(tip, text)
+            self.assertEqual((done.returncode, done.stdout), (1, 'REFUSED manifest\n'), what)
+        self.assertFalse(self.signdir.exists())
+
+    def test_the_fetch_step_checks_a_deploy_head_is_an_ancestor_of_the_tip_and_takes_null(self):
+        base = self.commit()
+        side = self.commit(branch='side')   # a commit the release branch never carried
+        git(self.origin, 'checkout', '-q', 'release')
+        for what, head, ok in (('an ancestor', base, True), ('a commit off the release branch', side, False), ('null', None, True)):
+            with self.subTest(what):
+                body_ = (b'{"serial": 1, "head": null}\n' if head is None else
+                         json.dumps({'serial': 1, 'head': head, 'tree': 'c' * 40}).encode() + b'\n')
+                tip = self.commit({'fleet/core/deploy-pin.json': body_}, branch='release')
+                done = self.fetch(tip, self.manifest({'fleet/core/deploy-pin.json': body_}, serial=1))
+                self.assertEqual(done.returncode == 0, ok, done.stdout + done.stderr)
+                if not ok:
+                    self.assertEqual(done.stdout.splitlines()[-1], 'REFUSED head')
+                    self.assertFalse(self.signdir.exists())
+        # a keep row is never read, so its head is not judged here
+        done = self.fetch(tip, self.manifest({'fleet/core/deploy-pin.json': body_}, {'fleet/core/deploy-pin.json': 'keep'}, serial=1))
+        self.assertEqual(done.returncode, 0)
+        # a body that does not name its head the one way this reads it is refused, not guessed at
+        for what, odd in (('no head', b'{"serial": 1}\n'), ('two heads', b'{"head": null, "serial": 1, "x": {"head": null}}\n'),
+                          ('a short head', b'{"serial": 1, "head": "abc"}\n')):
+            tip = self.commit({'fleet/core/deploy-pin.json': odd}, branch='release')
+            done = self.fetch(tip, self.manifest({'fleet/core/deploy-pin.json': odd}, serial=1))
+            self.assertEqual((done.returncode, done.stdout.splitlines()[-1]), (1, 'REFUSED head'), what)
+
+    # --- pins-sign, sign
+
+    def place(self, files: dict[str, bytes] | None = None, rows: tuple[int, ...] = (1, 2, 3, 4, 5)) -> dict[str, bytes]:
+        bodies = {**PINS_PLACE, **(files or {})}
+        self.signdir.mkdir(exist_ok=True)
+        for i in rows:
+            (self.signdir / str(i)).write_bytes(bodies[PIN_PATHS[i - 1]])
+        return bodies
+
+    def sign(self, key: Path | None = None, manifest: str | None = None, **over):
+        key = key or self.baked
+        env = {'SIGN_KEY': key.read_text(), 'MANIFEST': self.manifest() if manifest is None else manifest}
+        env.update(over)
+        done, out = self.run_step('pins-sign', 'sign', env)
+        secret = key.read_text().splitlines()[1]
+        self.assertNotIn(secret, done.stdout + done.stderr + (self.out.read_text() if self.out.exists() else ''))
+        return done, out
+
+    def verifies(self, data: bytes, sig_b64: str, namespace: str, pub: str | None = None) -> bool:
+        sig, allowed = self.tmp / 'x.sig', self.tmp / 'allowed'
+        sig.write_bytes(base64.b64decode(sig_b64))
+        allowed.write_text(f'owner namespaces="{namespace}" {pub or self.pub}\n')
+        return subprocess.run([fp.SSH_KEYGEN, '-Y', 'verify', '-f', str(allowed), '-I', 'owner', '-n', namespace, '-s', str(sig)],
+                              input=data, capture_output=True).returncode == 0
+
+    def test_the_sign_step_signs_each_planned_file_in_the_ctl_namespace_and_in_no_other(self):
+        bodies = self.place()
+        done, out = self.sign()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(set(out), {'hosts_sig', 'gateway_sig', 'work_pin_sig', 'deploy_pin_sig', 'proven_sig', 'pub', 'fp'})
+        self.assertEqual((out['pub'], out['fp']), (self.pub, self.pin))
+        for name, path in zip(('hosts', 'gateway', 'work_pin', 'deploy_pin', 'proven'), PIN_PATHS):
+            with self.subTest(path):
+                self.assertTrue(self.verifies(bodies[path], out[f'{name}_sig'], CTL))
+                for other in (fp.PIN_NS, fp.NS):   # a carrier's namespace never takes it, nor the install one
+                    self.assertFalse(self.verifies(bodies[path], out[f'{name}_sig'], other), other)
+                self.assertFalse(self.verifies(bodies[path] + b' ', out[f'{name}_sig'], CTL))   # another body is not covered
+        self.assertEqual(done.stdout.count('signed fleet/'), 5)
+        self.assertTrue(done.stdout.endswith(f'signed with key {self.pin}\n'))
+        self.assertFalse(self.signdir.exists())   # the copies go with the key
+
+    def test_the_sign_step_signs_only_the_sign_rows_and_a_keep_row_gets_no_signature(self):
+        self.place(rows=(1, 3))
+        self.clear()
+        done, out = self.sign(manifest=self.manifest(actions={p: 'keep' for p in PIN_PATHS if p not in (PIN_PATHS[0], PIN_PATHS[2])}))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(set(out), {'hosts_sig', 'work_pin_sig', 'pub', 'fp'})
+        self.clear()
+        self.assertEqual(self.sign(manifest=self.manifest(actions={p: 'keep' for p in PIN_PATHS}))[1], {'pub': self.pub, 'fp': self.pin})   # nothing to sign: the key is still proved
+
+    def test_the_sign_step_with_another_key_or_no_pinned_fingerprint_signs_nothing(self):
+        for want, over in (('REFUSED key', {'key': self.stranger}), ('REFUSED key-not-set', {'KEY_SHA256': 'SHA256:NOT-SET-fill-in-after-keygen'})):
+            self.place()
+            done, out = self.sign(**over)
+            self.assertEqual((done.returncode, out, done.stdout), (1, {}, want + '\n'), over)
+            self.assertFalse(self.signdir.exists())
+        self.place()
+        done, out = self.sign(SIGN_KEY='not a key\n')
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(out, {})
+
+    def test_the_sign_step_refuses_a_file_that_is_not_the_planned_one_or_not_a_plain_file(self):
+        self.place({'fleet/core/work-pin.json': b'{"serial": 0, "pins": [{}], "sub": null}\n'})
+        done, out = self.sign()
+        self.assertEqual((done.returncode, out, done.stdout.splitlines()[-1]), (1, {}, 'REFUSED hash fleet/core/work-pin.json'))
+        self.place(rows=(1, 2, 3, 5))   # row 4 missing
+        done, out = self.sign()
+        self.assertEqual((done.returncode, done.stdout.splitlines()[-1]), (1, 'REFUSED pins fleet/core/deploy-pin.json'))
+        self.place(rows=(1, 2, 3, 5))
+        (self.tmp / 'elsewhere').write_bytes(PINS_PLACE[PIN_PATHS[3]])   # a link to a file that exists and holds the planned bytes: only the link test refuses it
+        (self.signdir / '4').symlink_to(self.tmp / 'elsewhere')
+        done, out = self.sign()
+        self.assertEqual((done.returncode, done.stdout.splitlines()[-1]), (1, 'REFUSED pins fleet/core/deploy-pin.json'))
+        self.assertEqual(self.sign(manifest='x')[0].stdout, 'REFUSED manifest\n')
+        self.assertEqual(self.sign(manifest=self.manifest().replace(' sign', ' maybe', 1))[0].stdout, 'REFUSED manifest\n')
+
+    def test_a_verify_that_fails_stops_the_sign_step_before_a_signature_is_handed_on(self):
+        self.place()
+        shim = self.tmp / 'ssh-keygen-shim'
+        shim.write_text(f'#!/bin/sh\ncase "$*" in *"-Y verify"*) exit 1;; esac\nexec {fp.SSH_KEYGEN} "$@"\n')
+        shim.chmod(0o755)
+        script = body('pins-sign', 'sign').replace('/usr/bin/ssh-keygen', str(shim)).replace('/dev/shm/', f'{self.shm}/')
+        self.assertEqual(script.count(str(shim)), 4)   # -l, -y, -Y sign, -Y verify
+        env = {'PATH': f'{self.bin}:/usr/bin:/bin', 'HOME': str(self.tmp), 'RUNNER_TEMP': str(self.runner), 'GITHUB_OUTPUT': str(self.out), 'SERIES': 'test',
+               'KEY_SHA256': self.pin, 'SIGN_KEY': self.baked.read_text(), 'MANIFEST': self.manifest()}
+        done = subprocess.run(['/bin/bash', '-c', script], env=env, capture_output=True, text=True, cwd=self.tmp)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(fake_output(self.out), {})
+        self.assertEqual(list(self.shm.iterdir()), [])
+        shim.write_text(f'#!/bin/sh\nexec {fp.SSH_KEYGEN} "$@"\n')   # control: the shim passing -Y verify through lets it finish
+        self.place()
+        done = subprocess.run(['/bin/bash', '-c', script], env=env, capture_output=True, text=True, cwd=self.tmp)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    # --- pins-publish
+
+    def publish(self, signed: dict[str, str] | None = None, **over):
+        signed = signed if signed is not None else {}
+        env = {'TIP': 'a' * 40, 'MANIFEST': self.manifest(), 'PUB': self.pub, 'FP': self.pin,
+               **{f'SIG_{i}': signed.get(path, '') for i, path in enumerate(PIN_PATHS, 1)}}
+        env.update(over)
+        return self.run_step('pins-publish', 'publish', env)[0]
+
+    def real_sigs(self) -> dict[str, str]:
+        self.place()
+        done, out = self.sign()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.clear()
+        return {path: out[f'{n}_sig'] for n, path in zip(('hosts', 'gateway', 'work_pin', 'deploy_pin', 'proven'), PIN_PATHS)}
+
+    @property
+    def sigs_file(self) -> Path:
+        return self.runner / 'pins/pins-sigs.json'
+
+    def test_the_publish_step_writes_pins_sigs_json_of_tip_run_fingerprint_pub_and_the_signed_entries(self):
+        sigs = self.real_sigs()
+        done = self.publish(sigs, TIP='d' * 40)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        doc = json.loads(self.sigs_file.read_text())
+        self.assertEqual(set(doc), {'tip', 'run', 'fingerprint', 'pub', 'entries'})
+        self.assertEqual((doc['tip'], doc['run'], doc['fingerprint'], doc['pub']), ('d' * 40, '4242', self.pin, self.pub))
+        self.assertEqual(doc['entries'], [{'path': p, 'sha256': sha(PINS_PLACE[p]), 'serial': 0, 'sig_b64': sigs[p]} for p in PIN_PATHS])
+        self.assertEqual(sorted(path.name for path in self.sigs_file.parent.iterdir()), ['pins-sigs.json'])   # the key line file is not left for the upload
+        for entry in doc['entries']:   # what the land tool checks: the signature is the key's, in the ctl namespace, over those bytes
+            self.assertTrue(self.verifies(PINS_PLACE[entry['path']], entry['sig_b64'], CTL, doc['pub']))
+        # a keep row has no entry and no signature
+        self.runner.joinpath('pins').rename(self.tmp / 'moved')
+        done = self.publish({PIN_PATHS[0]: sigs[PIN_PATHS[0]]}, MANIFEST=self.manifest(actions={p: 'keep' for p in PIN_PATHS[1:]}))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual([e['path'] for e in json.loads(self.sigs_file.read_text())['entries']], [PIN_PATHS[0]])
+
+    def test_the_publish_step_refuses_a_signature_that_is_missing_not_base64_not_an_ssh_signature_or_on_a_keep_row(self):
+        sigs = self.real_sigs()
+        cases = {'a missing signature': {**sigs, PIN_PATHS[1]: ''}, 'not base64': {**sigs, PIN_PATHS[1]: 'not base64!'},
+                 'not an ssh signature': {**sigs, PIN_PATHS[1]: base64.b64encode(b'hello').decode()},
+                 'over 4 KiB': {**sigs, PIN_PATHS[1]: base64.b64encode(b'-----BEGIN SSH SIGNATURE-----' + b'x' * 4100).decode()}}
+        for what, signed in cases.items():
+            with self.subTest(what):
+                shutil.rmtree(self.runner / 'pins', ignore_errors=True)
+                done = self.publish(signed)
+                self.assertEqual(done.returncode, 1)
+                self.assertTrue(done.stderr.strip().startswith('REFUSED sig'), done.stderr)
+                self.assertFalse(self.sigs_file.exists())
+        shutil.rmtree(self.runner / 'pins', ignore_errors=True)
+        done = self.publish(sigs, MANIFEST=self.manifest(actions={PIN_PATHS[2]: 'keep'}))   # a signature for a row the plan kept
+        self.assertEqual((done.returncode, done.stderr.strip()), (1, f'REFUSED sig {PIN_PATHS[2]}'))
+
+    def test_the_publish_step_refuses_a_key_that_is_not_the_pinned_one_or_a_manifest_or_tip_that_is_malformed(self):
+        sigs = self.real_sigs()
+        for what, over in (('another fingerprint', {'FP': 'SHA256:' + 'A' * 43}), ('a pub of another key', {'PUB': self.stranger_pub}),
+                           ('a consistent pair of another key', {'PUB': self.stranger_pub, 'FP': fingerprint(self.stranger)}),
+                           ('a pub that is not one line', {'PUB': self.pub + '\nx'}), ('a short tip', {'TIP': 'a' * 12}),
+                           ('a manifest of four rows', {'MANIFEST': '\n'.join(self.manifest().split('\n')[:4])})):
+            with self.subTest(what):
+                shutil.rmtree(self.runner / 'pins', ignore_errors=True)
+                done = self.publish(sigs, **over)
+                self.assertEqual(done.returncode, 1, done.stdout)
+                self.assertFalse(self.sigs_file.exists())
+
+    # --- plan to publish in a row, the whole of mode pins over one fleet
+
+    def test_the_four_jobs_in_a_row_over_one_fleet_make_signatures_a_root_verifies_in_the_ctl_namespace(self):
+        self.commit(branch='main')
+        tip = self.commit()
+        done, planned = self.plan()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.clear()
+        self.assertEqual(self.approve(TIP=planned['tip'], MANIFEST=planned['manifest'], DEPLOY_HEAD=planned['deploy_head']).returncode, 0)
+        done = self.fetch(planned['tip'], planned['manifest'])
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        done, signed = self.sign(manifest=planned['manifest'])
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.clear()
+        done = self.run_step('pins-publish', 'publish', {'TIP': tip, 'MANIFEST': planned['manifest'], 'PUB': signed['pub'], 'FP': signed['fp'],
+                                                         **{f'SIG_{i}': signed[f'{n}_sig'] for i, n in enumerate(('hosts', 'gateway', 'work_pin', 'deploy_pin', 'proven'), 1)}})[0]
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        doc = json.loads(self.sigs_file.read_text())
+        self.assertEqual((doc['tip'], doc['fingerprint']), (tip, self.pin))
+        for entry in doc['entries']:
+            data = subprocess.run([fp.GIT, '-C', str(self.origin), 'show', f'{tip}:{entry["path"]}'], env=GIT_ENV, capture_output=True, check=True).stdout
+            self.assertEqual(sha(data), entry['sha256'])
+            self.assertTrue(self.verifies(data, entry['sig_b64'], CTL, doc['pub']), entry['path'])
+            self.assertFalse(self.verifies(data, entry['sig_b64'], fp.PIN_NS, doc['pub']), entry['path'])
 
 
 if __name__ == '__main__':
