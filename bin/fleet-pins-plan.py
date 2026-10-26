@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """fleet-pins-plan.py (CV05b, D342): judge the control VM's five pin files at the fleet `release` tip before CI signs them.
 
-  fleet-pins-plan.py plan --repo DIR --pub FILE [--release REF] [--main REF] [--tip SHA] [--run-id ID]
+  fleet-pins-plan.py plan --repo DIR --pub FILE [--release REF] [--main REF] [--tip SHA] [--run-id ID] [--only PATH]
   fleet-pins-plan.py clone URL DIR      (a blob:none clone, else a full one)
 
 Per file the plan prints `path sha256 serial action` on stdout after `tip <sha>` and `run <id>` lines: `keep` when the tip's
@@ -11,7 +11,8 @@ unless the bytes are the previous body's very bytes, and a `keep` needs a serial
 older signed pair). A refusal is `REFUSED <word> <path>` on stderr and exit 1, no manifest:
 shape size serial head tree blob tip-moved unread vendor pub fetch. Stdlib and git only: fleet code is never imported, so the
 plan cannot judge itself. fleet-disk is PUBLIC, so nothing printed is a value (attack M3): a path, serials, a sha256, key
-names, and the hosts' key fingerprints (M5); the review lines go to stderr with a leading `#`."""
+names, and the hosts' key fingerprints (M5); the review lines go to stderr with a leading `#`. `--only PATH` (one of the five) judges
+and prints that file's row alone (CV05d: install.yml's `plan` job runs it on gateway.json before gwsign signs the kit host's copy)."""
 from __future__ import annotations
 
 import base64
@@ -327,15 +328,16 @@ def main(argv: list[str]) -> int:
             print(f'clone {clone(argv[2], argv[3])}')
             return 0
         opts = dict(zip(argv[2::2], argv[3::2]))
-        want = {'--repo', '--pub', '--release', '--main', '--tip', '--run-id'}
+        want = {'--repo', '--pub', '--release', '--main', '--tip', '--run-id', '--only'}
         run_id = opts.get('--run-id', os.environ.get('GITHUB_RUN_ID', 'local'))
         if argv[1:2] != ['plan'] or len(argv) % 2 or not opts.keys() <= want or not {'--repo', '--pub'} <= opts.keys() \
-                or not re.fullmatch('[0-9A-Za-z._-]{1,32}', run_id) or not re.fullmatch('[0-9a-f]{40}', opts.get('--tip', '0' * 40)):
+                or not re.fullmatch('[0-9A-Za-z._-]{1,32}', run_id) or not re.fullmatch('[0-9a-f]{40}', opts.get('--tip', '0' * 40)) \
+                or opts.get('--only', FILES[0]) not in FILES:
             print(__doc__.split('\n\n')[1], file=sys.stderr)
             return 2
         plan = Plan(opts['--repo'], signers_line(opts['--pub']), opts.get('--release', 'origin/release'),
                     opts.get('--main', 'origin/main'), opts.get('--tip'))
-        rows = [(p, *plan.file(p)) for p in FILES]
+        rows = [(p, *plan.file(p)) for p in FILES if opts.get('--only', p) == p]
     except Refused as e:
         print(f'REFUSED {e.word} {e.path}', file=sys.stderr)
         return 1

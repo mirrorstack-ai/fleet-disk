@@ -388,6 +388,37 @@ class Plans(unittest.TestCase):
             self.assertNotIn(value, out + err)
         self.assertIn('changed: address cert_sha256 manifest_key next r9_closed serial session_key', err)
 
+    # ---- --only (CV05d: install.yml's plan job judges gateway.json alone before gwsign signs it)
+
+    def test_only_judges_and_prints_the_one_file_and_the_other_four_are_not_read(self):
+        self.with_body(HOSTS, b'{"serial": "x", "hosts": []}\n')   # a bad file the one-file plan must not look at
+        self.refused('shape', HOSTS)   # control: the whole plan stops on it
+        code, out, err = self.plan('--only', GATEWAY)
+        self.assertEqual(code, 0)
+        self.assertEqual(err.count('\n'), 1)   # the review line of this file alone
+        self.assertTrue(err.startswith(f'# {GATEWAY} sha256='), err)
+        self.assertEqual(out.splitlines()[:2], [f'tip {self.git("rev-parse", "release")}', 'run 77'])
+        self.assertEqual(self.rows(out), {GATEWAY: ('0', 'sign')})
+        self.assertEqual(len(out.splitlines()), 3)
+
+    def test_only_refuses_the_files_own_faults_with_the_same_words(self):
+        key = f'ssh-ed25519 {self.publine}'
+        live = {'serial': 3, 'address': '203.0.113.9', 'cert_sha256': 'ab' * 32, 'manifest_key': key, 'session_key': key,
+                'next': None, 'r9_closed': False}
+        self.with_body(GATEWAY, J({k: v for k, v in live.items() if k != 'r9_closed'}))   # wrong keys
+        self.refused('shape', GATEWAY, '--only', GATEWAY)
+        self.sign_set({GATEWAY: J({**live, 'serial': 5})})
+        self.with_body(GATEWAY, J(live))   # serial not above the previous signed one
+        self.refused('serial', GATEWAY, '--only', GATEWAY)
+        self.with_body(GATEWAY, J({**live, 'serial': 6}))
+        code, out, _ = self.plan('--only', GATEWAY)
+        self.assertEqual((code, self.rows(out)), (0, {GATEWAY: ('6', 'sign')}))
+
+    def test_only_names_one_of_the_five_files_and_nothing_else(self):
+        for argv in (['--only', 'fleet/core/other.json'], ['--only', ''], ['--only', '../' + GATEWAY], ['--only']):
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(pp.main(['p', 'plan', '--repo', str(self.repo), '--pub', self.pub, *argv]), 2, argv)
+
     # ---- usage and the clone fallback
 
     def test_a_bad_command_line_is_usage_and_a_bad_key_is_refused(self):

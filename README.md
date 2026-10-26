@@ -115,10 +115,17 @@ signing key's public line and fingerprint, `mode` floor runs only the floor job,
 - **kit** (Environment `release`, secrets `FLEET_READ` and `KIT_UPLOAD_KEY` and nothing else) runs `bin/fleet-kit-upload.py`
   three times: `gateway --check` judges the gateway pair at the fleet `release` tip before anything is stored (no upload, so a
   bad pair leaves no bundle behind on the write-once host), `bundle` rebuilds the tar from the fleet commit `install.json`
-  names and uploads it, `gateway` reads the gateway record and its signature from the tip again, checks the owner's signature
-  and uploads the pair, or, while no gateway is live (the placeholder record: serial 0, address null, and no `.sig` beside it),
+  names and uploads it, `gateway` reads the gateway record from the tip again, takes the signature from `--sig` (the one the job
+  `gwsign` made, in both series; the tip's own `gateway.json.sig` is never read, CV05d), checks the owner's signature
+  and uploads the pair, or, while no gateway is live (the placeholder record: serial 0, address null, and no `--sig`),
   prints `SKIP gateway not-live` and uploads nothing (ledger D309), so a first test release can be published before a gateway
-  exists. Any other state without a good signed pair is still `REFUSED gateway` or `REFUSED sig`. The install.json it works
+  exists. Any other state without a good signed pair is still `REFUSED gateway` or `REFUSED sig` (a live record with no `--sig`
+  is `REFUSED sig`). Before anything is signed the `plan` job's step `gateway` runs the pins planner (`bin/fleet-pins-plan.py plan
+  --only fleet/core/gateway.json`: exact key set, and a serial above every earlier signed body's) over the tip's record and hands
+  its sha256 and a live/not-live word (read off the parsed record, never a grep over its bytes) to `gwsign`, which
+  signs only those bytes (ledger G-CV05-M10). The planner's serial rule reads the previous signed body from the history of the tip's
+  `gateway.json.sig`, which nothing commits until CV05e: until then only the shape check, the size and the live/serial gate bite, and a
+  lower serial is not refused. The install.json it works
   from is the plan's output re-hashed against the plan's sha256, with the sign job's signature, so nothing here is downloaded.
   The job uploads no artifact, uses no cache and writes no step summary; the log shows a size and a sha256 only. The gateway pair
   is never in the plan's folder, which becomes a public artifact and public release assets.
@@ -300,18 +307,17 @@ never inherit it. `OWNER_PIN_SHA256` is required for both verbs (`REFUSED key` w
   (`{"sha256", "size"}`, as R2 holds them) to equal what it sent. An identical re-run is a 200; different bytes for the same serial
   are a 409 `conflict`. The other 409s keep their own word (`REFUSED replay`, `rollback`, `revoked`), and another known error
   word of the host follows the status (`REFUSED upload 401 stale`).
-- `fleet-kit-upload.py gateway [--check] --owner-pub P` reads `fleet/core/gateway.json` and `.sig` from the tip of the fleet `release`
-  branch, checks the owner's signature under namespace `mirrorstack-fleet-pin` and that the record has the gateway record's keys
+- `fleet-kit-upload.py gateway [--check] --owner-pub P [--sig FILE]` reads `fleet/core/gateway.json` from the tip of the fleet `release`
+  branch and the signature from FILE (gwsign's; the tip's `gateway.json.sig` is never read, CV05d), checks the owner's signature under namespace `mirrorstack-fleet-pin` and that the record has the gateway record's keys
   (`serial`, `address`, `cert_sha256`, `manifest_key`, `session_key`: the other files signed under the same namespace do not),
   and `PUT /_k/gateway/<serial>` (one to nine digits) with both files in one request, so the host flips to the pair whole or
   not at all. The answer must carry `gserial` and the `{sha256, size}` of both files. These two files never enter the release folder.
   Not live is the one state that is not a refusal: `gateway.json` is a regular file (mode 100644) that is exactly the placeholder
   the fleet repository holds (`serial` the integer 0 written as a plain `0`, `address`, `cert_sha256`, `manifest_key`,
-  `session_key` and `next` null, `r9_closed` false, no other key), and the tip has no `gateway.json.sig` at all. Then the verb
+  `session_key` and `next` null, `r9_closed` false, no other key), and no `--sig` is given. Then the verb
   prints `SKIP gateway not-live`, makes no request and exits 0. A half-edited record (any field filled in) is not the placeholder.
-  A signature beside a placeholder, a serial 0 with an address, an unsigned record with a null address and a serial of 1 or more,
-  a live-looking record without a signature, and every malformed record stay `REFUSED gateway` (or `REFUSED sig` for a bad
-  signature). A signed record with a null address and a serial of 1 or more is judged live, as before: the address is not read.
+  A `--sig` beside a placeholder, a serial 0 with an address, and every malformed record stay `REFUSED gateway`; a live-looking
+  record with no `--sig`, however the tip's own `.sig` looks, is `REFUSED sig` (as is a bad signature). A signed record with a null address and a serial of 1 or more is judged live, as before: the address is not read.
   `--check` is the same read and the same verdict with no upload and no upload key: `OK gateway-check serial=N`, the SKIP line, or
   the refusal. The kit job runs it first, so a refusal comes before the bundle is stored.
 - This repository is public, so nothing a build holds is printed: git's stderr and the build's output go to a file in

@@ -3078,8 +3078,16 @@ class Workflow(unittest.TestCase):
     def test_the_gateway_record_never_enters_the_folder_the_plan_publishes(self):
         for name in fp.FIXED + fp.KIT_FILES + fp.DATA:
             self.assertNotIn('gateway', name)
-        for job in ('plan', 'sign', 'tag', 'publish'):
+        for job in ('sign', 'tag', 'publish'):
             self.assertNotIn('gateway', self.JOBS[job], job)
+        # CV05d: the plan judges the record (its `gateway` step) and hands on a sha256 and nothing else; nothing else of the plan names it
+        plan = self.JOBS['plan'].replace('      - id: gateway\n' + self.step_text('plan', 'gateway'), '').replace('      gateway_sha: ${{ steps.gateway.outputs.gateway_sha }}\n', '').replace('      gateway_live: ${{ steps.gateway.outputs.gateway_live }}\n', '')
+        self.assertNotIn('gateway', plan)
+        self.assertEqual(self.declared_outputs('plan')['gateway_sha'], ('gateway', 'gateway_sha'))
+        self.assertEqual(self.declared_outputs('plan')['gateway_live'], ('gateway', 'gateway_live'))
+        self.assertEqual(self.written_outputs('plan', 'gateway'), {'gateway_sha', 'gateway_live'})
+        self.assertNotIn('"$RUNNER_TEMP/out', self.step_text('plan', 'gateway'))   # a byte of the record never reaches the published folder
+        self.assertNotIn('GITHUB_STEP_SUMMARY', self.step_text('plan', 'gateway'))
         self.assertEqual(self.declared_outputs('gwsign'), {'gateway_sig': ('sign', 'gateway_sig')})  # the signature only, never a byte of the record
         self.assertIn('gateway --owner-pub', self.JOBS['kit'])   # the kit job reads the pair itself, at the release tip
         self.assertEqual((self.written_outputs('gwsign', 'fetch'), self.written_outputs('gwsign', 'sign')), ({'live'}, {'gateway_sig'}))
@@ -3126,7 +3134,7 @@ class Workflow(unittest.TestCase):
 
     def test_the_two_secrets_never_share_a_step_and_the_signing_step_holds_no_git_ssh_python_or_jq(self):
         fetch, sign = self.step_text('gwsign', 'fetch'), self.step_text('gwsign', 'sign')
-        self.assertEqual(re.findall(r'(?m)^          (\w+): ', fetch), ['FLEET_READ', 'TIP'])
+        self.assertEqual(re.findall(r'(?m)^          (\w+): ', fetch), ['FLEET_READ', 'TIP', 'GATEWAY_SHA', 'GATEWAY_LIVE'])
         self.assertEqual(re.findall(r'(?m)^          (\w+): ', sign), ['SIGN_KEY'])
         self.assertEqual(re.findall(r'secrets\.(\w+)', fetch), ['FLEET_READ'])
         self.assertEqual(re.findall(r'secrets\.(\w+)', sign), ['SIGN_KEY'])
@@ -3147,37 +3155,42 @@ class Workflow(unittest.TestCase):
         spec.loader.exec_module(mod)
         return mod.GATEWAY_KEYS   # the names the kit verb's own check holds a record to
 
-    def test_the_fetch_step_refuses_a_moved_tip_judges_the_pair_and_signs_nothing_outside_the_test_series(self):
+    def test_the_fetch_step_refuses_a_moved_tip_signs_only_the_bytes_the_plan_judged_and_never_reads_the_tips_own_signature(self):
         fetch = self.step_text('gwsign', 'fetch')
         self.assertIn('TIP: ${{ needs.plan.outputs.tip }}', fetch)
+        self.assertIn('GATEWAY_SHA: ${{ needs.plan.outputs.gateway_sha }}', fetch)   # CV05d: the plan's verdict on these very bytes
+        self.assertIn('GATEWAY_LIVE: ${{ needs.plan.outputs.gateway_live }}', fetch)   # and on the parsed record, never a grep over the bytes
+        self.assertNotIn('fleet/core/gateway.json.sig', self.JOBS['gwsign'])   # the tip's own signature (the control VM's, from CV05e) is never looked at
+        self.assertNotIn('SKIP gwsign series', self.JOBS['gwsign'])   # both series sign
         self.assertEqual(self.declared_outputs('plan')['tip'], ('plan', 'tip'))   # the tip the plan judged, handed on
         for need in ('/dev/shm/gwfetch.', 'umask 077', "trap 'shred -u", 'StrictHostKeyChecking=yes', 'IdentitiesOnly=yes', 'GlobalKnownHostsFile=/dev/null',
-                     "REFUSED tip-moved", "REFUSED gateway tip", "REFUSED gateway", "SKIP gwsign not-live", "SKIP gwsign series",
-                     'ls-tree "$TIP" -- fleet/core/gateway.json.sig', "'100644 blob '*", '-le 65536'):
+                     "REFUSED tip-moved", "REFUSED gateway tip", "REFUSED gateway", "SKIP gwsign not-live", "REFUSED gateway unchecked",
+                     'ls-tree "$TIP" -- fleet/core/gateway.json', "'100644 blob '*", '-le 65536'):
             self.assertIn(need, fetch, need)
-        order = ["trap 'shred -u", '"$FLEET_READ" > "$d/key"', 'fetch -q --no-tags --depth 1', 'REFUSED tip-moved', 'if [ -z "$sig" ]',
-                 'case "$rec" in', 'if [ "$SERIES" != test ]', 'cat-file blob "$TIP:fleet/core/gateway.json"']
+        order = ["trap 'shred -u", '"$FLEET_READ" > "$d/key"', 'fetch -q --no-tags --depth 1', 'REFUSED tip-moved',
+                 'case "$rec" in', 'cat-file blob "$TIP:fleet/core/gateway.json"', 'for k in ', 'if [ "$GATEWAY_LIVE" = no ]', '"$GATEWAY_SHA"', 'echo live=yes']
         self.assertEqual([fetch.index(x) for x in order], sorted(fetch.index(x) for x in order))
         # the body is shaped like a gateway record before it is called live (review of AF08, P1): the five names of GATEWAY_KEYS, fixed strings
         self.assertIn('for k in ' + ' '.join(self.gateway_keys()) + '; do', fetch)
         self.assertIn('grep -qF "\\"$k\\"" "$RUNNER_TEMP/gwsign/gateway.json"', fetch)
         self.assertLess(fetch.index('for k in '), fetch.index('echo live=yes'))
+        self.assertNotIn('SERIES', fetch)   # CV05d: no series test in the fetch step
         self.assertGreater(fetch.index('for k in '), fetch.index('cat-file blob'))
         self.assertNotIn('--force', fetch)
         self.assertNotIn('+refs/tags', fetch)
         self.assertEqual(len(re.findall(r'cat-file blob', fetch)), 1)   # the record is read once, after every check; nothing prints it
         self.assertNotRegex(fetch, r'(?m)^\s*(?:cat|head|tail|xxd|od|base64)\b')
 
-    def test_the_sign_step_runs_in_the_test_series_only_checks_the_key_and_prints_a_size_and_a_hash_at_most(self):
+    def test_the_sign_step_runs_in_both_series_checks_the_key_and_prints_a_size_and_a_hash_at_most(self):
         sign = self.step_text('gwsign', 'sign')
         self.assertIn("        if: steps.fetch.outputs.live == 'yes'\n", sign)
-        for need in ('[ "$SERIES" = test ] || { echo \'REFUSED series\'; exit 1; }', '/dev/shm/gwsign.', 'umask 077', 'set -euo pipefail', "trap 'shred -u",
+        for need in ('case "$SERIES" in test | release) ;; *) echo \'REFUSED series\'; exit 1;; esac', '/dev/shm/gwsign.', 'umask 077', 'set -euo pipefail', "trap 'shred -u",
                      "grep -Eq '^SHA256:[A-Za-z0-9+/]{43}$'", '[ "$fp" = "$KEY_SHA256" ] ||', 'REFUSED key-not-set',
                      f'-Y sign -f "$d/key" -n {fp.PIN_NS} "$d/gateway.json"', f'-Y verify -f "$d/allowed" -I owner -n {fp.PIN_NS}',
                      f'namespaces="{fp.PIN_NS}"', 'REFUSED changed gateway.json', "printf 'gateway_sig=%s\\n' \"$(base64 -w0"):
             self.assertIn(need, sign, need)
         self.assertNotIn(fp.NS + '"', sign)   # the install namespace is never the gateway record's
-        order = ['[ "$SERIES" = test ]', '"$d/key"', '[ "$fp" = "$KEY_SHA256" ]', '-Y sign', '-Y verify', 'REFUSED changed', 'gateway_sig=']
+        order = ['case "$SERIES" in', '"$d/key"', '[ "$fp" = "$KEY_SHA256" ]', '-Y sign', '-Y verify', 'REFUSED changed', 'gateway_sig=']
         self.assertEqual([sign.index(x) for x in order], sorted(sign.index(x) for x in order))
         echoed = [l.strip() for l in sign.splitlines() if l.strip().startswith('echo ') and '$' in l]
         self.assertEqual(echoed, ['echo "signed gateway.json: $n bytes, sha256 $h, key $fp"'])   # the one line with a value: a size, a hash, the key's fingerprint
