@@ -726,7 +726,7 @@ jobs:
             [ "$n" -le 5 ] && [ "$p" = "${!n}" ] && [ -z "$x" ] && [[ "$h" =~ ^[0-9a-f]{64}$ ]] && [[ "$s" =~ ^(0|[1-9][0-9]{0,18})$ ]] && { [ "$a" = sign ] || [ "$a" = keep ]; } || { echo 'REFUSED manifest'; exit 1; }
           done <<< "$MANIFEST"
           [ "$n" = 5 ] || { echo 'REFUSED manifest'; exit 1; }
-          echo "approved: sign the control VM pins at fleet release tip $TIP"
+          echo "plan for approval in kit-floor (nothing is approved by this line): sign the control VM pins at fleet release tip $TIP"
           printf '%s\n' "$MANIFEST"
           echo "deploy-pin head: $DEPLOY_HEAD"
   pins-sign:

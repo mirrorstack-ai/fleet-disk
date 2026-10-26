@@ -458,6 +458,17 @@ class PinsStatic(unittest.TestCase):
         self.assertLess(sign.index('printf \'%s\\n\' "$SIGN_KEY"'), sign.index('-Y sign'))
         self.assertIn('sha256sum "$d/body"', sign)
 
+    def test_the_jobs_pass_each_file_its_own_signature_and_every_job_reads_the_plan_output_it_names(self):
+        """Review of CV05c: the run tests give each step its own env, so the job-level `env:` and `outputs:` wiring between the jobs ran nowhere."""
+        names = ('hosts', 'gateway', 'work_pin', 'deploy_pin', 'proven')
+        for i, n in enumerate(names, 1):
+            self.assertIn(f'      {n}_sig: ${{{{ steps.sign.outputs.{n}_sig }}}}\n', JOBS['pins-sign'], n)
+            self.assertIn(f'          SIG_{i}: ${{{{ needs.pins-sign.outputs.{n}_sig }}}}\n', JOBS['pins-publish'], n)
+        self.assertEqual(JOBS['pins-publish'].count('needs.pins-sign.outputs.'), 7)   # five signatures, the key line and its fingerprint
+        self.assertEqual(JOBS['pins-sign'].count('          MANIFEST: ${{ needs.pins-plan.outputs.manifest }}\n'), 2)   # fetch and sign
+        for job in ('pins-sign', 'pins-publish', 'pins-approve'):
+            self.assertIn('          TIP: ${{ needs.pins-plan.outputs.tip }}\n', JOBS[job], job)
+
     def test_pins_plan_holds_the_read_key_and_never_the_signing_key_and_the_others_hold_no_secret(self):
         self.assertEqual(re.findall(r'secrets\.(\w+)', JOBS['pins-plan']), ['FLEET_READ'])
         self.assertNotIn('SIGN_KEY', JOBS['pins-plan'])
@@ -658,7 +669,7 @@ class PinsRuns(unittest.TestCase):
     def test_the_approve_step_prints_each_file_with_serial_sha256_action_and_the_deploy_head(self):
         done = self.approve(DEPLOY_HEAD='b' * 40)
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stdout, f'approved: sign the control VM pins at fleet release tip {"a" * 40}\n{self.manifest()}\ndeploy-pin head: {"b" * 40}\n')
+        self.assertEqual(done.stdout, f'plan for approval in kit-floor (nothing is approved by this line): sign the control VM pins at fleet release tip {"a" * 40}\n{self.manifest()}\ndeploy-pin head: {"b" * 40}\n')
 
     def test_the_approve_step_refuses_a_manifest_tip_or_head_that_is_not_what_the_plan_prints(self):
         good = self.manifest().split('\n')
@@ -848,6 +859,22 @@ class PinsRuns(unittest.TestCase):
         self.place()
         done = subprocess.run(['/bin/bash', '-c', script], env=env, capture_output=True, text=True, cwd=self.tmp)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def test_a_file_that_changes_while_it_is_signed_stops_the_sign_step_and_hands_nothing_on(self):
+        """Review of CV05c: the re-hash after the signature (`REFUSED changed`) had no test; a shim appends a byte on -Y verify."""
+        self.place()
+        shim = self.tmp / 'ssh-keygen-shim'
+        shim.write_text(f'#!/bin/sh\n{fp.SSH_KEYGEN} "$@" || exit $?\n'
+                        'case "$*" in *"-Y verify"*) printf x >> "$(dirname "$(echo "$*" | sed \'s/.*-s //;s/ .*//\')")/body";; esac\n')
+        shim.chmod(0o755)
+        script = body('pins-sign', 'sign').replace('/usr/bin/ssh-keygen', str(shim)).replace('/dev/shm/', f'{self.shm}/')
+        env = {'PATH': f'{self.bin}:/usr/bin:/bin', 'HOME': str(self.tmp), 'RUNNER_TEMP': str(self.runner), 'GITHUB_OUTPUT': str(self.out), 'SERIES': 'test',
+               'KEY_SHA256': self.pin, 'SIGN_KEY': self.baked.read_text(), 'MANIFEST': self.manifest()}
+        done = subprocess.run(['/bin/bash', '-c', script], env=env, capture_output=True, text=True, cwd=self.tmp)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertTrue(done.stdout.endswith('REFUSED changed fleet/hosts.json\n'), done.stdout)
+        self.assertEqual(fake_output(self.out), {})
+        self.assertEqual(list(self.shm.iterdir()), [])
 
     # --- pins-publish
 
