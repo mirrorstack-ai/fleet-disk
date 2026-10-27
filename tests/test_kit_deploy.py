@@ -1449,7 +1449,7 @@ class OverHttp(unittest.TestCase):
                   rows_failures=20, log=lambda *_: None)
         kw.update(run or {})
         # the expiry pause moves the kit's clock and the cut pause polls its releases (no flat sleep); a `sleep` in `run` is
-        # the one the spacings and retries really use
+        # the one the spacings and retries really use; run={'pause': None} keeps the replay's own live default pause
         kw['sleep'] = kit.fake_sleep(kw.get('sleep', time.sleep))
         kw.setdefault('pause', kit.fake_pause())
         with Served(kit) as base, (nullcontext() if real_clock else mock.patch.object(kc, 'time', ReplayClock())):
@@ -1935,6 +1935,58 @@ class OverHttp(unittest.TestCase):
     def test_a_margin_larger_than_the_time_spent_still_waits_virtually(self):
         kit, _ = self.replay(run={'late_margin_ms': 9000})
         self.assert_one_expiry_wait(kit, whole=11.5)                   # 2500 + 9000 ms of the kit's clock, no real 11 s
+
+    def test_a_zero_margin_waits_just_the_invites_life_it_is_a_margin_not_an_unset_default(self):
+        # CX04 review (the excerpt's zero-margin case): 0 is a margin. The expiry wait is the 2500 ms life less the replay's
+        # own tiny elapsed time (ReplayClock), never the 5.0 s a margin read as unset (2500) would ask. Whether the invite
+        # is then judged expired is the edge (the real time spent since it was made against that tiny elapsed time), so the
+        # outcome is not asserted: a replay that gets past it is as good as one that refuses at 'expired'
+        try:
+            self.replay(run={'late_margin_ms': 0})
+        except kc.Refused as e:
+            self.assertIn('expired', str(e))
+        asked = [s for why, s in self.kit.pauses if why == 'expiry']
+        self.assertEqual(len(asked), 1, self.kit.pauses)
+        self.assertGreater(asked[0], 2.3)
+        self.assertLessEqual(asked[0], 2.5)
+        self.assertEqual(self.kit.skew_ms, asked[0] * 1000)
+
+    def test_a_margin_that_ends_the_wait_before_the_invite_does_is_refused(self):
+        # CX04 review (the excerpt's "a margin too small, the invite would still be valid"): a 120 s life and a margin of
+        # minus 60 s ask for a wait of about 60 s of the kit's clock, half the life left, so the 'expired' download answers
+        # 200 and the replay refuses. Real time spent is seconds at most, so nothing here sits on the edge
+        e = self.refused('expired: status 200, expected 404', run={'short_life_ms': 120000, 'late_margin_ms': -60000})
+        asked = [s for why, s in self.kit.pauses if why == 'expiry']
+        self.assertEqual(len(asked), 1, self.kit.pauses)
+        self.assertGreater(asked[0], 59.0)
+        self.assertLessEqual(asked[0], 60.0)
+        # control, same life: the helper's 200 ms margin is the only change and the invite is judged expired
+        kit, _ = self.replay(run={'short_life_ms': 120000})
+        self.assert_one_expiry_wait(kit, whole=120.2)
+
+    def test_the_default_pause_sleeps_both_named_waits_through_the_replays_own_sleep(self):
+        # CX04 review: every other test hands the replay a pause, so the live default (no pause: sleep(seconds)) was never
+        # run, and a default that did nothing would skip the cut and the expiry wait on a live run. Here there is no pause:
+        # the four cut waits and the one expiry-sized wait must reach the `sleep` given (a recorder; it really sleeps the cut
+        # waits, the fake hears the hang-ups meanwhile, and moves the kit's clock for the long one in place of 2.7 s asleep)
+        asked = []
+
+        def sleep(s):
+            asked.append(s)
+            if s >= 2.0:
+                self.kit.advance(s * 1000)
+            else:
+                time.sleep(s)
+        kit, lines = self.replay(run={'sleep': sleep, 'pause': None})
+        waits = [s for s in asked if s > 0]                            # the readiness spacing and retry wait are 0.0
+        self.assertEqual([s for s in waits if s < 2.0], [0.4] * 4, asked)
+        longer = [s for s in waits if s >= 2.0]
+        self.assertEqual(len(longer), 1, asked)
+        self.assertGreaterEqual(longer[0], 2.6)
+        self.assertLessEqual(longer[0], 2.7)
+        self.assertEqual(kit.skew_ms, longer[0] * 1000)
+        self.assertEqual(kit.pauses, [])                               # fake_pause was not in play
+        self.assertTrue(lines)
 
     def test_the_expiry_pause_moves_the_kit_clock_at_any_size_of_wait(self):
         for seconds in (0.003, 0.5, 1.99, 2.0, 40.0):                  # the old heuristic moved only from 2.0 s up
