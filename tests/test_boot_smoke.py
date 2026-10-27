@@ -594,6 +594,35 @@ class MacRows(unittest.TestCase):
                               capture_output=True, text=True, env=dict(os.environ, TMPDIR=str(self.tmp)))
         self.assertIn('REFUSED python-install', done.stdout)
 
+    def run_pinned_stub(self, name, script):
+        """MAC_SCRIPT over a case folder whose pinned archive holds `script` as its python3 and a kit.json that pins that archive's sha256."""
+        data = mac_tgz(script)
+        kit = json.loads((self.out / 'good-sh' / 'release' / 'install-20' / 'kit.json').read_text())
+        kit['python_mac']['sha256'] = hashlib.sha256(data).hexdigest()
+        rel = Path('pbs') / 'releases' / 'download' / '20260929' / kit['python_mac']['url'].rsplit('/', 1)[1]
+        (self.out / name / rel).parent.mkdir(parents=True)
+        (self.out / name / rel).write_bytes(data)
+        (self.tmp / f'{name}.json').write_text(json.dumps(kit))
+        self.fx.set_case(name)
+        return subprocess.run(['sh', '-c', sd.MAC_SCRIPT, 'sh', str(self.out / 'good-sh' / 'run' / 'bootstrap.sh'), str(self.tmp / f'{name}.json'), self.FACTS],
+                              capture_output=True, text=True, env=dict(os.environ, TMPDIR=str(self.tmp)))
+
+    def test_a_python_that_fails_python_ok_turns_the_good_row_red(self):  # the control for the marker: python_ok's verdict, not just its text, is judged
+        msg = 'python_ok refused the fetched Python (3.12+ with zstd)'
+        stubs = {'python-mac-broken': b'#!/bin/sh\nexit 1\n',  # fails every probe
+                 'python-mac-nover': b'#!/bin/sh\ncase "$3" in *version_info*) exit 1 ;; esac\nexit 0\n',  # fails only the 3.12+ probe, so only that line of python_ok can turn it red
+                 'python-mac-nozstd': b'#!/bin/sh\ncase "$3" in *zstd*) exit 1 ;; esac\nexit 0\n'}  # passes it, fails only the Darwin-only zstd line
+        for name, script in stubs.items():
+            done = self.run_pinned_stub(name, script)
+            self.assertEqual(done.returncode, 0, (name, done.stdout, done.stderr))
+            self.assertIn('mac-row python_ok refused', done.stdout, name)
+            self.assertNotIn('mac-row python_ok\n', done.stdout, name)
+            self.assertIn(msg, sd.judge_mac('good', done.stdout, done.returncode, list(self.fx.log), [], []), name)
+        # and the same rows with a passing stub print the plain marker and judge clean of this message
+        ok = self.run_pinned_stub('python-mac-okstub', b'#!/bin/sh\nexit 0\n')
+        self.assertIn('mac-row python_ok\n', ok.stdout)
+        self.assertNotIn(msg, sd.judge_mac('good', ok.stdout, ok.returncode, list(self.fx.log), [], []))
+
 
 # --- PY13: smoke_driver.py real, over a fake gh; smoke-real.yml's shape ---------------------------------------------------------------
 
