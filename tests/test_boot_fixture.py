@@ -12,9 +12,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock as mock
 import urllib.error
 import urllib.request
 import hashlib
+import io
+import tarfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -132,6 +135,126 @@ def live_lines(data: bytes):
             if not x.lstrip().startswith('#') and any(h in x.lower() for h in mf.HOSTS)]
 
 
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def mac_archive(script: bytes = b'#!/bin/sh\nexit 0\n') -> bytes:
+    """A tiny python-build-standalone-shaped tar.gz (python/bin/python3): nothing is downloaded in a test."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w:gz') as t:
+        info = tarfile.TarInfo('python/bin/python3')
+        info.size, info.mode = len(script), 0o755
+        t.addfile(info, io.BytesIO(script))
+    return buf.getvalue()
+
+
+TAG, MAC_FILE = '20260929', 'cpython-3.14.7+20260929-aarch64-apple-darwin-install_only.tar.gz'
+PBS_URL = f'https://github.com/astral-sh/python-build-standalone/releases/download/{TAG}/{MAC_FILE}'
+
+
+def pin(sha: str = '0' * 64, **o) -> dict:
+    return {'version': '3.14.7', 'url': PBS_URL, 'sha256': sha, **o}
+
+
+class MacPin(unittest.TestCase):
+    """G-SMOKE-MAC-1: the builder takes python_mac from the kit lock, checks the archive against it and writes it into every kit."""
+
+    def kit(self, **kw) -> bytes:
+        return json.dumps({'serial': 1, 'files': [], **kw}).encode()
+
+    def test_the_shipped_pin_is_taken_and_a_kit_without_one_has_none(self):
+        shipped = (PINNED / 'kit.json').read_bytes()
+        self.assertEqual(mf.mac_pin(shipped), json.loads(shipped)['python_mac'])
+        self.assertIsNone(mf.mac_pin(self.kit()))
+        self.assertIsNone(mf.mac_pin(self.kit(python_mac=None)))
+
+    def test_every_other_shape_of_the_pin_refuses_python(self):
+        bad = {'a url off the PBS root': pin(url=PBS_URL.replace('https://github.com/astral-sh', 'https://example.org/astral-sh')),
+               'a version that is not the file\'s': pin(version='3.14.8'), 'a tag that is not the file\'s': pin(url=PBS_URL.replace('/20260929/', '/20260930/')),
+               'a path in the tag': pin(url=PBS_URL.replace('/20260929/', '/../')), 'a short sha256': pin('0' * 63),
+               'an upper-case sha256': pin('A' * 64), 'a fourth key': pin(extra='x'), 'a number': 5,
+               'a number for the sha256': pin(sha256=5), 'a number for the version': pin(version=3), 'a null url': pin(url=None),
+               'another arch': pin(url=PBS_URL.replace('aarch64', 'x86_64'))}
+        for why, v in bad.items():
+            with self.subTest(why), self.assertRaises(mf.Refused) as r:
+                mf.mac_pin(self.kit(python_mac=v))
+            self.assertEqual(str(r.exception), 'python')
+        for raw in (b'not json', b'[]'):
+            with self.assertRaises(mf.Refused):
+                mf.mac_pin(raw)
+
+    def test_the_archive_is_placed_on_the_rewritten_pbs_and_must_be_the_pins_bytes(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        data = mac_archive()
+        (tmp / 'a.tgz').write_bytes(data)
+        got = mf.place_mac(tmp / 'fx', pin(sha256(data)), '127.0.0.1', 18443, tmp / 'a.tgz')
+        self.assertEqual(got, pin(sha256(data), url=f'https://127.0.0.1:18443/pbs/releases/download/{TAG}/{MAC_FILE}'))
+        rel = Path('pbs') / 'releases' / 'download' / TAG / MAC_FILE
+        self.assertEqual((tmp / 'fx' / rel).read_bytes(), data)
+        altered = (tmp / 'fx' / mf.MAC_ROWS[2] / rel).read_bytes()  # the hash row's own copy: the pin's bytes plus one
+        self.assertEqual((altered[:-1], len(altered)), (data, len(data) + 1))
+        with self.assertRaises(mf.Refused) as r:  # a pin whose hash is not the archive's
+            mf.place_mac(tmp / 'other', pin('f' * 64), '127.0.0.1', 18443, tmp / 'a.tgz')
+        self.assertEqual(str(r.exception), 'python')
+        with self.assertRaises(mf.Refused):  # the url must fit the loader's 200 characters after the re-root
+            mf.place_mac(tmp / 'long', pin(sha256(data)), 'h' * 150, 18443, tmp / 'a.tgz')
+        with mock.patch.object(mf, 'MAX_MAC_PY', len(data)):  # the cap is the loader's: the pin's own archive at the cap passes, one byte over is refused
+            mf.place_mac(tmp / 'atcap', pin(sha256(data)), '127.0.0.1', 18443, tmp / 'a.tgz')
+        big = data + b'\0'
+        (tmp / 'big.tgz').write_bytes(big)
+        with mock.patch.object(mf, 'MAX_MAC_PY', len(data)), self.assertRaises(mf.Refused) as r:
+            mf.place_mac(tmp / 'big', pin(sha256(big)), '127.0.0.1', 18443, tmp / 'big.tgz')
+        self.assertEqual(str(r.exception), 'python')
+
+    def test_the_download_of_the_pinned_archive_is_bounded_and_refuses_what_is_empty_or_over(self):
+        class Stream:
+            def __init__(self, data):
+                self.data, self.asked = data, []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, n=-1):
+                self.asked.append(n)
+                return self.data if n is None or n < 0 else self.data[:n]
+
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        with mock.patch.object(mf, 'MAX_MAC_PY', 10):
+            for body, ok in ((b'x' * 10, True), (b'x' * 11, False), (b'x' * 5000, False), (b'', False)):
+                stream = Stream(body)
+                with mock.patch.object(mf.urllib.request, 'urlopen', return_value=stream):
+                    if ok:
+                        mf.get_mac(PBS_URL, tmp / 'got')
+                        self.assertEqual((tmp / 'got').read_bytes(), body)
+                    else:
+                        with self.assertRaises(mf.Refused, msg=len(body)) as r:
+                            mf.get_mac(PBS_URL, tmp / f'no{len(body)}')
+                        self.assertEqual(str(r.exception), 'python')
+                        self.assertFalse((tmp / f'no{len(body)}').exists())
+                self.assertEqual(stream.asked, [11], len(body))  # never an unbounded read: at most the cap and one byte
+            with mock.patch.object(mf.urllib.request, 'urlopen', side_effect=OSError('down')), self.assertRaises(mf.Refused):
+                mf.get_mac(PBS_URL, tmp / 'down')
+
+    def test_main_takes_the_two_flags_and_refuses_an_archive_without_a_kit(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / 'a.tgz').write_bytes(b'x')
+        argv = ['--out', str(tmp / 'o'), '--ps1', 'p', '--sh', 's', '--python-mac-archive', str(tmp / 'a.tgz')]
+        with mock.patch('builtins.print') as shown:
+            self.assertEqual(mf.main(argv), 1)
+        shown.assert_called_with('REFUSED python')
+        (tmp / 'kit.json').write_bytes(json.dumps({'python_mac': pin()}).encode())
+        with mock.patch.object(mf, 'build', return_value={'cases': [], 'fingerprint': 'f'}) as built, mock.patch('builtins.print'):
+            self.assertEqual(mf.main(argv + ['--kit-json', str(tmp / 'kit.json')]), 0)
+        self.assertEqual((built.call_args.kwargs['kit_json'], built.call_args.kwargs['mac_archive']), (str(tmp / 'kit.json'), str(tmp / 'a.tgz')))
+
+
 class TwoRefetchSites(unittest.TestCase):
     """G-PC-16: since AF36 the ps1 loader names the elevated re-fetch twice (the uninstall loader and $RemoveLoader); the builder
     rewrites every such site, up to REFETCH_MAX, and still refuses everything else."""
@@ -201,6 +324,23 @@ class TwoRefetchSites(unittest.TestCase):
         self.assertTrue(meta['cases'])
         for p in (tmp / 'fx').rglob('bootstrap.ps1'):
             self.assertEqual(live_lines(p.read_bytes()), [], str(p))
+
+    def test_the_whole_fixture_builds_from_the_pinned_loaders_and_the_pinned_kit(self):  # G-SMOKE-MAC-1: a loader or kit change that breaks the Mac pin fails here
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        kit = json.loads((PINNED / 'kit.json').read_text())
+        archive, kit_path = tmp / 'py.tar.gz', tmp / 'kit.json'
+        archive.write_bytes(mac_archive())
+        kit['python_mac']['sha256'] = sha256(archive.read_bytes())  # the real pin's shape, over the tiny archive a test may build
+        kit_path.write_text(json.dumps(kit))
+        (tmp / 'z.zip').write_bytes(b'PKfake')
+        meta = mf.build(tmp / 'fx', PINNED / 'bootstrap.ps1', PINNED / 'bootstrap.sh', zip_path=tmp / 'z.zip', kit_json=kit_path, mac_archive=archive)
+        pbs = re.search(r'(?m)^PBS=(\S+)', (tmp / 'fx' / 'good-sh' / 'run' / 'bootstrap.sh').read_text())[1]
+        served = json.loads((tmp / 'fx' / 'good-sh' / 'release' / 'install-20' / 'kit.json').read_text())['python_mac']
+        self.assertEqual(pbs, 'https://127.0.0.1:18443/pbs/releases/download')  # the loader's own root, rewritten
+        self.assertEqual(served['url'], f'{pbs}/20260929/cpython-3.14.7+20260929-aarch64-apple-darwin-install_only.tar.gz')
+        self.assertEqual((served['version'], served['sha256']), (kit['python_mac']['version'], kit['python_mac']['sha256']))
+        self.assertEqual(meta['python_mac']['rows'], list(mf.MAC_ROWS))
 
 
 @unittest.skipUnless(TOOLS, 'ssh-keygen or openssl is missing')
@@ -379,6 +519,98 @@ class Built(unittest.TestCase):
             got.close()
         finally:
             fx.close()
+
+
+@unittest.skipUnless(TOOLS, 'ssh-keygen or openssl is missing')
+class BuiltWithMac(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.data = mac_archive()
+        for name, data in (('a.ps1', PS1), ('a.sh', SH), ('z.zip', b'PKfake'), ('py.tgz', cls.data),
+                           ('kit.json', json.dumps({'serial': 1, 'files': [], 'python_mac': pin(sha256(cls.data))}).encode())):
+            (cls.tmp / name).write_bytes(data)
+        cls.out = cls.tmp / 'fx'
+        cls.meta = mf.build(cls.out, cls.tmp / 'a.ps1', cls.tmp / 'a.sh', zip_path=cls.tmp / 'z.zip', kit_json=cls.tmp / 'kit.json',
+                            mac_archive=cls.tmp / 'py.tgz')
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def kit(self, cid):
+        return json.loads((self.out / cid / 'release' / 'install-20' / 'kit.json').read_text())
+
+    def test_every_fixture_kit_carries_the_pin_on_the_rewritten_pbs(self):
+        want = pin(sha256(self.data), url=f'https://127.0.0.1:18443/pbs/releases/download/{TAG}/{MAC_FILE}')
+        for c in self.meta['cases']:
+            f = self.out / c['id'] / 'release' / f'install-{c["folder"]}' / 'kit.json'
+            if f.exists() and not c['id'].startswith('size-kit-json'):  # a case with no folder, and the one whose kit is junk, have none to read
+                self.assertEqual(json.loads(f.read_bytes()).get('python_mac'), want, c['id'])
+        self.assertLess(len((self.out / 'good-sh' / 'release' / 'install-20' / 'kit.json').read_bytes()), mf.MAX_KIT_JSON)
+        self.assertLessEqual(len(want['url']), 200)
+        self.assertEqual(self.meta['python_mac'], {'version': '3.14.7', 'sha256': sha256(self.data), 'rows': list(mf.MAC_ROWS)})
+
+    def test_python_mac_is_not_a_file_row_so_the_file_count_and_kit_six_still_behave(self):
+        self.assertEqual(len(self.kit('good-sh')['files']), 5)
+        self.assertEqual(len(self.kit('kit-six-sh')['files']), 6)
+        self.assertEqual(self.kit('kit-six-sh')['python_mac']['sha256'], sha256(self.data))
+
+    def test_the_publisher_still_verifies_a_kit_with_the_pin(self):  # build() runs verify on the good set; a refusal there raises
+        self.assertEqual(mf.publisher(self.out, self.meta['cases'][0]), 'OK install-20')
+
+    def test_the_server_answers_the_pbs_path_as_the_release_path_does(self):
+        fx = serve.Fixture(str(self.out), port=0, crl_port=0)
+        ctx = ssl.create_default_context(cafile=str(self.out / 'tls' / 'ca.crt'))
+        base, path = f'https://127.0.0.1:{fx.port}', f'/pbs/releases/download/{TAG}/{MAC_FILE}'
+
+        class Stay(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a):
+                return None
+        try:
+            fx.set_case('good-sh')
+            with self.assertRaises(urllib.error.HTTPError) as hop:  # 302 first, to an object path on the same origin
+                urllib.request.build_opener(Stay, urllib.request.HTTPSHandler(context=ctx)).open(base + path)
+            self.assertEqual((hop.exception.code, hop.exception.headers['Location']), (302, f'/pbs/objects/{TAG}/{MAC_FILE}'))
+            hop.exception.close()
+            self.assertEqual(urllib.request.urlopen(base + path, context=ctx).read(), self.data)  # then 200 with the archive
+            fx.set_case(mf.MAC_ROWS[2])  # the hash row's own folder serves its altered copy
+            self.assertEqual(urllib.request.urlopen(base + path, context=ctx).read(), self.data + b'\0')
+            # a real copy of the archive where only the regexes (not a missing file) keep the request out: a widened route would serve it
+            for planted in (f'x{TAG}/{MAC_FILE}', f'../{MAC_FILE}', f'{TAG}/sub/{MAC_FILE}', f'{TAG}/x-{MAC_FILE}', f'{TAG}/../{MAC_FILE}'):
+                where = (self.out / 'pbs' / 'releases' / 'download' / planted).resolve()
+                where.parent.mkdir(parents=True, exist_ok=True)
+                where.write_bytes(self.data)
+                self.addCleanup(where.unlink, True)
+            for hostile in (f'/pbs/releases/download/x{TAG}/{MAC_FILE}', f'/pbs/releases/download/../{MAC_FILE}', f'/pbs/releases/download/{TAG}/sub/{MAC_FILE}',
+                            f'/pbs/releases/download/{TAG}/x-{MAC_FILE}', f'/pbs/releases/download/{TAG}/../{MAC_FILE}',
+                            f'/pbs/objects/x{TAG}/{MAC_FILE}', f'/pbs/objects/../{MAC_FILE}', f'/pbs/objects/{TAG}/sub/{MAC_FILE}',
+                            f'/pbs/objects/{TAG}/x-{MAC_FILE}', f'/pbs/objects/{TAG}/../{MAC_FILE}'):
+                with self.assertRaises(urllib.error.HTTPError, msg=hostile) as nope:  # no redirect followed: a 302 here is the release route matching
+                    urllib.request.build_opener(Stay, urllib.request.HTTPSHandler(context=ctx)).open(base + hostile)
+                self.assertEqual(nope.exception.code, 404, hostile)
+                nope.exception.close()
+            for bad in (f'/pbs/releases/download/../{MAC_FILE}', f'/pbs/releases/download/x{TAG}/{MAC_FILE}', f'/pbs/releases/download/{TAG}/../cases.json',
+                        f'/pbs/releases/download/{TAG}/cpython-3.14.7+{TAG}-aarch64-apple-darwin-install_only.tar.gz/..',
+                        f'/pbs/releases/download/{TAG}/other.tar.gz', f'/pbs/objects/..%2f/{MAC_FILE}', f'/pbs/objects/x1/{MAC_FILE}',
+                        f'/pbs/releases/download/99/cpython-3.14.7+99-aarch64-apple-darwin-install_only.tar.gz'):
+                with self.assertRaises(urllib.error.HTTPError, msg=bad) as nope:
+                    urllib.request.urlopen(base + bad, context=ctx)
+                self.assertEqual(nope.exception.code, 404, bad)
+                nope.exception.close()
+            self.assertEqual(urllib.request.urlopen(f'{base}/python/3.12.10/python-3.12.10-embed-amd64.zip', context=ctx).read(), b'PKfake')
+            fx.set_case('good-sh')
+            self.assertEqual(urllib.request.urlopen(f'{base}/releases/download/install-20/kit.json', context=ctx).status, 200)
+        finally:
+            fx.close()
+
+    def test_a_pin_the_archive_does_not_match_refuses_python_and_leaves_no_tree(self):
+        (self.tmp / 'bad.json').write_text(json.dumps({'python_mac': pin('f' * 64)}))
+        out = self.tmp / 'bad'
+        with self.assertRaises(mf.Refused) as r:
+            mf.build(out, self.tmp / 'a.ps1', self.tmp / 'a.sh', zip_path=self.tmp / 'z.zip', kit_json=self.tmp / 'bad.json', mac_archive=self.tmp / 'py.tgz')
+        self.assertEqual(str(r.exception), 'python')
+        self.assertFalse(out.exists())
 
 
 if __name__ == '__main__':

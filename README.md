@@ -482,10 +482,18 @@ network access to python.org for the ZIP, or `--python-zip PATH`).
 
 The gate that matters is the `smoke` job of `install.yml` (above): the release folder is committed only in the fleet repository,
 so the plan fetches the loaders from the fleet `release` tip, the `fixture` job builds one fixture from them on ubuntu with
-`make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh`, and every runner downloads it and runs the same steps and rows as this
+`make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh --kit-json loaders/kit.json`, and every runner downloads it and runs the same steps and rows as this
 workflow, minus the experimental `keychain` and `ubuntu-26.04` rows (the latter is a hosted image that moves weekly, so it only reports here). `boot-smoke.yml` stays as a dispatch and as a PR-path trigger (`release/install-*/bootstrap.*`, which now rarely fires, and edits of the builder and the
 driver); a dispatch that finds no complete pair fails. The smoke ends the good run in `kvm` on a hosted runner (no `/dev/kvm`),
 and never runs the install itself.
+
+On a Mac the smoke also reaches past check mode (G-SMOKE-MAC-1): `--kit-json` hands the builder the release's own kit.json, it
+downloads the `python_mac` archive once, refuses `python` unless its sha256 is the pin's, serves it under `/pbs` (302, then 200, as
+the release path does) and writes `python_mac` into every fixture kit.json on the rewritten PBS root. The driver then sources the
+built sh copy through its `FLEET_BOOT_LIB=1` seam (no sudo, nothing under `/Library`) and runs `fetch_python` and `python_ok`:
+`python-mac-good` (one TLS 1.2+ GET, a 3.12+ Python with zstd), `python-mac-null` (`python_mac` null: `REFUSED python-lock`, no request)
+and `python-mac-hash` (changed bytes: `REFUSED python-hash`). A row that never reaches `fetch_python`, or a Mac fixture built without
+a pin under `--must-run`, is red. An `--install --elevated` row is not taken: it needs sudo and writes under `/Library`.
 
 The cases also cover each size cap (the signature, `install.json` with and without a `Content-Length`, `kit.json`, a kit file, the
 ZIP), a wrong `kind`, a missing field, a six-file kit, and bad command lines (below the floor, a repeated or missing flag, an

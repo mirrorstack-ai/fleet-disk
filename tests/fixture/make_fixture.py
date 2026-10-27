@@ -5,7 +5,10 @@ their base URLs at the local server by pinned regexes (each must match exactly o
 per case, signed with the throwaway key and then damaged the way the case needs. The original files are never changed.
 
   make_fixture.py --out DIR (--boot-dir release/install-N | --ps1 P --sh P) [--host H] [--port N] [--crl-port N]
-                  [--python-version V | --python-zip PATH] [--no-verify]
+                  [--python-version V | --python-zip PATH] [--kit-json PATH [--python-mac-archive PATH]] [--no-verify]
+
+--kit-json is the release's own kit.json: its python_mac pin (G-SMOKE-MAC-1) is downloaded once (or read from --python-mac-archive,
+the test seam), refused unless its sha256 is the pin's, served under /pbs, and written into every fixture kit.json, re-rooted.
 
 A failure prints `REFUSED <rewrite|bake|python|tool|out|verify>` and exits 1. The private keys and the CA key never reach
 DIR: what is left (public keys, the CA certificate, the leaf TLS key, the CRL) is worthless."""
@@ -34,6 +37,11 @@ _spec.loader.exec_module(PUB)
 NS, PIN_NS = PUB.NS, PUB.PIN_NS
 KIT = PUB.KIT_FILES
 MAX_SIG, MAX_KIT_JSON, MAX_CARRIER_SH, MAX_KIT, MAX_ZIP = 4096, 65536, 262144, 4 << 20, 32 << 20  # the bootstraps' own caps
+MAX_MAC_PY = 100 << 20  # bootstrap.sh's MAC_PY_CAP, the pinned archive's cap
+# python_mac's url as fetch_python accepts it: the one PBS root, a digit tag, and the file named by version and tag (G-SMOKE-MAC-1)
+MAC_URL = re.compile(r'https://github\.com/astral-sh/python-build-standalone/releases/download/([0-9]{1,10})/'
+                     r'(cpython-([0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,3})\+\1-aarch64-apple-darwin-install_only\.tar\.gz)', re.ASCII)
+MAC_ROWS = ('python-mac-good', 'python-mac-null', 'python-mac-hash')  # the driver's Mac rows; the last one is served altered bytes
 CODE = 'ABCDE 23456 FGHJK MNPQR STVWX YZ012 34567 89ABC'  # the one code the dummy carrier-check prints
 TIME = '%Y-%m-%dT%H:%M:%SZ'
 UNBAKED = 'ssh-ed25519 UNBAKED'
@@ -230,6 +238,54 @@ def make_tls(d: Path, host: str, crl: int, now: datetime) -> None:
         (d / junk).unlink(missing_ok=True)
 
 
+def mac_pin(kit_json: bytes) -> dict | None:
+    """G-SMOKE-MAC-1: the kit.json's python_mac in the shape fetch_python takes (None when it has none or null); any other shape is `python`."""
+    try:
+        kit = json.loads(kit_json)
+    except ValueError:
+        raise Refused('python') from None
+    if not isinstance(kit, dict):
+        raise Refused('python')
+    pin = kit.get('python_mac')
+    if pin is None:
+        return None
+    m = isinstance(pin, dict) and set(pin) == {'version', 'url', 'sha256'} and all(type(v) is str for v in pin.values()) and MAC_URL.fullmatch(pin['url'])
+    if not (m and m[3] == pin['version'] and re.fullmatch(r'[0-9a-f]{64}', pin['sha256'])):
+        raise Refused('python')
+    return pin
+
+
+def get_mac(url: str, dest: Path) -> None:
+    """Download the pinned archive from the pin's own url, once."""
+    try:
+        with urllib.request.urlopen(url, timeout=300) as r:
+            data = r.read(MAX_MAC_PY + 1)
+    except (OSError, ValueError):
+        raise Refused('python') from None
+    if not data or len(data) > MAX_MAC_PY:
+        raise Refused('python')
+    dest.write_bytes(data)
+
+
+def place_mac(out: Path, pin: dict, host: str, port: int, archive: Path | None) -> dict:
+    """The archive under out/pbs, refused unless its sha256 is the pin's, and python_mac for the fixture kits: the same version and
+    sha256, the url on the rewritten PBS. The python-mac-hash row gets its own copy with one byte appended, so it is not the pin's."""
+    m = MAC_URL.fullmatch(pin['url'])
+    rel = Path('pbs') / 'releases' / 'download' / m[1] / m[2]
+    (out / rel).parent.mkdir(parents=True)
+    if archive:
+        shutil.copy(archive, out / rel)
+    else:
+        get_mac(pin['url'], out / rel)
+    data = (out / rel).read_bytes()
+    url = f'https://{host}:{port}/pbs/releases/download/{m[1]}/{m[2]}'
+    if sha(data) != pin['sha256'] or len(data) > MAX_MAC_PY or len(url) > 200:
+        raise Refused('python')
+    (out / MAC_ROWS[2] / rel).parent.mkdir(parents=True)
+    (out / MAC_ROWS[2] / rel).write_bytes(data + b'\0')
+    return {'version': pin['version'], 'url': url, 'sha256': pin['sha256']}
+
+
 def kit_files() -> dict[str, bytes]:
     """Five dummy kit files: both carrier-checks write the one Code line, and the .py proves `-I -X utf8` reached it."""
     return {
@@ -295,7 +351,7 @@ def dumps(doc, pretty=False) -> bytes:
     return (json.dumps(doc, indent=2) if pretty else json.dumps(doc, separators=(',', ':'))).encode() + b'\n'
 
 
-def build_case(x: Ctx, boots: dict[str, bytes], zip_info: dict, c: dict, osn: str) -> dict:
+def build_case(x: Ctx, boots: dict[str, bytes], zip_info: dict, c: dict, osn: str, mac: dict | None = None) -> dict:
     o, cid = c['o'], f'{c["id"]}-{osn}'
     folder = o.get('serial', 20)
     dserial, minv = o.get('doc_serial', folder), o.get('min', 5)
@@ -307,7 +363,7 @@ def build_case(x: Ctx, boots: dict[str, bytes], zip_info: dict, c: dict, osn: st
     entry = (lambda n: {'sha256': sha(files[n]), 'path': n}) if o.get('kitorder') else (lambda n: {'path': n, 'sha256': sha(files[n])})
     zsha = 'f' * 64 if o.get('zip_bad') else zip_info['sha256']
     listed = [entry(n) for n in KIT] + ([{'path': 'extra.txt', 'sha256': sha(b'extra')}] if o.get('kit_extra') else [])
-    kit = dumps({'serial': 1, 'files': listed, 'python_zip': {'version': zip_info['version'], 'sha256': zsha}})
+    kit = dumps({'serial': 1, 'files': listed, 'python_zip': {'version': zip_info['version'], 'sha256': zsha}, **({'python_mac': mac} if mac else {})})
     valid = (x.now + timedelta(days=o.get('days', 60))).strftime(TIME)
     doc = {'kind': o.get('kind', 'install'), 'serial': dserial, 'valid_until': valid, 'source_head': '9' * 40,
            'bootstrap': {n: {'sha256': sha(boots[n]), 'blob': PUB.blob_ids(boots[n]).pop()} for n in ('ps1', 'sh')},
@@ -391,9 +447,11 @@ def publisher(out: Path, c: dict) -> str:
 
 
 def build(out: Path, ps1: Path, sh: Path, host='127.0.0.1', port=18443, crl_port=18444, version='3.12.10', zip_path=None,
-          verify=True) -> dict:
+          verify=True, kit_json=None, mac_archive=None) -> dict:
     if out.exists():
         raise Refused('out')
+    if mac_archive and not kit_json:  # an archive with no pin to check it against is never served
+        raise Refused('python')
     out.mkdir(parents=True)
     x = Ctx(out, datetime.now(timezone.utc))
     x.crl_port = crl_port
@@ -409,8 +467,12 @@ def build(out: Path, ps1: Path, sh: Path, host='127.0.0.1', port=18443, crl_port
             get_zip(raw['ps1'], version, zdest)
         zip_info = {'version': version, 'sha256': sha(zdest.read_bytes())}
         (out / 'owner.pub').write_text(x.key + '\n')
-        cases = [build_case(x, boots, zip_info, c, osn) for c in CASES for osn in ('ps1', 'sh') if c['only'] in (None, osn)]
+        pin = mac_pin(Path(kit_json).read_bytes()) if kit_json else None
+        mac = place_mac(out, pin, host, port, Path(mac_archive) if mac_archive else None) if pin else None
+        cases = [build_case(x, boots, zip_info, c, osn, mac) for c in CASES for osn in ('ps1', 'sh') if c['only'] in (None, osn)]
         meta = {'host': host, 'port': port, 'crl_port': crl_port, 'fingerprint': x.fp, 'cases': cases}
+        if mac:
+            meta['python_mac'] = {'version': mac['version'], 'sha256': mac['sha256'], 'rows': list(MAC_ROWS)}
         (out / 'cases.json').write_text(json.dumps(meta, indent=1))
         if verify and publisher(out, cases[0]) != f'OK install-{cases[0]["folder"]}':  # the good set is one the publisher would publish
             raise Refused('verify')
@@ -425,14 +487,16 @@ def build(out: Path, ps1: Path, sh: Path, host='127.0.0.1', port=18443, crl_port
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog='make_fixture.py', description='build --out DIR from --boot-dir release/install-N or --ps1/--sh')
     for flag, default in (('out', None), ('boot-dir', None), ('ps1', None), ('sh', None), ('host', '127.0.0.1'), ('port', 18443),
-                          ('crl-port', 18444), ('python-version', '3.12.10'), ('python-zip', None)):
+                          ('crl-port', 18444), ('python-version', '3.12.10'), ('python-zip', None), ('kit-json', None),
+                          ('python-mac-archive', None)):
         p.add_argument('--' + flag, default=default, required=flag == 'out', type=type(default) if isinstance(default, int) else str)
     p.add_argument('--no-verify', action='store_true')
     a = p.parse_args(argv)
     d = Path(a.boot_dir or '')
     ps1, sh = (d / 'bootstrap.ps1', d / 'bootstrap.sh') if a.boot_dir else (Path(a.ps1 or ''), Path(a.sh or ''))
     try:
-        meta = build(Path(a.out), ps1, sh, a.host, a.port, a.crl_port, a.python_version, a.python_zip, verify=not a.no_verify)
+        meta = build(Path(a.out), ps1, sh, a.host, a.port, a.crl_port, a.python_version, a.python_zip, verify=not a.no_verify,
+                     kit_json=a.kit_json, mac_archive=a.python_mac_archive)
     except (Refused, OSError, ValueError, TypeError) as why:
         print(f'REFUSED {why if isinstance(why, Refused) else "case"}')
         return 1

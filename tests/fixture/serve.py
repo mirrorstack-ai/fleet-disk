@@ -1,5 +1,6 @@
 """The boot smoke's two local servers, stdlib only: HTTPS answers GitHub's release layout from one case folder (the
-asset URL answers 302 to an object URL on the same origin, as GitHub does) plus /python/<v>/<zip> and /ping; plain HTTP
+asset URL answers 302 to an object URL on the same origin, as GitHub does) plus /python/<v>/<zip>, the pinned Mac Python under
+/pbs (the same two steps, G-SMOKE-MAC-1) and /ping; plain HTTP
 answers the leaf certificate's CRL and a case's `plain/` folder (what a downgrading redirect would lead to)."""
 from __future__ import annotations
 
@@ -15,6 +16,10 @@ NAME = r'([A-Za-z0-9][A-Za-z0-9._-]{0,63})'
 REL = re.compile(r'/releases/download/(install-(?:0|[1-9][0-9]{0,9}))/' + NAME)
 OBJ = re.compile(r'/objects/(install-[0-9]{1,10})/' + NAME)
 PY = re.compile(r'/python/([0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,2})/' + NAME)  # a version, never `..`
+# G-SMOKE-MAC-1: the loader's PBS root, `<root>/<digit tag>/cpython-<v>+<tag>-aarch64-apple-darwin-install_only.tar.gz` (no version is pinned here)
+PBS_FILE = r'(cpython-[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,3}\+[0-9]{1,10}-aarch64-apple-darwin-install_only\.tar\.gz)'
+PBS = re.compile(r'/pbs/releases/download/([0-9]{1,10})/' + PBS_FILE)
+PBSOBJ = re.compile(r'/pbs/objects/([0-9]{1,10})/' + PBS_FILE)
 PLAIN = re.compile(r'/(install-[0-9]{1,10})/' + NAME)
 
 
@@ -87,6 +92,12 @@ class Fixture:
         m = OBJ.fullmatch(path)
         return bool(m) and os.path.isfile(os.path.join(self.base, self.case, 'release', m[1], m[2] + '.chunked'))
 
+    def pbs(self, d: str, m) -> str:
+        """The pinned archive's file: a case's own copy first (altered bytes), else the shared one under <base>/pbs."""
+        rel = os.path.join('pbs', 'releases', 'download', m[1], m[2])
+        own = os.path.join(d, rel)
+        return own if os.path.isfile(own) else os.path.join(self.base, rel)
+
     def answer(self, path: str, secure: bool) -> tuple[int, bytes, str | None]:
         d = os.path.join(self.base, self.case)
         if not secure:
@@ -102,7 +113,11 @@ class Fixture:
             if moved is not None:
                 return 302, b'', moved.decode().strip()
             return (302, b'', f'/objects/{m[1]}/{m[2]}') if os.path.isfile(f) else (404, b'', None)
-        if m := OBJ.fullmatch(path):
+        if m := PBS.fullmatch(path):
+            return (302, b'', f'/pbs/objects/{m[1]}/{m[2]}') if os.path.isfile(self.pbs(d, m)) else (404, b'', None)
+        if m := PBSOBJ.fullmatch(path):
+            body = _read(self.pbs(d, m))
+        elif m := OBJ.fullmatch(path):
             body = _read(os.path.join(d, 'release', m[1], m[2]))
         elif m := PY.fullmatch(path):
             body = _read(os.path.join(d, 'python', m[1], m[2]))  # a case's own ZIP first (an oversize one), else the shared one
