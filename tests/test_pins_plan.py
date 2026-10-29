@@ -368,8 +368,8 @@ class Plans(unittest.TestCase):
         self.assertNotRegex(err + out, r'hosts new|owner-b')
 
     def test_each_work_pin_blob_must_be_the_release_trees_work_yml(self):
-        yml = self.commit({'.github/workflows/work.yml': b'name: work\n'})
-        blob = self.git('rev-parse', f'{yml}:.github/workflows/work.yml')
+        yml = self.commit({'fleet/work/work.yml': b'name: work\n'})   # the real path in the fleet tree (CV16)
+        blob = self.git('rev-parse', f'{yml}:fleet/work/work.yml')
         for pin, word in ((blob, None), ('5' * 40, 'blob')):
             with self.subTest(pin=pin):
                 self.with_body(WORK, J({'serial': 1, 'pins': [{'work_sha': '6' * 40, 'blob': pin}], 'sub': 'repo:x'}))
@@ -377,6 +377,18 @@ class Plans(unittest.TestCase):
                     self.refused(word, WORK)
                 else:
                     self.assertEqual(self.plan()[0], 0)
+
+    def test_a_work_yml_only_at_the_old_github_workflows_path_is_not_the_release_trees_work_yml(self):
+        # the CV16 bug control: the planner once read .github/workflows/work.yml, which the fleet tree does not have
+        yml = self.commit({'.github/workflows/work.yml': b'name: work\n'})
+        blob = self.git('rev-parse', f'{yml}:.github/workflows/work.yml')
+        self.with_body(WORK, J({'serial': 1, 'pins': [{'work_sha': '6' * 40, 'blob': blob}], 'sub': 'repo:x'}))
+        self.refused('blob', WORK)
+
+    def test_empty_work_pins_never_reach_the_blob_check(self):
+        self.assertFalse((self.repo / 'fleet/work/work.yml').exists())   # no work.yml at all
+        self.with_body(WORK, J({'serial': 1, 'pins': [], 'sub': None}))
+        self.assertEqual(self.plan()[0], 0)
 
     def test_no_value_of_a_body_is_printed(self):
         key = f'ssh-ed25519 {self.publine}'
