@@ -378,6 +378,23 @@ class Plans(unittest.TestCase):
                 else:
                     self.assertEqual(self.plan()[0], 0)
 
+    def test_the_work_pin_blob_is_read_at_the_release_tip_not_at_main(self):  # M5
+        def body(blob: str) -> bytes:
+            return J({'serial': 1, 'pins': [{'work_sha': '6' * 40, 'blob': blob}], 'sub': 'repo:x'})
+        v1 = self.git('rev-parse', self.commit({'fleet/work/work.yml': b'v1\n'}) + ':fleet/work/work.yml')
+        self.with_body(WORK, body(v1))   # release == main, both hold v1
+        self.commit({'fleet/work/work.yml': b'v2\n'})   # main moves on; the release tip still holds v1
+        self.assertEqual(self.plan()[0], 0)
+        # reverse: the release tip holds v2, main holds v1, the pin is the v1 blob: it is not the release tree's
+        self.git('checkout', '-q', '-b', 'rel', 'release')
+        self.commit({'fleet/work/work.yml': b'v2\n'})
+        self.git('branch', '-f', 'release', 'rel')
+        self.git('checkout', '-q', 'main')
+        self.git('reset', '-q', '--hard', 'release~1')   # main holds v1 again
+        self.assertEqual(self.git('show', 'main:fleet/work/work.yml'), 'v1')
+        self.assertEqual(self.git('show', 'release:fleet/work/work.yml'), 'v2')
+        self.refused('blob', WORK)
+
     def test_a_work_yml_only_at_the_old_github_workflows_path_is_not_the_release_trees_work_yml(self):
         # the CV16 bug control: the planner once read .github/workflows/work.yml, which the fleet tree does not have
         yml = self.commit({'.github/workflows/work.yml': b'name: work\n'})

@@ -352,6 +352,7 @@ whose `fleet/slot/model.py` has no module-level `SIG_NS` literal mapping `ctl` t
 `fleet/work/work.yml`), `tip-moved`, `unread`, `vendor`, `pub`, `fetch`. `fleet-pins-plan.py clone URL DIR` takes a
 `--filter=blob:none` clone and falls back to a full clone when that fails (not measured here: it needs the FLEET_READ key); a DIR that already holds files is
 refused (`fetch`) and never touched.
+The pins workflow runs from `release`, so a change to this planner (CV16's path fix was one) reaches a `mode=pins` dispatch only after the main to release promotion; put that promotion on the first-pins-run checklist and check `git show origin/release:bin/fleet-pins-plan.py | grep -n 'WORK_YML ='` before dispatching.
 `vendor/pin-summary.py` is the fleet's `bin/pin-summary.py` byte for byte at fleet main 754265e0, pinned by
 `vendor/pin-summary.sha256`; `tests/test_pins_plan.py` holds the fleet's own digest as a literal (so a change to the vendored copy needs a visible edit there)
 and compares its tables with the fleet's copy when `FLEET_REPO` names a clone.
