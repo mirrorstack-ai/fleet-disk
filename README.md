@@ -349,9 +349,10 @@ signed body's, read unverified at each commit that added or changed the `.sig`, 
 whose serial is below any of them is refused too), `head` (a deploy
 head outside main's first 300 first parents, not an ancestor of the release tip, not a descendant of the last signed non-null head, or
 whose `fleet/slot/model.py` has no module-level `SIG_NS` literal mapping `ctl` to the ctl namespace), `tree`, `blob` (a work-pin blob that is not the release tree's
-`.github/workflows/work.yml`), `tip-moved`, `unread`, `vendor`, `pub`, `fetch`. `fleet-pins-plan.py clone URL DIR` takes a
+`fleet/work/work.yml`), `tip-moved`, `unread`, `vendor`, `pub`, `fetch`. `fleet-pins-plan.py clone URL DIR` takes a
 `--filter=blob:none` clone and falls back to a full clone when that fails (not measured here: it needs the FLEET_READ key); a DIR that already holds files is
 refused (`fetch`) and never touched.
+The pins workflow runs from `release`, so a change to this planner (CV16's path fix was one) reaches a `mode=pins` dispatch only after the main to release promotion; put that promotion on the first-pins-run checklist and check `git show origin/release:bin/fleet-pins-plan.py | grep -n 'WORK_YML ='` before dispatching.
 `vendor/pin-summary.py` is the fleet's `bin/pin-summary.py` byte for byte at fleet main 754265e0, pinned by
 `vendor/pin-summary.sha256`; `tests/test_pins_plan.py` holds the fleet's own digest as a literal (so a change to the vendored copy needs a visible edit there)
 and compares its tables with the fleet's copy when `FLEET_REPO` names a clone.
