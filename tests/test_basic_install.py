@@ -497,7 +497,8 @@ class Static(unittest.TestCase):
         self.assertGreaterEqual(len(urls), 4)
         for url in urls:
             self.assertTrue(allowed.match(url), url)
-        self.assertIn('basic-invites', TEXT)
+        self.assertNotIn('basic-invites', TEXT, 'the shared release is gone: the repo\'s releases are immutable, one release per invite now')
+        self.assertIn('fetch "${BASE_PREFIX}inv-$ID/inv-$ID.enc"', TEXT)  # the invite's own release: tag inv-<id>, asset inv-<id>.enc
         self.assertEqual(re.findall(r'https://www\.python\.org\S+', TEXT)[0], 'https://www.python.org/ftp/python/3.14.10/python-3.14.10-macos11.pkg')
 
     def test_the_pinned_python_pkg(self):
@@ -600,7 +601,7 @@ class Functions(BoxCase):
         self.assertEqual(len(self.sh('OS=mac; machine_tag', FAKE_MACHINE_ID='').stdout), 4)
 
     def test_url_ok_holds_every_hop_to_github(self):
-        for ok in ('https://github.com/mirrorstack-ai/fleet-disk/releases/download/basic-invites/x.enc', 'https://codeload.github.com/x',
+        for ok in ('https://github.com/mirrorstack-ai/fleet-disk/releases/download/inv-0123456789ab/inv-0123456789ab.enc', 'https://codeload.github.com/x',
                    'https://release-assets.githubusercontent.com/github-production-release-asset/1/a?sp=r&sig=b%2Fc', 'https://objects.githubusercontent.com/x',
                    'https://github.com:443/x', 'https://github.com'):
             self.assertEqual(self.sh('url_ok "$U" gh', U=ok).returncode, 0, ok)
@@ -755,7 +756,7 @@ class Fetch(BoxCase):
 
     def test_a_redirect_to_githubs_signed_objects_host_is_followed_by_hand_and_curl_follows_nothing(self):
         b, inv = self.ready()
-        first = f'https://github.com/mirrorstack-ai/fleet-disk/releases/download/basic-invites/inv-{inv.id}.enc'
+        first = f'https://github.com/mirrorstack-ai/fleet-disk/releases/download/inv-{inv.id}/inv-{inv.id}.enc'
         hop = f'https://release-assets.githubusercontent.com/github-production-release-asset/9/inv-{inv.id}.enc'
         res = b.run(inv.line, FAKE_REDIRECT=f'{first}={hop}')
         self.assertEqual(res.rc, 0, res.out)
@@ -767,7 +768,7 @@ class Fetch(BoxCase):
 
     def test_a_redirect_anywhere_else_is_never_requested(self):
         """Old code (`curl -L --proto-redir =https`) went to ANY https host; every hop must now be github.com or githubusercontent.com."""
-        first = lambda inv: f'https://github.com/mirrorstack-ai/fleet-disk/releases/download/basic-invites/inv-{inv.id}.enc'  # noqa: E731
+        first = lambda inv: f'https://github.com/mirrorstack-ai/fleet-disk/releases/download/inv-{inv.id}/inv-{inv.id}.enc'  # noqa: E731
         for name, target in (('other host', 'https://evil.example/x/inv-ID.enc'), ('plain http', 'http://objects.githubusercontent.com/inv-ID.enc'),
                              ('suffix trick', 'https://github.com.evil.example/inv-ID.enc'), ('userinfo', 'https://github.com@evil.example/inv-ID.enc'),
                              ('port', 'https://objects.githubusercontent.com:8443/inv-ID.enc'), ('empty location', '')):
@@ -782,12 +783,12 @@ class Fetch(BoxCase):
 
     def test_a_redirect_loop_and_a_3xx_that_is_not_a_redirect_stop(self):
         b, inv = self.ready()
-        first = f'https://github.com/mirrorstack-ai/fleet-disk/releases/download/basic-invites/inv-{inv.id}.enc'
+        first = f'https://github.com/mirrorstack-ai/fleet-disk/releases/download/inv-{inv.id}/inv-{inv.id}.enc'
         res = b.run(inv.line, FAKE_REDIRECT=f'{first}={first}')
         self.assertStopped(res, 'invite-download')
         self.assertEqual(len(res.calls('curl')), 6)  # the first ask and five hops
         b, inv = self.ready()
-        first = f'https://github.com/mirrorstack-ai/fleet-disk/releases/download/basic-invites/inv-{inv.id}.enc'
+        first = f'https://github.com/mirrorstack-ai/fleet-disk/releases/download/inv-{inv.id}/inv-{inv.id}.enc'
         res = b.run(inv.line, FAKE_REDIRECT=f'{first}={first}', FAKE_REDIRECT_CODE='304')
         self.assertStopped(res, 'invite-download')
         self.assertEqual(len(res.calls('curl')), 1)
@@ -983,7 +984,7 @@ class Flow(BoxCase):
                 self.assertIn(f'curl', res.calls('curl')[0])
                 first = res.calls('curl')[0]  # the invite, by exact URL, as the last word of the first curl
                 self.assertIn(' -o ', first)
-                self.assertEqual(first.rsplit(' ', 1)[1], f'https://github.com/mirrorstack-ai/fleet-disk/releases/download/basic-invites/inv-{inv.id}.enc')
+                self.assertEqual(first.rsplit(' ', 1)[1], f'https://github.com/mirrorstack-ai/fleet-disk/releases/download/inv-{inv.id}/inv-{inv.id}.enc')
                 src = b.src_parent / inv.commit
                 self.assertEqual([p.name for p in b.src_parent.iterdir()], [inv.commit])
                 self.assertEqual((src / 'COMMIT').read_text(), inv.commit + '\n')

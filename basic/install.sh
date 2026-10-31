@@ -3,8 +3,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/mirrorstack-ai/fleet-disk/main/basic/install.sh | sh -s -- <invite> [--host NAME]
 #
-# The invite is '<12 hex id>.<43 char key>.<64 hex sha256>' and is good for under one hour. It names ONE encrypted asset of the public
-# release basic-invites (inv-<id>.enc): a gzip tar of the private fleet tree that only that key opens. This script holds no secret and
+# The invite is '<12 hex id>.<43 char key>.<64 hex sha256>' and is good for under one hour. It names ONE encrypted asset, inv-<id>.enc, of
+# its own public release tagged inv-<id> (one release per invite: the repo's releases are immutable, so a shared release cannot take new
+# assets, and a tag is never reused): a gzip tar of the private fleet tree that only that key opens. This script holds no secret and
 # reaches no private URL: only fleet-disk release assets and python.org. Eight steps, each idempotent (a re-run with the same or a
 # new invite resumes where the last one stopped):
 #   1 check the invite, this machine, free disk and RAM, sudo      5 start the VM image build in the background
@@ -21,7 +22,6 @@ set -u
 LC_ALL=C
 export LC_ALL
 
-INVITES=https://github.com/mirrorstack-ai/fleet-disk/releases/download/basic-invites
 BASE_PREFIX=https://github.com/mirrorstack-ai/fleet-disk/releases/download/
 RUNNER_APP_ID=5208968
 PY_MM=3.14
@@ -358,7 +358,7 @@ main() {
   say '[2/8] fetch the fleet code (encrypted, for this machine only, expires within an hour)'
   TMP=$(mktemp -d "${TMPDIR:-/tmp}/fleet-basic-install.XXXXXX") || stop 'tmp cannot make a temp folder'
   chmod 700 "$TMP"
-  fetch "$INVITES/inv-$ID.enc" "$TMP/inv.enc" 104857600 || stop 'invite-download the invite was not found: it expires within one hour, ask the owner for a new line'
+  fetch "${BASE_PREFIX}inv-$ID/inv-$ID.enc" "$TMP/inv.enc" 104857600 || stop 'invite-download the invite was not found: it expires within one hour, ask the owner for a new line'
   got=$(sha256_file "$TMP/inv.enc")
   [ "$got" = "$DIGEST" ] || stop 'invite-sha the downloaded invite is not the one you were given, ask the owner for a new line'
   # shellcheck disable=SC2086 # fixed words

@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/mirrorstack-ai/fleet-disk/main/basi
 ## What it does (8 steps, each safe to run again)
 
 1. checks the invite's shape, the machine, free disk (Mac 45 GB, PC 10 GB) and RAM (PC 11 GB), and asks for sudo;
-2. downloads the invite's encrypted asset, checks its sha256, decrypts it (the key goes to openssl's stdin only) and unpacks the
+2. downloads the invite's encrypted asset (the only file of its own public release, tag `inv-<id>`), checks its sha256, decrypts it (the key goes to openssl's stdin only) and unpacks the
    fleet code into a root-owned folder (only `fleet/`, `bin/fleet-basic*.py` and `COMMIT`; anything else stops it);
 3. Mac: installs the pinned python.org Python (sha256 and signature checked, framework only); PC: uses Ubuntu's `python3`;
 4. installs `fleet-basic` with the switch OFF;
