@@ -16,7 +16,7 @@ jobs:
     # for a short-lived invite to expire. PW08 (G-KITTEST-1) moved that wait onto the fake kit's clock, but 10 is not earned
     # yet: run 39247858912 measured unit (3.13) at 361.8 s for 657 tests, and unit (3.11) was cancelled at the 10-minute
     # limit (10m15s). Back to 10 only when a run shows both Pythons well under 300 s; record the durations in the gap.
-    timeout-minutes: 20
+    timeout-minutes: 30  # the suite ran ~18 min on 10-30; the basic-mode bootstrap tests (sh, dash, bash x real openssl) add ~3
     strategy:
       fail-fast: false
       matrix:
