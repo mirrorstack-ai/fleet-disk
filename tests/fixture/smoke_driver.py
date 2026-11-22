@@ -5,7 +5,8 @@
                                                            trust step and accept it after (so the step is proven)
   smoke_driver.py fixture --dir D --os ps1|sh [--must-run] every case of that OS: exit, last two lines, info lines,
                                                            requests made, no temp folder left; --must-run: fail when this
-                                                           machine would refuse before the cases (a vacuous pass)
+                                                           machine would refuse before the cases (a vacuous pass); on a Mac,
+                                                           also the three python-mac rows (G-SMOKE-MAC-1, see run_mac)
   smoke_driver.py real --serial N [--os win|mac|ubuntu]    the REAL one-liner of the published release install-N, taken from its
                                                            notes, on this machine and a throwaway home (PY13, smoke-real.yml)
 The expected outcome comes from cases.json, adjusted only for what this machine is (see expect)."""
@@ -35,7 +36,22 @@ LEFT = re.compile(r'(mirrorstack-fleet-|fleet-boot\.)')  # what a bootstrap's te
 INFO = re.compile(r'(bootstrap sha256|key|serial) ')
 FLAGS = {'ps1': {'serial': '-Serial', 'min': '-MinSerial', 'ser': '-Ser'},  # `ser`: an abbreviation the line must refuse
          'sh': {'serial': '--serial', 'min': '--min-serial', 'ser': '--ser'}}
-LOGICAL = [(serve.REL, lambda m: m[2]), (serve.PY, lambda m: 'python.zip')]
+LOGICAL = [(serve.REL, lambda m: m[2]), (serve.PY, lambda m: 'python.zip'), (serve.PBS, lambda m: 'python-mac')]
+# G-SMOKE-MAC-1: row kind -> (the refusal it must end in or None, the requests it makes); the Mac rows of the fixture's python_mac block
+MAC_WANT = {'good': (None, ['python-mac']), 'null': ('python-lock', []), 'hash': ('python-hash', ['python-mac'])}
+MAC_TIMEOUT = 300  # seconds for one row (a fetch of the pinned archive and its unpack)
+# The built sh copy sourced through its FLEET_BOOT_LIB seam (no sudo, nothing under /Library): the marker lines prove a row reached
+# fetch_python and python_ok; `eval "$3"` is the test seam for the machine's facts (boot_sys), empty on a hosted Mac
+MAC_SCRIPT = r'''FLEET_BOOT_LIB=1
+. "$1"
+eval "${3:-}"
+make_tmp
+trap clean EXIT
+kitone=$(flat "$2")
+echo 'mac-row fetch_python'
+fetch_python
+if python_ok; then echo 'mac-row python_ok'; else echo 'mac-row python_ok refused'; fi
+'''
 
 
 # The Ubuntu releases the loaders admit (D310, exact VERSION_ID). Twin: backends.UBUNTU_OK and bootstrap.sh check_machine in
@@ -113,18 +129,84 @@ def judge(c: dict, ex: dict, out: str, rc: int, sha: str, fp: str, log: list, ht
         bad.append(f'info lines {seen}, want {want}')
     if ex['show']:
         bad += code_problems(lines, f'Your code: {CODE}', linux)
+    bad += net_problems(log, http, ex['reqs'])
+    if left:
+        bad.append(f'temp folder left: {left}')
+    return bad
+
+
+def net_problems(log: list, http: list, reqs: list[str]) -> list[str]:
+    """The requests a run made: the logical names in order, all from curl over TLS 1.2+, none over plain http."""
+    bad = []
     names = [n for e in log if (n := logical(e['path']))]
-    if names != ex['reqs']:
-        bad.append(f'requests {names}, want {ex["reqs"]}')
+    if names != reqs:
+        bad.append(f'requests {names}, want {reqs}')
     if any(not e['ua'].startswith('curl/') for e in log):
         bad.append('a request did not come from curl')
     if any(e['tls'] not in ('TLSv1.2', 'TLSv1.3') for e in log):
         bad.append('a request used TLS below 1.2')
     if [e['path'] for e in http if e['path'] != '/ca.crl']:
         bad.append('a plain-http request (the redirect was followed)')
+    return bad
+
+
+def judge_mac(kind: str, out: str, rc: int, log: list, http: list, left: list) -> list[str]:
+    """Every way a python-mac row differs from what it must do. A row that never printed the fetch_python marker is red, whatever
+    else it did (G-SMOKE-MAC-1: a skipped row must never read as green); `good` also needs python_ok's marker."""
+    code, reqs = MAC_WANT[kind]
+    lines = [x for x in out.replace('\r', '').split('\n') if x.strip()]
+    bad = outcome_problems(lines, rc, code)
+    if 'mac-row fetch_python' not in lines:
+        bad.append('the row never reached fetch_python')
+    if kind == 'good' and 'mac-row python_ok' not in lines:
+        bad.append('python_ok refused the fetched Python (3.12+ with zstd)')
+    bad += net_problems(log, http, reqs)
     if left:
         bad.append(f'temp folder left: {left}')
     return bad
+
+
+def run_mac(row: str, base: str, fx: serve.Fixture, good: dict, facts: str = '') -> tuple[list[str], str]:
+    """One python-mac row: fetch_python and python_ok of the good-sh run copy against the fixture's /pbs. `good` is the good-sh case.
+    The kit is the served good kit (python_mac null for the `null` row); the `hash` row's case folder holds altered bytes."""
+    kind = row.rsplit('-', 1)[1]
+    run = os.path.join(base, good['id'], 'run', 'bootstrap.sh')
+    with open(os.path.join(base, good['id'], 'release', f'install-{good["folder"]}', 'kit.json')) as f:
+        kit = json.load(f)
+    if kind == 'null':
+        kit['python_mac'] = None
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        with open(os.path.join(tmp, 'kit.json'), 'w') as f:
+            json.dump(kit, f, separators=(',', ':'))
+        env = dict(os.environ, TEMP=tmp, TMP=tmp, TMPDIR=tmp)
+        fx.set_case(row)
+        try:
+            done = subprocess.run(['sh', '-c', MAC_SCRIPT, 'sh', run, os.path.join(tmp, 'kit.json'), facts], env=env, stdin=subprocess.DEVNULL,
+                                  capture_output=True, timeout=MAC_TIMEOUT)
+            out, rc = done.stdout.decode('utf-8', 'replace'), done.returncode
+        except subprocess.TimeoutExpired:
+            out, rc = '', -1
+        left = [n for n in os.listdir(tmp) if LEFT.match(n)]
+    return judge_mac(kind, out, rc, list(fx.log), list(fx.http_log), left), out
+
+
+def run_mac_rows(base: str, meta: dict, fx: serve.Fixture, must_run: bool, facts: str = '') -> int:
+    """G-SMOKE-MAC-1: the fixture's python-mac rows, how many failed. A fixture built without a python_mac pin has none: that is
+    a failure under --must-run (a Mac that never reached fetch_python proved nothing), else a skip."""
+    mac = meta.get('python_mac')
+    if not mac:
+        print(f'{"FAIL" if must_run else "skip"} python-mac rows: the fixture has no python_mac pin (built without --kit-json)')
+        return 1 if must_run else 0
+    good = next(c for c in meta['cases'] if c['id'] == 'good-sh')
+    failed = 0
+    for row in mac['rows']:
+        bad, out = run_mac(row, base, fx, good, facts)
+        print(f'{"FAIL" if bad else "ok  "} {row}' + ''.join(f'\n     {b}' for b in bad))
+        if bad:
+            failed += 1
+            print('     output tail: ' + ' | '.join(out.replace('\r', '').strip().split('\n')[-6:]))
+    print(f'{len(mac["rows"]) - failed}/{len(mac["rows"])} python-mac rows as expected')
+    return failed
 
 
 def run_case(c: dict, base: str, fx: serve.Fixture, fp: str, mach: str | None, kvm: bool) -> tuple[list[str], str]:
@@ -190,7 +272,7 @@ def cmd_fixture(a) -> int:
         print(f'FAIL this runner must reach the cases but would refuse `{mach}` before any request')
         return 1
     fx = serve.Fixture(a.dir, meta['host'], meta['port'], meta['crl_port'])
-    failed = 0
+    failed = mac_failed = 0
     try:
         for c in cases:
             bad, out = run_case(c, a.dir, fx, meta['fingerprint'], mach, kvm)
@@ -198,10 +280,12 @@ def cmd_fixture(a) -> int:
             if bad:
                 failed += 1
                 print('     output tail: ' + ' | '.join(out.replace('\r', '').strip().split('\n')[-6:]))
+        if a.os == 'sh' and platform.system() == 'Darwin':  # only a Mac runs the pinned arm64 Python (a Mac row can reach past check mode)
+            mac_failed = run_mac_rows(a.dir, meta, fx, a.must_run)
     finally:
         fx.close()
     print(f'{len(cases) - failed}/{len(cases)} cases as expected on {platform.platform()} (machine refusal: {mach})')
-    return 1 if failed else 0
+    return 1 if failed or mac_failed else 0
 
 # --- real mode (PY13, G-I06-1): the published release's own one-liner, judged against values that live on main ----------------
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

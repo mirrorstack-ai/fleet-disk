@@ -34,7 +34,7 @@ NS, PRINCIPAL = 'mirrorstack-fleet-ctl', 'owner'
 FILES = ('fleet/hosts.json', 'fleet/core/gateway.json', 'fleet/core/work-pin.json', 'fleet/core/deploy-pin.json',
          'fleet/core/proven.json')  # model.PIN_FILES
 MAX_PIN, MAX_SIG, MAX_SERIAL, MAX_DEPTH, PIN_DEPTH = 1 << 20, 4 << 10, (1 << 63) - 1, 5, 300  # pins.py; root takes 400
-WORK_YML = '.github/workflows/work.yml'
+WORK_YML = 'fleet/work/work.yml'  # the fleet tree's own path (CV16); .github/workflows/work.yml is not in it
 SHA1, SHA256 = re.compile('[0-9a-f]{40}'), re.compile('[0-9a-f]{64}')
 KEY_WORDS = re.compile('ssh-ed25519 ([A-Za-z0-9+/]{68})')
 ED_HEAD = b'\0\0\0\x0bssh-ed25519\0\0\0\x20'

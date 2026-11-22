@@ -1025,7 +1025,7 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
                rows_failures: int = ROWS_FAILURES,
                short_life_ms: int = 12000, ready_streak: int = READY_STREAK, ready_spacing: float = READY_SPACING,
                ready_timeout: float = READY_TIMEOUT, retry_max: int = RETRY_MAX, retry_wait: float = RETRY_WAIT,
-               sleep=time.sleep, log=say) -> list[str]:
+               late_margin_ms: int = 2500, sleep=time.sleep, pause=None, log=say) -> list[str]:
     """The staging replay. Waits out version propagation first (wait_ready) and sends a 2xx-expecting admin call again
     on the Worker's fixed 404 (ok_call, at most retry_max times, counted in the summary); see the Version propagation
     note above (run 38140164568 attempts 1 and 2).
@@ -1036,7 +1036,12 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
     rows_per_failure. A third read, between the loop and the flood, splits the figure: rows per decision of the loop (its 404s
     and the 429 that ends them) and per 429 of the flood. A kit that does not report the number prints rows_read=unavailable
     (no failure, no flood); so does a counter that did not move over the decisions (a figure of 0.0 would read as a pass); a
-    second read below the first prints rows_read=reset (the Gate was evicted between them)."""
+    second read below the first prints rows_read=reset (the Gate was evicted between them).
+
+    Named waits (G-KITTEST-1): the replay's two long waits go through `pause(why, seconds)`, why 'cut' (the Worker releasing
+    a cut stream, cut_wait at most) or 'expiry' (past short_life_ms + late_margin_ms); the default sleeps them, so a live run
+    is unchanged. A test passes its own pause (a fake kit's clock, a poll of its release state) and a short life and margin."""
+    pause = pause or (lambda why, seconds: sleep(seconds))
     s1, s2, s3, s4, s5, gser = (S_BASE + i for i in (1, 2, 3, 4, 5, 1))
     s6 = S_BASE + 6                                    # the cut vector's object
     small = det_bytes('s1', small_bytes)
@@ -1223,7 +1228,7 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
             cut = get_kit_cut(client, s2, code_b)
             if cut != 200:
                 raise Refused('cut #%d: status %d, expected 200' % (i, cut))
-            sleep(cut_wait)
+            pause('cut', cut_wait)
         vector('after two cuts both downloads still fit')
         m['a_cuts'], m['a_restored'] = 2, 0
         for i in (1, 2):
@@ -1240,7 +1245,7 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
             cut = get_kit_cut(client, s6, code_c, chunk=CUT_CHUNK, chunks=chunks)
             if cut != 200:
                 raise Refused('cut vector, after chunk %d: status %d, expected 200' % (chunks, cut))
-            sleep(cut_wait)
+            pause('cut', cut_wait)
         m['cv_cuts'], m['cv_restored'] = len(CUT_AFTER), 0
         for i in (1, 2):                                                      # cap 2: both fit again only if each cut was released
             r = get_kit(client, s6, 'bundle.tar', code_c)
@@ -1251,9 +1256,9 @@ def run_replay(client: Client, admin: Admin, *, big_mib: int = 16, cut_wait: flo
                           % (m['cv_restored'], len(CUT_AFTER)))
 
         vector('expiry, after')
-        late = (short_life_ms + 2500) / 1000 - (time.monotonic() - t_e)
+        late = (short_life_ms + late_margin_ms) / 1000 - (time.monotonic() - t_e)
         if late > 0:
-            sleep(late)
+            pause('expiry', late)
         gate_404('expired', get_kit(client, s1, 'gateway.json', code_e))
 
         # -- the budget: the last thing, it blocks this source for the hour --------------------------------------------

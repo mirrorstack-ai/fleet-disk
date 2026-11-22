@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import importlib.util
 import io
+import tarfile
 import json
 import os
 import re
@@ -22,6 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tests' / 'fixture'))
 import make_fixture as mf  # noqa: E402
+import serve  # noqa: E402
 import smoke_driver as sd  # noqa: E402
 from smoke_driver import UBUNTU_OK  # noqa: E402
 
@@ -38,6 +40,12 @@ class Fixture(unittest.TestCase):
 
     def test_the_driver_names_a_download_path_by_its_file(self):
         self.assertEqual(sd.logical('/releases/download/install-20/install.json'), 'install.json')
+
+    def test_the_driver_names_the_pbs_path_python_mac_and_hides_its_object_hop(self):  # G-SMOKE-MAC-1
+        pbs = '/pbs/releases/download/20260929/cpython-3.14.7+20260929-aarch64-apple-darwin-install_only.tar.gz'
+        self.assertEqual(sd.logical(pbs), 'python-mac')
+        self.assertIsNone(sd.logical(pbs.replace('/releases/download/', '/objects/')))   # the 302's target is not a request of its own
+        self.assertIsNone(sd.logical('/pbs/releases/download/x/cpython-3.14.7+x-aarch64-apple-darwin-install_only.tar.gz'))
 
 
 class Judge(unittest.TestCase):
@@ -263,8 +271,8 @@ class Workflow(unittest.TestCase):
         self.assertEqual(SMOKE.count("if: matrix.trust != 'none'"), 2)   # before and after the trust step
 
     def test_the_release_gate_builds_the_fixture_once_from_the_loaders_it_was_handed(self):
-        self.assertIn('make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh', FIXTURE)
-        self.assertNotIn('--boot-dir', FIXTURE)   # the tip's folder is not in this checkout: only the two files cross
+        self.assertIn('make_fixture.py --out fixture --ps1 loaders/bootstrap.ps1 --sh loaders/bootstrap.sh --kit-json loaders/kit.json\n', FIXTURE)   # G-SMOKE-MAC-1: the tip's kit.json carries the Mac pin
+        self.assertNotIn('--boot-dir', FIXTURE)   # the tip's folder is not in this checkout: only the two loaders and the kit cross
         self.assertNotIn('--no-verify', FIXTURE)
         self.assertIn('name: loaders', FIXTURE)
         # run 38633686710: built on each leg it was REFUSED tool on macos-15 and REFUSED verify on both Windows legs; so no leg builds it
@@ -292,10 +300,15 @@ class Workflow(unittest.TestCase):
             self.assertEqual(by_use(mine, use), by_use(theirs, use), use)   # the same pinned action and inputs, byte for byte
         run = lambda steps: [st for st in steps if 'make_fixture.py' in st]
         self.assertEqual((len(run(mine)), len(run(theirs))), (1, 1))
-        # the same interpreter, script and output folder; only the input differs: the dispatch has a folder, this has the two loaders
-        strip = lambda st: re.sub(r' --(?:boot-dir "\$BOOT_DIR"|ps1 \S+ --sh \S+)$', '', st.strip().split('run: ', 1)[1])
+        # the same interpreter, script and output folder; only the input differs: the dispatch has a folder, this has the two loaders and the kit
+        strip = lambda st: re.sub(r' --(?:boot-dir "\$BOOT_DIR" --kit-json "\$BOOT_DIR/kit\.json"|ps1 \S+ --sh \S+ --kit-json \S+)$', '', st.strip().split('run: ', 1)[1])
         self.assertEqual(strip(run(mine)[0]), 'python3 tests/fixture/make_fixture.py --out fixture')
         self.assertEqual(strip(run(mine)[0]), strip(run(theirs)[0]))
+
+    def test_both_fixture_jobs_hand_the_release_kit_to_the_builder_for_the_mac_pin(self):  # G-SMOKE-MAC-1
+        self.assertIn('--boot-dir "$BOOT_DIR" --kit-json "$BOOT_DIR/kit.json"\n', WF)
+        self.assertIn('for f in bootstrap.sh bootstrap.ps1 kit.json; do', INSTALL)   # the plan's loaders step copies it from the tip, beside the two
+        self.assertEqual([r for r in re.findall(r'must_run: (true|false)', SMOKE)].count('true'), 4)   # the macos-15 row keeps must_run: the Mac rows ride it
 
     def test_the_ubuntu_26_04_row_is_experimental_and_only_in_the_dispatch(self):  # PZ03b: a weekly-moving hosted image must not gate a release
         rows = re.findall(r'(?m)^          - (\{runner: ubuntu-26\.04,[^\n]*\})', WF)
@@ -408,6 +421,207 @@ class RealBootstrap(unittest.TestCase):
                 if sd.main(['control', '--dir', str(out), '--phase', 'after']) != 0:
                     self.skipTest('this curl does not take CURL_CA_BUNDLE')
                 self.assertEqual(sd.main(['fixture', '--dir', str(out), '--os', 'sh']), 0)
+
+
+class MacJudge(unittest.TestCase):
+    """G-SMOKE-MAC-1: what a python-mac row must do, as a judge over its output and request log."""
+    GET = [{'path': '/pbs/releases/download/20260929/cpython-3.14.7+20260929-aarch64-apple-darwin-install_only.tar.gz', 'status': 302,
+            'ua': 'curl/8.7', 'tls': 'TLSv1.3'},
+           {'path': '/pbs/objects/20260929/cpython-3.14.7+20260929-aarch64-apple-darwin-install_only.tar.gz', 'status': 200, 'ua': 'curl/8.7',
+            'tls': 'TLSv1.3'}]
+    GOOD = 'mac-row fetch_python\nmac-row python_ok\n'
+    REFUSE = 'mac-row fetch_python\nREFUSED {}\nThe Python download is not the one the owner signed. Nothing was changed. Tell the owner.\n'
+
+    def judge(self, kind, out, rc, log=(), http=(), left=()):
+        return sd.judge_mac(kind, out, rc, list(log), list(http), list(left))
+
+    def test_each_row_passes_on_its_designed_outcome(self):
+        self.assertEqual(self.judge('good', self.GOOD, 0, self.GET), [])
+        self.assertEqual(self.judge('null', self.REFUSE.format('python-lock'), 1), [])
+        self.assertEqual(self.judge('hash', self.REFUSE.format('python-hash'), 1, self.GET), [])
+
+    def test_a_row_that_never_reached_fetch_python_is_red_even_if_the_rest_looks_right(self):  # must-run: never green on a skip
+        for kind, out, rc, log in (('good', 'mac-row python_ok\n', 0, self.GET), ('null', self.REFUSE.format('python-lock').replace('mac-row fetch_python\n', ''), 1, ()),
+                                   ('hash', self.REFUSE.format('python-hash').replace('mac-row fetch_python\n', ''), 1, self.GET), ('good', '', 0, self.GET)):
+            self.assertIn('the row never reached fetch_python', self.judge(kind, out, rc, log), kind)
+
+    def test_each_wrong_outcome_fails(self):
+        bad = {'python_ok refused': ('good', self.GOOD.replace('python_ok', 'python_ok refused'), 0, self.GET),
+               'a refusal where a pass is due': ('good', self.REFUSE.format('python-hash'), 1, self.GET),
+               'no request at all': ('good', self.GOOD, 0, []), 'two archive requests': ('good', self.GOOD, 0, self.GET + self.GET),
+               'the null row reached the network': ('null', self.REFUSE.format('python-lock'), 1, self.GET),
+               'the null row ended in the hash refusal': ('null', self.REFUSE.format('python-hash'), 1, ()),
+               'the hash row ended in a pass': ('hash', self.GOOD, 0, self.GET), 'the hash row never asked': ('hash', self.REFUSE.format('python-hash'), 1, []),
+               'a refusal with the wrong exit': ('hash', self.REFUSE.format('python-hash'), 0, self.GET)}
+        for why, (kind, out, rc, log) in bad.items():
+            self.assertNotEqual(self.judge(kind, out, rc, log), [], why)
+
+    def test_the_request_rules_of_a_case_hold_for_the_mac_rows_too(self):
+        for why, log, http, left in (('not curl', [{**e, 'ua': 'Python-urllib'} for e in self.GET], (), ()),
+                                     ('TLS 1.1', [{**e, 'tls': 'TLSv1.1'} for e in self.GET], (), ()),
+                                     ('plain http', self.GET, [{'path': '/pbs/releases/download/x'}], ()), ('a temp folder left', self.GET, (), ['fleet-boot.abc'])):
+            self.assertNotEqual(self.judge('good', self.GOOD, 0, log, http, left), [], why)
+        self.assertEqual(self.judge('good', self.GOOD, 0, self.GET, [{'path': '/ca.crl'}]), [])   # the CRL fetch is not a plain-http download
+
+    def test_the_rows_are_the_fixtures_rows_by_kind(self):
+        self.assertEqual([r.rsplit('-', 1)[1] for r in mf.MAC_ROWS], list(sd.MAC_WANT))
+        self.assertTrue(all(r.startswith('python-mac-') for r in mf.MAC_ROWS))
+
+    def args(self, **kw):
+        return mock.Mock(dir='fx', os='sh', must_run=kw.get('must', False))
+
+    def run_fixture(self, system, rows=0, must=False, cases=()):
+        meta = {'host': '127.0.0.1', 'port': 1, 'crl_port': 2, 'fingerprint': 'f', 'cases': [{'id': 'good-sh', 'os': 'sh'}, *cases]}
+        with mock.patch.object(sd, 'load', return_value=meta), mock.patch.object(sd, 'machine', return_value=None), \
+                mock.patch.object(sd.serve, 'Fixture'), mock.patch.object(sd, 'run_case', return_value=([], '')), \
+                mock.patch.object(sd, 'run_mac_rows', return_value=rows) as mac, mock.patch.object(sd.platform, 'system', return_value=system), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return sd.cmd_fixture(self.args(must=must)), mac
+
+    def test_only_a_mac_runs_the_mac_rows_and_their_failure_fails_the_run(self):
+        rc, mac = self.run_fixture('Linux')
+        self.assertEqual((rc, mac.call_count), (0, 0))
+        rc, mac = self.run_fixture('Darwin')
+        self.assertEqual((rc, mac.call_count, mac.call_args.args[3]), (0, 1, False))
+        self.assertEqual(self.run_fixture('Darwin', rows=1)[0], 1)   # a red Mac row fails the job though every case was as expected
+        self.assertTrue(self.run_fixture('Darwin', must=True)[1].call_args.args[3])   # --must-run reaches the rows
+
+    def test_a_mac_fixture_without_a_pin_is_a_failure_under_must_run_and_a_skip_without(self):
+        meta = {'cases': [{'id': 'good-sh'}]}
+        for must, want in ((True, 1), (False, 0)):
+            with contextlib.redirect_stdout(io.StringIO()) as shown:
+                self.assertEqual(sd.run_mac_rows('fx', meta, mock.Mock(), must), want)
+            self.assertIn('FAIL' if must else 'skip', shown.getvalue())
+
+
+def mac_tgz(script: bytes = b'#!/bin/sh\nexit 0\n') -> bytes:
+    """A tiny python-build-standalone-shaped tar.gz whose python3 is a stub that exits 0 (a version and zstd probe both pass)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w:gz') as t:
+        info = tarfile.TarInfo('python/bin/python3')
+        info.size, info.mode = len(script), 0o755
+        t.addfile(info, io.BytesIO(script))
+    return buf.getvalue()
+
+
+@unittest.skipUnless(TOOLS and shutil.which('sh') and shutil.which('curl') and os.path.exists('/usr/bin/tar'), 'ssh-keygen, openssl, sh, curl or tar is missing')
+class MacRows(unittest.TestCase):
+    """G-SMOKE-MAC-1: the rows over the shipped (pinned) loaders and the shipped kit pin's shape, against the local fixture, for real:
+    the sh copy is sourced through its FLEET_BOOT_LIB seam, boot_sys says Darwin (the stub archive is no arm64 Python), nothing is downloaded."""
+    FACTS = 'boot_sys() { echo Darwin; }'
+
+    @classmethod
+    def setUpClass(cls):
+        pinned = ROOT / 'tests' / 'fixture' / 'pinned'
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.data = mac_tgz()
+        kit = json.loads((pinned / 'kit.json').read_text())
+        kit['python_mac']['sha256'] = hashlib.sha256(cls.data).hexdigest()
+        (cls.tmp / 'kit.json').write_text(json.dumps(kit))
+        (cls.tmp / 'py.tgz').write_bytes(cls.data)
+        (cls.tmp / 'z.zip').write_bytes(b'PKfake')
+        ports = []
+        for _ in range(2):
+            with socket.socket() as sk:
+                sk.bind(('127.0.0.1', 0))
+                ports.append(sk.getsockname()[1])
+        cls.out = cls.tmp / 'fx'
+        cls.meta = mf.build(cls.out, pinned / 'bootstrap.ps1', pinned / 'bootstrap.sh', port=ports[0], crl_port=ports[1], zip_path=cls.tmp / 'z.zip',
+                            kit_json=cls.tmp / 'kit.json', mac_archive=cls.tmp / 'py.tgz')
+        cls.good = next(c for c in cls.meta['cases'] if c['id'] == 'good-sh')
+        cls.fx = serve.Fixture(str(cls.out), '127.0.0.1', ports[0], ports[1])
+        cls.env = mock.patch.dict(os.environ, {'CURL_CA_BUNDLE': str(cls.out / 'tls' / 'ca.crt')})
+        cls.env.start()
+        cls.addClassCleanup(cls.env.stop)
+        cls.addClassCleanup(cls.fx.close)
+        cls.addClassCleanup(shutil.rmtree, cls.tmp, ignore_errors=True)
+        if subprocess.run([sd.curl(), '-fsS', '--max-time', '20', '-o', os.devnull, f'https://127.0.0.1:{ports[0]}/ping']).returncode != 0:
+            raise unittest.SkipTest('this curl does not take CURL_CA_BUNDLE')
+
+    def row(self, name, facts=FACTS):
+        return sd.run_mac(name, str(self.out), self.fx, self.good, facts)
+
+    def test_the_good_row_makes_one_archive_get_and_python_ok_passes(self):
+        bad, out = self.row('python-mac-good')
+        self.assertEqual(bad, [], out)
+        self.assertEqual([sd.logical(e['path']) for e in self.fx.log], ['python-mac', None])   # the 302 and its object hop: one logical request
+        self.assertEqual([e['status'] for e in self.fx.log], [302, 200])
+        self.assertTrue(all(e['tls'] in ('TLSv1.2', 'TLSv1.3') and e['ua'].startswith('curl/') for e in self.fx.log))
+        self.assertIn('mac-row python_ok', out)
+
+    def test_the_null_row_is_python_lock_with_no_request(self):
+        bad, out = self.row('python-mac-null')
+        self.assertEqual((bad, self.fx.log), ([], []), out)
+        self.assertIn('REFUSED python-lock', out)
+
+    def test_the_hash_row_is_python_hash_after_one_request(self):
+        bad, out = self.row('python-mac-hash')
+        self.assertEqual(bad, [], out)
+        self.assertIn('REFUSED python-hash', out)
+        self.assertEqual(len(self.fx.log), 2)
+
+    def test_all_three_rows_are_run_and_counted(self):
+        with contextlib.redirect_stdout(io.StringIO()) as shown:
+            self.assertEqual(sd.run_mac_rows(str(self.out), self.meta, self.fx, True, self.FACTS), 0)
+        self.assertIn('3/3 python-mac rows as expected', shown.getvalue())
+
+    def test_a_row_that_stops_before_fetch_python_is_red(self):  # the control: a skipped row never reads as green
+        for name in sd.MAC_WANT:
+            bad, _ = self.row(f'python-mac-{name}', facts='exit 0')
+            self.assertIn('the row never reached fetch_python', bad, name)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sd.run_mac_rows(str(self.out), self.meta, self.fx, True, 'exit 0'), 3)
+
+    def test_an_archive_that_is_not_the_pin_is_not_a_pass(self):  # the good row against the hash row's folder is python-hash, so it is red
+        self.fx.set_case('python-mac-hash')
+        out = subprocess.run(['sh', '-c', sd.MAC_SCRIPT, 'sh', str(self.out / 'good-sh' / 'run' / 'bootstrap.sh'),
+                              str(self.out / 'good-sh' / 'release' / 'install-20' / 'kit.json'), self.FACTS], capture_output=True, text=True,
+                             env=dict(os.environ, TMPDIR=str(self.tmp)))
+        self.assertEqual(out.returncode, 1)
+        self.assertNotEqual(sd.judge_mac('good', out.stdout, out.returncode, list(self.fx.log), [], []), [])
+
+    def test_a_loader_that_cannot_unpack_what_it_fetched_is_python_install_not_a_pass(self):
+        self.assertEqual(sd.MAC_WANT['good'], (None, ['python-mac']))
+        junk = mac_tgz()[:40]   # a cut archive whose hash the kit nevertheless pins
+        kit = json.loads((self.out / 'good-sh' / 'release' / 'install-20' / 'kit.json').read_text())
+        kit['python_mac']['sha256'] = hashlib.sha256(junk).hexdigest()
+        rel = Path('pbs') / 'releases' / 'download' / '20260929' / kit['python_mac']['url'].rsplit('/', 1)[1]
+        (self.out / 'python-mac-cut' / rel).parent.mkdir(parents=True)
+        (self.out / 'python-mac-cut' / rel).write_bytes(junk)
+        (self.tmp / 'cut.json').write_text(json.dumps(kit))
+        self.fx.set_case('python-mac-cut')
+        done = subprocess.run(['sh', '-c', sd.MAC_SCRIPT, 'sh', str(self.out / 'good-sh' / 'run' / 'bootstrap.sh'), str(self.tmp / 'cut.json'), self.FACTS],
+                              capture_output=True, text=True, env=dict(os.environ, TMPDIR=str(self.tmp)))
+        self.assertIn('REFUSED python-install', done.stdout)
+
+    def run_pinned_stub(self, name, script):
+        """MAC_SCRIPT over a case folder whose pinned archive holds `script` as its python3 and a kit.json that pins that archive's sha256."""
+        data = mac_tgz(script)
+        kit = json.loads((self.out / 'good-sh' / 'release' / 'install-20' / 'kit.json').read_text())
+        kit['python_mac']['sha256'] = hashlib.sha256(data).hexdigest()
+        rel = Path('pbs') / 'releases' / 'download' / '20260929' / kit['python_mac']['url'].rsplit('/', 1)[1]
+        (self.out / name / rel).parent.mkdir(parents=True)
+        (self.out / name / rel).write_bytes(data)
+        (self.tmp / f'{name}.json').write_text(json.dumps(kit))
+        self.fx.set_case(name)
+        return subprocess.run(['sh', '-c', sd.MAC_SCRIPT, 'sh', str(self.out / 'good-sh' / 'run' / 'bootstrap.sh'), str(self.tmp / f'{name}.json'), self.FACTS],
+                              capture_output=True, text=True, env=dict(os.environ, TMPDIR=str(self.tmp)))
+
+    def test_a_python_that_fails_python_ok_turns_the_good_row_red(self):  # the control for the marker: python_ok's verdict, not just its text, is judged
+        msg = 'python_ok refused the fetched Python (3.12+ with zstd)'
+        stubs = {'python-mac-broken': b'#!/bin/sh\nexit 1\n',  # fails every probe
+                 'python-mac-nover': b'#!/bin/sh\ncase "$3" in *version_info*) exit 1 ;; esac\nexit 0\n',  # fails only the 3.12+ probe, so only that line of python_ok can turn it red
+                 'python-mac-nozstd': b'#!/bin/sh\ncase "$3" in *zstd*) exit 1 ;; esac\nexit 0\n'}  # passes it, fails only the Darwin-only zstd line
+        for name, script in stubs.items():
+            done = self.run_pinned_stub(name, script)
+            self.assertEqual(done.returncode, 0, (name, done.stdout, done.stderr))
+            self.assertIn('mac-row python_ok refused', done.stdout, name)
+            self.assertNotIn('mac-row python_ok\n', done.stdout, name)
+            self.assertIn(msg, sd.judge_mac('good', done.stdout, done.returncode, list(self.fx.log), [], []), name)
+        # and the same rows with a passing stub print the plain marker and judge clean of this message
+        ok = self.run_pinned_stub('python-mac-okstub', b'#!/bin/sh\nexit 0\n')
+        self.assertIn('mac-row python_ok\n', ok.stdout)
+        self.assertNotIn(msg, sd.judge_mac('good', ok.stdout, ok.returncode, list(self.fx.log), [], []))
 
 
 # --- PY13: smoke_driver.py real, over a fake gh; smoke-real.yml's shape ---------------------------------------------------------------
