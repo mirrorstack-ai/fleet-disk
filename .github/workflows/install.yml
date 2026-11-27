@@ -91,7 +91,9 @@
 #   pins-publish  (no secret, `contents: read`) writes `pins-sigs.json` (tip, run, fingerprint, pub, entries of path, sha256, serial and sig_b64)
 #                 and uploads it as the artifact `pins-sigs` (one day). The signature reaches root only through a land PR on the fleet main
 #                 (an admin session writes the `.sig` files: CI holds no write credential into the fleet, and a write credential there would
-#                 be worth more than this key). Nothing printed is a value: this repository is public.
+#                 be worth more than this key). Nothing printed is a value: this repository is public. Its `if` names the signer's
+#                 success itself, under `!cancelled()`: the test series skips `pins-approve`, and GitHub skips every job below a
+#                 skipped one unless its `if` holds a status function, so run 46039004469 signed five files and published none.
 # Inputs reach the scripts only through env:. Which key signs is the constant KEY_SHA256, a reviewed change to this file.
 name: install
 on:
@@ -895,7 +897,7 @@ jobs:
           echo "signed with key $fp"
   pins-publish:
     needs: [pins-plan, pins-sign]
-    if: github.ref == 'refs/heads/release' && inputs.mode == 'pins'
+    if: ${{ !cancelled() && github.ref == 'refs/heads/release' && inputs.mode == 'pins' && needs.pins-sign.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
