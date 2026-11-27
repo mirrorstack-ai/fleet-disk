@@ -805,7 +805,13 @@ class PinsStatic(unittest.TestCase):
         approve = re.search(r'(?m)^    if: (.*)$', job_header('pins-approve'))[1]
         self.assertIn("needs.pins-plan.outputs.series == 'release'", approve)
         self.assertRegex(job_header('pins-publish'), r'(?m)^    needs: \[pins-plan, pins-sign\]$')
-        self.assertNotIn('!cancelled()', re.search(r'(?m)^    if: (.*)$', job_header('pins-publish'))[1])  # a failed signer never reaches the upload
+        publish = re.search(r'(?m)^    if: (.*)$', job_header('pins-publish'))[1]
+        # The test series skips pins-approve, and GitHub skips every job below a skipped one unless its `if` holds a status
+        # function: run 46039004469 (2026-11-27) signed five files and published none. So !cancelled(), with the signer's
+        # success by name: a failed or skipped signer still never reaches the upload.
+        self.assertIn('!cancelled()', publish)
+        self.assertIn("needs.pins-sign.result == 'success'", publish)
+        self.assertNotIn('always()', publish)
 
     def test_pins_sign_runs_no_action_no_checkout_no_repository_code_and_holds_a_job_token_of_nothing(self):
         job = JOBS['pins-sign']
